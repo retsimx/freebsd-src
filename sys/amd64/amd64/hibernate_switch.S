@@ -69,6 +69,11 @@ END(hibernate_savectx)
  * Entered from the loader under physical 1:1 identity paging.
  */
 ENTRY(hibernate_resume_tramp)
+	/* Telemetry Marker 'K': Entered kernel physical trampoline */
+	movw	$0x3f8, %dx
+	movb	$'K', %al
+	outb	%al, %dx
+
 	/* 1. Reload kernel page-table root (safe: low page is 1:1 mapped in kernel_pmap) */
 	movq	hibernate_tramp_cr3(%rip), %rax
 	movq	%rax, %cr3
@@ -94,6 +99,11 @@ hibernate_resume_tramp_size:
  * %r12 holds struct pcb *.
  */
 ENTRY(hibernate_restore_kernel)
+	/* Telemetry Marker '1': Entered canonical high virtual memory */
+	movw	$0x3f8, %dx
+	movb	$'1', %al
+	outb	%al, %dx
+
 	movq	%r12, %rdi
 	call	resumectx
 	/* NOTREACHED - resumectx returns directly to .Lhibernate_resumed */

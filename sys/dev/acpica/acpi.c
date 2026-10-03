@@ -3886,6 +3886,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    break;
 
 	case EJUSTRETURN:
+	    printf("\n[RESUME] S4 resume successfully returned from hibernate_savectx!\n");
 	    resume_other_cpus(&susp_cpus);
 	    intr_restore(intr_state);
 	    /* Free memory used to hibernate. */
