@@ -123,4 +123,31 @@ ENTRY(hibernate_restore_kernel)
 	/* NOTREACHED - resumectx returns directly to .Lhibernate_resumed */
 END(hibernate_restore_kernel)
 
+/*
+ * int hibernate_call_on_stack(void *stack_top, int (*fn)(void *, void *),
+ *     void *arg1, void *arg2)
+ *
+ * Switches %rsp to stack_top, enforces 16-byte alignment, invokes fn(arg1, arg2),
+ * and restores original %rsp.
+ */
+ENTRY(hibernate_call_on_stack)
+	pushq	%rbp
+	movq	%rsp, %rbp
+	pushq	%r12
+
+	movq	%rsp, %r12		/* Preserve thread stack %rsp in %r12 */
+	movq	%rdi, %rsp		/* Switch %rsp to scratch stack_top */
+	andq	$~0xf, %rsp		/* Enforce 16-byte stack alignment */
+
+	movq	%rsi, %rax		/* Save fn pointer in %rax */
+	movq	%rdx, %rdi		/* arg1 -> %rdi */
+	movq	%rcx, %rsi		/* arg2 -> %rsi */
+	call	*%rax			/* Call worker function */
+
+	movq	%r12, %rsp		/* Restore thread stack %rsp */
+	popq	%r12
+	popq	%rbp
+	ret
+END(hibernate_call_on_stack)
+
 	.section .note.GNU-stack,"",%progbits

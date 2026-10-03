@@ -96,9 +96,13 @@ hcb_validate(const void *const buf, const uint64_t size)
 
 struct pcb;
 
+#define	HIBERNATE_SCRATCH_STACK_SIZE	(32 * 1024)
+
 int dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb) __returns_twice;
 int hibernate_savectx(struct hibernate_pcb *hpcb, struct pcb *pcb,
     uint64_t low_entry, uint64_t low_stack) __returns_twice;
+int hibernate_call_on_stack(void *stack_top, int (*fn)(void *, void *),
+    void *arg1, void *arg2);
 void hibernate_resume_tramp(void);
 extern uint32_t hibernate_resume_tramp_size;
 extern uint64_t hibernate_tramp_cr3;
