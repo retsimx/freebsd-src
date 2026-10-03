@@ -138,6 +138,7 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
 		return (0);
 	}
 
+	outb(0x3f8, '4');
 	fpuresume(susppcbs[0]->sp_fpususpend);
 	return (EJUSTRETURN);
 }

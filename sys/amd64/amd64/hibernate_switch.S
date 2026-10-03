@@ -57,6 +57,11 @@ ENTRY(hibernate_savectx)
 	ret
 
 .Lhibernate_resumed:
+	/* Telemetry Marker '3': resumectx returned successfully */
+	movw	$0x3f8, %dx
+	movb	$'3', %al
+	outb	%al, %dx
+
 	/* Resume path: resumectx() restored context and returned here with %eax == 0 */
 	movl	$EJUSTRETURN, %eax
 	ret
@@ -102,6 +107,15 @@ ENTRY(hibernate_restore_kernel)
 	/* Telemetry Marker '1': Entered canonical high virtual memory */
 	movw	$0x3f8, %dx
 	movb	$'1', %al
+	outb	%al, %dx
+
+	/* Reload kernel GDTR and segment registers before calling resumectx */
+	leaq	PCB_GDT(%r12), %rdi
+	call	lgdt
+
+	/* Telemetry Marker '2': Kernel GDT restored, calling resumectx */
+	movw	$0x3f8, %dx
+	movb	$'2', %al
 	outb	%al, %dx
 
 	movq	%r12, %rdi
