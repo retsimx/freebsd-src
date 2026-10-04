@@ -1376,10 +1376,19 @@ sched_pickcpu(struct thread *td, int flags)
 
 	self = PCPU_GET(cpuid);
 	ts = td_get_sched(td);
-	KASSERT(!CPU_ABSENT(ts->ts_cpu), ("sched_pickcpu: Start scheduler on "
-	    "absent CPU %d for thread %s.", ts->ts_cpu, td->td_name));
+	/*
+	 * When SMP is not started the only CPU that can run threads is the
+	 * current one; a stale ts_cpu is then irrelevant.  This happens after
+	 * an S4 hibernate resume that deliberately degraded to UP with the
+	 * APs halted in WFS, where restored threads still carry the ts_cpu of
+	 * a CPU that is now absent.  sched_setcpu() will fix ts_cpu up to
+	 * self.  Keep the assert for the dangerous case (SMP started but the
+	 * thread points at an absent CPU).
+	 */
 	if (smp_started == 0)
 		return (self);
+	KASSERT(!CPU_ABSENT(ts->ts_cpu), ("sched_pickcpu: Start scheduler on "
+	    "absent CPU %d for thread %s.", ts->ts_cpu, td->td_name));
 	/*
 	 * Don't migrate a running thread from sched_switch().
 	 */
