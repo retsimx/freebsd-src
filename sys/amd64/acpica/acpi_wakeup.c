@@ -102,6 +102,15 @@ acpi_wakeup_ap(struct acpi_softc *sc, int cpu)
 	int		ms;
 
 	pcb = &susppcbs[cpu]->sp_pcb;
+	/*
+	 * S4 does not call acpi_sleep_machdep(), which is where S3 patches
+	 * wakeup_efer.  Patch here (and once in acpi_install_wakeup_handler)
+	 * before INIT-SIPI so wakecode can set EFER_LME.  Clear EFER_LMA:
+	 * the AP enters via real→protected→long mode and must not see LMA
+	 * already set.  i386 wakecode has its own EFER path in
+	 * acpi_sleep_machdep; acpi_wakeup_cpus is amd64-only (stub elsewhere).
+	 */
+	WAKECODE_FIXUP(wakeup_efer, uint64_t, rdmsr(MSR_EFER) & ~(EFER_LMA));
 	WAKECODE_FIXUP(wakeup_pcb, struct pcb *, pcb);
 	WAKECODE_FIXUP(wakeup_gdt, uint16_t, pcb->pcb_gdt.rd_limit);
 	WAKECODE_FIXUP(wakeup_gdt + 2, uint64_t, pcb->pcb_gdt.rd_base);
@@ -163,20 +172,25 @@ acpi_wakeup_cpus_bios(struct acpi_softc *sc)
 	outb(CMOS_DATA, mpbiosreason);
 }
 
-static void
-acpi_wakeup_cpus_efi(struct acpi_softc *sc)
+void
+acpi_wakeup_cpus(struct acpi_softc *sc, cpuset_t map)
 {
 	int		cpu;
 
-	/* Wake up each AP. */
 	for (cpu = 1; cpu < mp_ncpus; cpu++) {
-		if (!CPU_ISSET(cpu, &suspcpus))
+		if (!CPU_ISSET(cpu, &map))
 			continue;
 		if (acpi_wakeup_ap(sc, cpu) == 0) {
 			panic("acpi_wakeup: failed to resume AP #%d (PHY #%d)",
 			    cpu, cpu_apic_ids[cpu]);
 		}
 	}
+}
+
+static void
+acpi_wakeup_cpus_efi(struct acpi_softc *sc)
+{
+	acpi_wakeup_cpus(sc, suspcpus);
 }
 
 int
@@ -416,6 +430,7 @@ acpi_install_wakeup_handler(struct acpi_softc *sc)
 
 	/* Save pointers to some global data. */
 	WAKECODE_FIXUP(wakeup_ret, void *, resumectx);
+	WAKECODE_FIXUP(wakeup_efer, uint64_t, rdmsr(MSR_EFER) & ~(EFER_LMA));
 	/* Create 1:1 mapping for the low 4G */
 	if (la57) {
 		bcopy(kernel_pmap->pm_pmltop, pt5, PAGE_SIZE);

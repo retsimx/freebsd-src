@@ -67,6 +67,7 @@
 #include <x86/apicvar.h>
 #include <x86/cputypes.h>
 #include <x86/x86_var.h>
+#include <machine/pvclock.h>
 #endif
 #include <machine/resource.h>
 #include <machine/bus.h>
@@ -344,7 +345,21 @@ SYSCTL_INT(_debug_acpi, OID_AUTO, suspend_bounce, CTLFLAG_RW,
 bool acpi_hibernate_susp_bounce = true;
 SYSCTL_BOOL(_debug_acpi, OID_AUTO, hibernate_suspend_bounce, CTLFLAG_RW,
     &acpi_hibernate_susp_bounce, 0, "Don't actually hibernate, just test.");
+
+static int acpi_hibernate_smp = 1;
+SYSCTL_INT(_debug_acpi, OID_AUTO, hibernate_smp, CTLFLAG_RWTUN,
+    &acpi_hibernate_smp, 0, "Enable SMP secondary CPU resume after hibernate");
 #endif
+
+static int acpi_hibernate_trace = 0;
+SYSCTL_INT(_debug_acpi, OID_AUTO, hibernate_trace, CTLFLAG_RWTUN,
+    &acpi_hibernate_trace, 0,
+    "Emit COM1 single-char ACPI sleep/resume progress markers");
+
+#define	ACPI_HIBERNATE_TRACE(c) do {				\
+	if (__predict_false(acpi_hibernate_trace != 0))		\
+		outb(0x3f8, (c));				\
+} while (0)
 
 #if defined(__amd64__) || defined(__i386__)
 int acpi_override_isa_irq_polarity;
@@ -3802,15 +3817,16 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 #ifdef OS_HIBERNATE_SUPPORT
     } else {
 	/*
-	 * XXX - We don't currently invoke the 'power_suspend' event handler, as
-	 * disk drivers shutdown the disks which makes the dump fail.
+	 * Hibernate skips full power_suspend: disk drivers (ada/nda) would
+	 * spindown and freeze CAM queues, breaking the dump.  Consumers:
+	 *   - acpi_timer: bridged via acpi_timer_suspend/resume
+	 *   - vt: uses power_suspend_early (invoked above) + power_resume
+	 *   - adaresume: tolerates bare resume (skips OS_HIBERNATE)
+	 *   - acpi_stop_beep / linuxkpi: resume-only or suspend_early paired
+	 * power_resume is still invoked (ACPI_SS_SUSP_EH) for vt and peers.
 	 */
-	/*
-	 * TODO - Deactivate the swap partitions overlapping with dumping devices.
-	 * TODO - Check that we are really flushing everything that needs to here.
-	 * TODO - Get rid of the buffer and page cache (when we are able to
-	 * forego saving all physical pages).
-	 */
+	acpi_timer_suspend();
+	slp_state |= ACPI_SS_SUSP_EH;
     }
 #endif
 
@@ -3919,6 +3935,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 */
 	int saved_td_locks = curthread->td_locks;
 	int saved_td_pinned = curthread->td_pinned;
+	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
 
 	/*
 	 * This is where the current CPU context is saved, and from where we
@@ -3938,9 +3955,10 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    break;
 
 	case EJUSTRETURN:
-	    outb(0x3f8, '7');
-	    printf("\n[RESUME] S4 resume successfully returned from hibernate_savectx!\n");
-	    outb(0x3f8, '8');
+	    ACPI_HIBERNATE_TRACE('7');
+	    if (acpi_hibernate_trace)
+		printf("\n[RESUME] S4 resume successfully returned from hibernate_savectx!\n");
+	    ACPI_HIBERNATE_TRACE('8');
 	    /*
 	     * The hibernate image is a live snapshot of physical memory taken
 	     * by the dump worker, so the snapshot can capture a transient
@@ -3962,6 +3980,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    curthread->td_md.md_spinlock_count = 0;
 	    curthread->td_locks = saved_td_locks;
 	    curthread->td_pinned = saved_td_pinned;
+	    curthread->td_sleeplocks = saved_td_sleeplocks;
 	    hibernate_writing = false;
 	    callout_hibernate_report();
 	    /*
@@ -3970,58 +3989,74 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	     * clear.
 	     */
 	    dumping = 0;
-#ifdef SMP
-	    /*
-	     * Track A diagnostic UP degradation (Plan 008 / Design 010):
-	     * Secondary CPUs are cold-halted in Wait-For-SIPI (WFS) post-firmware.
-	     * Reconcile SMP variables to UP state on the BSP to prevent spinning
-	     * in SMP rendezvous and generic_restart_cpus().
-	     */
-	    CPU_ZERO(&suspended_cpus);
-	    CPU_ZERO(&resuming_cpus);
-	    CPU_ZERO(&toresume_cpus);
-	    smp_started = 0;
-	    CPU_SETOF(PCPU_GET(cpuid), &all_cpus);
-	    /*
-	     * The restored image still reports the pre-suspend CPU count, but
-	     * the APs are cold in WFS and smp_started is now 0.  Reflect the
-	     * UP degradation in the topology counters as well: several clock,
-	     * timer and interrupt paths assert "mp_ncpus == 1 || smp_started"
-	     * (e.g. timercb() in kern_clocksource.c, intr_assign_cpu()), so
-	     * with more than one CPU claimed and SMP not started the first
-	     * timer tick panics.  This is the CPU-count override Design 010
-	     * calls for, not a suppression of the invariant.
-	     */
-	    mp_ncpus = 1;
-	    mp_ncores = 1;
+#if defined(__i386__) || defined(__amd64__)
+	    pvclock_resume();
 #endif
+	    if ((timecounter->tc_flags & TC_FLAGS_SUSPEND_SAFE) == 0)
+		acpi_timer_suspend();
+	    slp_state |= ACPI_SS_SUSP_EH;
 	    pmap_init_pat();
 	    initializecpu();
 	    PCPU_SET(switchtime, 0);
 	    PCPU_SET(switchticks, ticks);
-	    outb(0x3f8, 'A');
+	    ACPI_HIBERNATE_TRACE('A');
 	    lapic_xapic_mode();
-	    outb(0x3f8, 'P');
-	    intr_resume(false);
-	    outb(0x3f8, '9');
-	    /*
-	     * Re-enable the scheduler before restoring interrupts.  The LAPIC
-	     * timer is already armed by intr_resume()/lapic_setup() and fires
-	     * as soon as STI executes.  Its tick processes callouts, and
-	     * callout_process() hands the callout-cpu spinlock off to the
-	     * (idle) softclock thread; if the scheduler is still stopped the
-	     * softclock thread cannot run to complete the handoff and the
-	     * interrupted thread is left holding that spinlock, so the very
-	     * next sleep lock (resumeclock()'s et_mtx) trips witness.  User
-	     * threads stay frozen independently until resume_all_proc(), so
-	     * releasing the scheduler here is safe.
-	     */
+	    ACPI_HIBERNATE_TRACE('P');
+#ifdef SMP
+	    if (acpi_hibernate_smp && !CPU_EMPTY(&susp_cpus)) {
+		/*
+		 * Match resume_other_cpus(): clear scheduler_stopped BEFORE
+		 * releasing APs.  APs return through the IPI trapframe into
+		 * whatever they were doing at suspend — typically cpu_idle()'s
+		 * critical section (td_critnest=1).  IPI_SUSPEND itself does
+		 * not critical_enter/exit.  Once lapic_setup arms the timer
+		 * and iret restores IF, a tick can set td_owepreempt; the
+		 * matching critical_exit then calls mi_switch().  If the
+		 * scheduler is still stopped, mi_switch returns without
+		 * spinlock_exit(), leaking nest/spinlock into the idle loop
+		 * (panic: mi_switch: switch in a critical section on cpuid=1).
+		 * User threads stay frozen until resume_all_proc().
+		 */
+		scheduler_stopped = false;
+		ACPI_HIBERNATE_TRACE('S'); /* Starting AP wakeup */
+		acpi_wakeup_cpus(sc, susp_cpus);
+		ACPI_HIBERNATE_TRACE('M'); /* APs reached 64-bit cpususpend_handler */
+		resume_cpus(susp_cpus);
+		ACPI_HIBERNATE_TRACE('P'); /* APs fully resumed */
+	    } else {
+		/*
+		 * Track A diagnostic UP degradation (Plan 008 / Design 010):
+		 * Secondary CPUs are cold-halted in Wait-For-SIPI (WFS) post-firmware.
+		 * Reconcile SMP variables to UP state on the BSP to prevent spinning
+		 * in SMP rendezvous and generic_restart_cpus().
+		 */
+		CPU_ZERO(&suspended_cpus);
+		CPU_ZERO(&resuming_cpus);
+		CPU_ZERO(&toresume_cpus);
+		smp_started = 0;
+		CPU_SETOF(PCPU_GET(cpuid), &all_cpus);
+		mp_ncpus = 1;
+		mp_ncores = 1;
+		/*
+		 * UP path: release the scheduler before STI for the same
+		 * callout-handoff reason as K11 (LAPIC timer + softclock).
+		 */
+		scheduler_stopped = false;
+	    }
+#else
 	    scheduler_stopped = false;
+#endif
+	    intr_resume(false);
+	    ACPI_HIBERNATE_TRACE('9');
+	    /*
+	     * Scheduler was re-enabled above (before AP resume_cpus / UP
+	     * STI).  Restore BSP interrupt state; timer callouts can drain.
+	     */
 	    intr_restore(intr_state);
-	    outb(0x3f8, '!');
-	    outb(0x3f8, 'T');
+	    ACPI_HIBERNATE_TRACE('!');
+	    ACPI_HIBERNATE_TRACE('T');
 	    resumeclock();
-	    outb(0x3f8, 'C');
+	    ACPI_HIBERNATE_TRACE('C');
 #if defined(__i386__) || defined(__amd64__)
 	    resume_TSC();
 #endif
@@ -4030,12 +4065,19 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    /* Free memory used to hibernate. */
 	    free(hpcb, M_TEMP);
 	    dumpsys_hibernate_free_hcb(hcb);
-	    outb(0x3f8, 'd');
+	    ACPI_HIBERNATE_TRACE('d');
 	    /*
 	     * We fully powered down, forget about restoring GPE state.
 	     */
 	    if (!acpi_supported_sstates[ACPI_STATE_S4])
 		slp_state &= ~ACPI_SS_GPE_SET;
+	    /*
+	     * We have returned from S4 cold boot. The hardware devices were
+	     * power-cycled and re-initialized by UEFI firmware, while the
+	     * restored kernel state expects them configured. Mark DEV_SUSPEND
+	     * so that backout: executes DEVICE_RESUME(root_bus).
+	     */
+	    slp_state |= ACPI_SS_DEV_SUSPEND;
 	    /*
 	     * Context has just been restored, we execute the normal
 	     * resume procedure.
@@ -4140,7 +4182,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
      * process.  This handles both the error and success cases.
      */
 backout:
-    outb(0x3f8, 'e');
+    ACPI_HIBERNATE_TRACE('e');
     if ((slp_state & ACPI_SS_GPE_SET) != 0) {
 	device_printf(sc->acpi_dev, "Disabling wake GPEs...\n");
 	acpi_wake_prep_walk(sc, acpi_sstate);
@@ -4150,7 +4192,7 @@ backout:
     if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
 	EVENTHANDLER_INVOKE(acpi_pre_dev_resume, stype);
 	device_printf(sc->acpi_dev, "Resuming devices...\n");
-	outb(0x3f8, 'f');
+	ACPI_HIBERNATE_TRACE('f');
 	DEVICE_RESUME(root_bus);
 	slp_state &= ~ACPI_SS_DEV_SUSPEND;
     }
@@ -4161,7 +4203,7 @@ backout:
 	slp_state &= ~ACPI_SS_SLP_PREP;
     }
     if ((slp_state & ACPI_SS_SLEPT) != 0) {
-	outb(0x3f8, 'g');
+	ACPI_HIBERNATE_TRACE('g');
 #if defined(__i386__) || defined(__amd64__)
 	/* NB: we are still using ACPI timecounter at this point. */
 	resume_TSC();
@@ -4186,7 +4228,7 @@ backout:
 #endif
 
     device_printf(sc->acpi_dev, "Resuming filesystems...\n");
-    outb(0x3f8, 'h');
+    ACPI_HIBERNATE_TRACE('h');
     resume_all_fs();
     /*
      * Restore scheduler execution before unfreezing processes
@@ -4194,10 +4236,10 @@ backout:
      */
     scheduler_stopped = false;
     device_printf(sc->acpi_dev, "Resuming processes...\n");
-    outb(0x3f8, 'i');
+    ACPI_HIBERNATE_TRACE('i');
     resume_all_proc();
-    outb(0x3f8, 'j');
-
+    ACPI_HIBERNATE_TRACE('j');
+    acpi_timer_resume();
     if ((slp_state & ACPI_SS_SUSP_EH) != 0) {
 	EVENTHANDLER_INVOKE(power_resume, stype);
 	slp_state &= ~ACPI_SS_SUSP_EH;
@@ -4207,7 +4249,7 @@ backout:
 
     /* Allow another sleep request after a while. */
     callout_schedule(&acpi_sleep_timer, hz * ACPI_MINIMUM_AWAKETIME);
-    outb(0x3f8, 'k');
+    ACPI_HIBERNATE_TRACE('k');
 
     /* Run /etc/rc.resume after we are back. */
     if (devctl_process_running())

@@ -1697,7 +1697,25 @@ cpususpend_handler(void)
 	mca_resume();
 	lapic_setup(0);
 
-	/* Indicate that we are resumed */
+	/*
+	 * Indicate that we are resumed.
+	 *
+	 * Nesting note (S3/S4): IPI_SUSPEND does NOT critical_enter() —
+	 * unlike intr_event_handle paths, Xcpususpend jumps straight into
+	 * this handler and returns via doreti/iret with no critical_exit().
+	 * A common suspend-time nest of 1 is from cpu_idle()'s own
+	 * critical_enter(); wakecode/resumectx returns into that section
+	 * whose critical_exit() balances it.  Zeroing nest here would
+	 * underflow that exit (unlike BSP K11, which discards snapshot
+	 * nesting on a cold hibernate return that does not resume into an
+	 * interrupted critical section).
+	 *
+	 * S4 must clear scheduler_stopped before resume_cpus() so a timer
+	 * tick that sets td_owepreempt cannot make that critical_exit()
+	 * call mi_switch() while SCHEDULER_STOPPED (which returns without
+	 * spinlock_exit and leaves nest/spinlock elevated into the idle
+	 * loop).  See acpi.c EJUSTRETURN SMP resume ordering.
+	 */
 	CPU_CLR_ATOMIC(cpu, &resuming_cpus);
 	CPU_CLR_ATOMIC(cpu, &suspended_cpus);
 	CPU_CLR_ATOMIC(cpu, &toresume_cpus);
