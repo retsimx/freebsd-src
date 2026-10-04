@@ -47,6 +47,8 @@
 #include <machine/cpu.h>
 #include <x86/init.h>
 
+int delay_tc_suspend_fallback = 0;
+
 static void
 delay_tsc(int n)
 {
@@ -71,7 +73,7 @@ delay_tc(int n)
 {
 	struct timecounter *tc;
 	timecounter_get_t *func;
-	uint64_t end, freq, now;
+	uint64_t end, freq, now, spin_count;
 	u_int last, mask, u;
 
 	/*
@@ -91,6 +93,7 @@ delay_tc(int n)
 	mask = tc->tc_counter_mask;
 	freq = tc->tc_frequency;
 	now = 0;
+	spin_count = 0;
 	end = freq * n / 1000000;
 	last = func(tc) & mask;
 	do {
@@ -101,6 +104,14 @@ delay_tc(int n)
 		else
 			now += u - last;
 		last = u;
+		if (++spin_count > 10000000 && now == 0 &&
+		    delay_tc_suspend_fallback != 0) {
+			/*
+			 * Timecounter frozen during suspend/hibernate window;
+			 * DELAY() falls back to init_ops.early_delay().
+			 */
+			return (0);
+		}
 	} while (now < end);
 	return (1);
 }

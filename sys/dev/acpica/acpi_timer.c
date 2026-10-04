@@ -35,6 +35,7 @@
 #include <sys/sysctl.h>
 #include <sys/timetc.h>
 #include <sys/power.h>
+#include <sys/proc.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -45,6 +46,7 @@
 
 #include <dev/acpica/acpivar.h>
 #include <dev/pci/pcivar.h>
+#include <machine/clock.h>
 
 /*
  * A timecounter based on the free-running ACPI timer.
@@ -237,6 +239,8 @@ acpi_timer_attach(device_t dev)
     return (0);
 }
 
+static struct timecounter *acpi_timer_saved_tc;
+
 static void
 acpi_timer_resume_handler(struct timecounter *newtc, enum power_stype stype)
 {
@@ -244,13 +248,19 @@ acpi_timer_resume_handler(struct timecounter *newtc, enum power_stype stype)
 
 	tc = timecounter;
 	if (tc != newtc) {
-		if (bootverbose)
+		if (bootverbose && acpi_timer_dev != NULL)
 			device_printf(acpi_timer_dev,
 			    "restoring timecounter, %s -> %s\n",
 			    tc->tc_name, newtc->tc_name);
 		(void)newtc->tc_get_timecount(newtc);
 		timecounter = newtc;
 	}
+	/*
+	 * Clear saved pointer and suspend-window delay fallback even when
+	 * already restored (explicit acpi_timer_resume + power_resume EH).
+	 */
+	acpi_timer_saved_tc = NULL;
+	delay_tc_suspend_fallback = 0;
 }
 
 static void
@@ -266,9 +276,11 @@ acpi_timer_suspend_handler(struct timecounter *newtc, enum power_stype stype)
 
 	if ((timecounter->tc_flags & TC_FLAGS_SUSPEND_SAFE) != 0) {
 		/*
-		 * If we are using a suspend safe timecounter, don't
-		 * save/restore it across suspend/resume.
+		 * Already on a suspend-safe timecounter — leave
+		 * acpi_timer_saved_tc untouched so a prior switch's
+		 * saved target is not lost on a redundant suspend call.
 		 */
+		delay_tc_suspend_fallback = 1;
 		return;
 	}
 
@@ -277,15 +289,55 @@ acpi_timer_suspend_handler(struct timecounter *newtc, enum power_stype stype)
 
 	tc = timecounter;
 	if (tc != newtc) {
-		if (bootverbose)
+		if (bootverbose && acpi_timer_dev != NULL)
 			device_printf(acpi_timer_dev,
 			    "switching timecounter, %s -> %s\n",
 			    tc->tc_name, newtc->tc_name);
 		(void)acpi_timer_read();
 		(void)acpi_timer_read();
+		/*
+		 * Preserve the first saved non-ACPI timecounter across
+		 * redundant suspend calls (hibernate entry + EJUSTRETURN).
+		 */
+		if (acpi_timer_saved_tc == NULL)
+			acpi_timer_saved_tc = tc;
 		timecounter = newtc;
-		acpi_timer_eh = EVENTHANDLER_REGISTER(power_resume,
-		    acpi_timer_resume_handler, tc, EVENTHANDLER_PRI_LAST);
+		delay_tc_suspend_fallback = 1;
+		if (curthread->td_critnest == 0 &&
+		    curthread->td_md.md_spinlock_count == 0) {
+			acpi_timer_eh = EVENTHANDLER_REGISTER(power_resume,
+			    acpi_timer_resume_handler, acpi_timer_saved_tc,
+			    EVENTHANDLER_PRI_LAST);
+		}
+	}
+}
+
+void
+acpi_timer_suspend(void)
+{
+	if (acpi_timer_timecounter.tc_quality <= 0)
+		return;
+	acpi_timer_suspend_handler(&acpi_timer_timecounter,
+	    POWER_STYPE_OS_HIBERNATE);
+}
+
+void
+acpi_timer_resume(void)
+{
+	struct timecounter *tc;
+
+	tc = acpi_timer_saved_tc;
+	if (tc != NULL && tc != timecounter) {
+		acpi_timer_saved_tc = NULL;
+		acpi_timer_resume_handler(tc, POWER_STYPE_OS_HIBERNATE);
+	} else {
+		acpi_timer_saved_tc = NULL;
+		delay_tc_suspend_fallback = 0;
+	}
+	/* Drop any EH so a later power_resume cannot double-swap. */
+	if (acpi_timer_eh != NULL) {
+		EVENTHANDLER_DEREGISTER(power_resume, acpi_timer_eh);
+		acpi_timer_eh = NULL;
 	}
 }
 

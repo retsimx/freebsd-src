@@ -24,6 +24,13 @@ extern int	smp_tsc;
 
 void	i8254_init(void);
 void	i8254_delay(int);
+/*
+ * When non-zero, delay_tc() may fall back to early_delay() if the active
+ * timecounter appears frozen.  Set only for suspend/hibernate windows
+ * where hypervisor clocks may be un-armed; must not stay set in normal
+ * operation or it would mask broken timecounters.
+ */
+extern int	delay_tc_suspend_fallback;
 void	clock_init(void);
 void	lapic_calibrate(void);
 void	tsc_init(void);

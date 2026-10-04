@@ -33,6 +33,7 @@
 
 #include "acpi_if.h"
 #include "bus_if.h"
+#include <sys/_cpuset.h>
 #include <sys/_eventhandler.h>
 #ifdef INTRNG
 #include <sys/intr.h>
@@ -530,6 +531,19 @@ void		acpi_install_wakeup_handler(struct acpi_softc *sc);
 int		acpi_sleep_machdep(struct acpi_softc *sc, int state);
 int		acpi_wakeup_machdep(struct acpi_softc *sc, int state,
 		    int sleep_result, int intr_enabled);
+#if defined(__amd64__)
+void		acpi_wakeup_cpus(struct acpi_softc *sc, cpuset_t map);
+#else
+/* i386 / other: S4 SMP AP re-entry is amd64-only; no-op stub. */
+static __inline void
+acpi_wakeup_cpus(struct acpi_softc *sc, cpuset_t map)
+{
+	(void)sc;
+	(void)map;
+}
+#endif
+void		acpi_timer_suspend(void);
+void		acpi_timer_resume(void);
 int		acpi_table_quirks(int *quirks);
 int		acpi_machdep_quirks(int *quirks);
 int		acpi_pnpinfo(ACPI_HANDLE handle, struct sbuf *sb);
