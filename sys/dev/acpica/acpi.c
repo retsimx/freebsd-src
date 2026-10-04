@@ -58,10 +58,13 @@
 #include <sys/uuid.h>
 
 #if defined(__i386__) || defined(__amd64__)
+#include <vm/vm.h>
+#include <vm/pmap.h>
 #include <machine/clock.h>
 #include <machine/cpufunc.h>
 #include <machine/intr_machdep.h>
 #include <machine/pci_cfgreg.h>
+#include <x86/apicvar.h>
 #include <x86/cputypes.h>
 #include <x86/x86_var.h>
 #endif
@@ -3931,13 +3934,80 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    outb(0x3f8, '7');
 	    printf("\n[RESUME] S4 resume successfully returned from hibernate_savectx!\n");
 	    outb(0x3f8, '8');
-	    resume_other_cpus(&susp_cpus);
+	    /*
+	     * The hibernate image is a live snapshot of physical memory taken
+	     * by the dump worker, so the snapshot can capture a transient
+	     * critical section in this thread's nesting counters (for example
+	     * spinlock_enter()'s critical_enter(), or pvclock_getsystime()).
+	     * The logical save point held no locks or critical sections, so
+	     * discard any captured nesting before taking sleep locks
+	     * (intr_resume(), resumeclock(), free()) and re-enabling
+	     * interrupts.  Otherwise witness panics on the first blockable
+	     * sleep lock acquired with a non-zero critical nesting.
+	     */
+	    curthread->td_critnest = 0;
+	    curthread->td_md.md_spinlock_count = 0;
+#ifdef SMP
+	    /*
+	     * Track A diagnostic UP degradation (Plan 008 / Design 010):
+	     * Secondary CPUs are cold-halted in Wait-For-SIPI (WFS) post-firmware.
+	     * Reconcile SMP variables to UP state on the BSP to prevent spinning
+	     * in SMP rendezvous and generic_restart_cpus().
+	     */
+	    CPU_ZERO(&suspended_cpus);
+	    CPU_ZERO(&resuming_cpus);
+	    CPU_ZERO(&toresume_cpus);
+	    smp_started = 0;
+	    CPU_SETOF(PCPU_GET(cpuid), &all_cpus);
+	    /*
+	     * The restored image still reports the pre-suspend CPU count, but
+	     * the APs are cold in WFS and smp_started is now 0.  Reflect the
+	     * UP degradation in the topology counters as well: several clock,
+	     * timer and interrupt paths assert "mp_ncpus == 1 || smp_started"
+	     * (e.g. timercb() in kern_clocksource.c, intr_assign_cpu()), so
+	     * with more than one CPU claimed and SMP not started the first
+	     * timer tick panics.  This is the CPU-count override Design 010
+	     * calls for, not a suppression of the invariant.
+	     */
+	    mp_ncpus = 1;
+	    mp_ncores = 1;
+#endif
+	    pmap_init_pat();
+	    initializecpu();
+	    PCPU_SET(switchtime, 0);
+	    PCPU_SET(switchticks, ticks);
+	    outb(0x3f8, 'A');
+	    lapic_xapic_mode();
+	    outb(0x3f8, 'P');
+	    intr_resume(false);
 	    outb(0x3f8, '9');
+	    /*
+	     * Re-enable the scheduler before restoring interrupts.  The LAPIC
+	     * timer is already armed by intr_resume()/lapic_setup() and fires
+	     * as soon as STI executes.  Its tick processes callouts, and
+	     * callout_process() hands the callout-cpu spinlock off to the
+	     * (idle) softclock thread; if the scheduler is still stopped the
+	     * softclock thread cannot run to complete the handoff and the
+	     * interrupted thread is left holding that spinlock, so the very
+	     * next sleep lock (resumeclock()'s et_mtx) trips witness.  User
+	     * threads stay frozen independently until resume_all_proc(), so
+	     * releasing the scheduler here is safe.
+	     */
+	    scheduler_stopped = false;
 	    intr_restore(intr_state);
 	    outb(0x3f8, '!');
+	    outb(0x3f8, 'T');
+	    resumeclock();
+	    outb(0x3f8, 'C');
+#if defined(__i386__) || defined(__amd64__)
+	    resume_TSC();
+#endif
+	    acpi_resync_clock(sc);
+	    acpi_enable_fixed_events(sc);
 	    /* Free memory used to hibernate. */
 	    free(hpcb, M_TEMP);
 	    dumpsys_hibernate_free_hcb(hcb);
+	    outb(0x3f8, 'd');
 	    /*
 	     * We fully powered down, forget about restoring GPE state.
 	     */
@@ -4047,6 +4117,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
      * process.  This handles both the error and success cases.
      */
 backout:
+    outb(0x3f8, 'e');
     if ((slp_state & ACPI_SS_GPE_SET) != 0) {
 	device_printf(sc->acpi_dev, "Disabling wake GPEs...\n");
 	acpi_wake_prep_walk(sc, acpi_sstate);
@@ -4056,6 +4127,7 @@ backout:
     if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
 	EVENTHANDLER_INVOKE(acpi_pre_dev_resume, stype);
 	device_printf(sc->acpi_dev, "Resuming devices...\n");
+	outb(0x3f8, 'f');
 	DEVICE_RESUME(root_bus);
 	slp_state &= ~ACPI_SS_DEV_SUSPEND;
     }
@@ -4066,6 +4138,7 @@ backout:
 	slp_state &= ~ACPI_SS_SLP_PREP;
     }
     if ((slp_state & ACPI_SS_SLEPT) != 0) {
+	outb(0x3f8, 'g');
 #if defined(__i386__) || defined(__amd64__)
 	/* NB: we are still using ACPI timecounter at this point. */
 	resume_TSC();
@@ -4090,9 +4163,17 @@ backout:
 #endif
 
     device_printf(sc->acpi_dev, "Resuming filesystems...\n");
+    outb(0x3f8, 'h');
     resume_all_fs();
+    /*
+     * Restore scheduler execution before unfreezing processes
+     * (Plan 008 / Design 010 Section 2.1).
+     */
+    scheduler_stopped = false;
     device_printf(sc->acpi_dev, "Resuming processes...\n");
+    outb(0x3f8, 'i');
     resume_all_proc();
+    outb(0x3f8, 'j');
 
     if ((slp_state & ACPI_SS_SUSP_EH) != 0) {
 	EVENTHANDLER_INVOKE(power_resume, stype);
@@ -4103,6 +4184,7 @@ backout:
 
     /* Allow another sleep request after a while. */
     callout_schedule(&acpi_sleep_timer, hz * ACPI_MINIMUM_AWAKETIME);
+    outb(0x3f8, 'k');
 
     /* Run /etc/rc.resume after we are back. */
     if (devctl_process_running())
