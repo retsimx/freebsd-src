@@ -530,6 +530,8 @@ void		acpi_install_wakeup_handler(struct acpi_softc *sc);
 int		acpi_sleep_machdep(struct acpi_softc *sc, int state);
 int		acpi_wakeup_machdep(struct acpi_softc *sc, int state,
 		    int sleep_result, int intr_enabled);
+void		acpi_timer_suspend(void);
+void		acpi_timer_resume(void);
 int		acpi_table_quirks(int *quirks);
 int		acpi_machdep_quirks(int *quirks);
 int		acpi_pnpinfo(ACPI_HANDLE handle, struct sbuf *sb);
