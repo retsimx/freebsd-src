@@ -700,6 +700,7 @@ dump_for_hibernate(const struct hibernate_cb *const hcb,
 	 * we need to reproduce these here.
 	 */
 	++dumping;
+	hibernate_writing = true;
 
 	/* XXX - Validity of 'dumper_configs' under SCHEDULER_STOPPED(). */
 	TAILQ_FOREACH(di, &dumper_configs, di_next) {
@@ -717,7 +718,9 @@ dump_for_hibernate(const struct hibernate_cb *const hcb,
 	}
 
 finish:
+	hibernate_writing = false;
 	--dumping;
+	callout_hibernate_report();
 
 	return (error);
 }

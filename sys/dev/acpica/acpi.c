@@ -3944,9 +3944,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	     * (intr_resume(), resumeclock(), free()) and re-enabling
 	     * interrupts.  Otherwise witness panics on the first blockable
 	     * sleep lock acquired with a non-zero critical nesting.
+	     * Likewise hibernate_writing is captured as true; clear it or
+	     * every callout stays frozen after resume.
 	     */
 	    curthread->td_critnest = 0;
 	    curthread->td_md.md_spinlock_count = 0;
+	    hibernate_writing = false;
+	    callout_hibernate_report();
 #ifdef SMP
 	    /*
 	     * Track A diagnostic UP degradation (Plan 008 / Design 010):
