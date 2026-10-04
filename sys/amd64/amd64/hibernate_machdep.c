@@ -94,7 +94,8 @@ hibernate_setup_identity_map(void)
  * Returns twice, the second time with EJUSTRETURN (on restore).
  */
 int
-dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
+dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb, void *stack_top,
+    int (*dump_fn)(void *, void *), void *dump_arg)
 {
 	static void *low_page = NULL;
 	struct pcb *pcb;
@@ -121,7 +122,8 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
 	 * 3. Copy trampoline code to offset 0 and record kernel CR3.
 	 */
 	bcopy(hibernate_resume_tramp, low_page, hibernate_resume_tramp_size);
-	cr3_offset = (uintptr_t)&hibernate_tramp_cr3 - (uintptr_t)hibernate_resume_tramp;
+	cr3_offset = (uintptr_t)&hibernate_tramp_cr3 -
+	    (uintptr_t)hibernate_resume_tramp;
 	*(uint64_t *)((char *)low_page + cr3_offset) = kernel_pmap->pm_cr3;
 
 	/*
@@ -132,12 +134,28 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
 
 	pcb = &susppcbs[0]->sp_pcb;
 
+	/*
+	 * Capture FPU state before hibernate_savectx so subsequent stack
+	 * growth cannot overwrite the return-address slot savectx saved.
+	 */
+	fpususpend(susppcbs[0]->sp_fpususpend);
+
 	error = hibernate_savectx(hpcb, pcb, low_entry_pa, low_stack_pa);
-	if (error == 0) {
-		fpususpend(susppcbs[0]->sp_fpususpend);
-		return (0);
+	if (error != 0) {
+		fpuresume(susppcbs[0]->sp_fpususpend);
+		return (EJUSTRETURN);
 	}
 
-	fpuresume(susppcbs[0]->sp_fpususpend);
-	return (EJUSTRETURN);
+	/*
+	 * Save path: hibernate_savectx returned 0.
+	 * Do not return to the caller or unwind this frame. The suspended
+	 * thread's stack frame (including the return-address slot into
+	 * acpi_EnterSleepState) must remain completely unperturbed.
+	 * Execute the dump worker on the isolated scratch stack.
+	 */
+	if (stack_top != NULL && dump_fn != NULL)
+		error = hibernate_call_on_stack(stack_top, dump_fn, dump_arg,
+		    NULL);
+
+	return (error);
 }

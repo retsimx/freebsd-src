@@ -3679,6 +3679,33 @@ resume_other_cpus(const cpuset_t *const susp_cpus)
 #endif
 }
 
+static char hibernate_dump_stack[HIBERNATE_SCRATCH_STACK_SIZE] __aligned(PAGE_SIZE);
+
+struct hibernate_dump_args {
+	struct acpi_softc	*sc;
+	struct hibernate_cb	*hcb;
+	struct hibernate_pcb	*hpcb;
+	int			slp_state;
+};
+
+static int
+acpi_hibernate_dump_worker(void *arg1, void *arg2)
+{
+	struct hibernate_dump_args *args = arg1;
+	int error = 0;
+
+	(void)arg2;
+	if ((args->slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
+		device_printf(args->sc->acpi_dev,
+		    "Resuming the dump device (currently, all devices)\n");
+		DEVICE_RESUME(root_bus);
+	}
+
+	device_printf(args->sc->acpi_dev, "Saving the dump image...\n");
+	error = dump_for_hibernate(args->hcb, args->hpcb);
+	return (error);
+}
+
 #endif
 
 /*
@@ -3875,11 +3902,27 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * other means to know we have to deallocate)?
 	 */
 
+	struct hibernate_dump_args dargs = {
+		.sc = sc,
+		.hcb = hcb,
+		.hpcb = hpcb,
+		.slp_state = slp_state,
+	};
+	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
+
 	/*
 	 * This is where the current CPU context is saved, and from where we
 	 * return on resume.
+	 *
+	 * On save, dumpsys_hibernate_savectx executes acpi_hibernate_dump_worker
+	 * directly on the scratch stack without unwinding, preserving the saved
+	 * return-address slot into this function completely intact in the image.
+	 *
+	 * On resume, dumpsys_hibernate_savectx returns EJUSTRETURN into this
+	 * function.
 	 */
-	error = dumpsys_hibernate_savectx(hpcb);
+	error = dumpsys_hibernate_savectx(hpcb, stack_top,
+	    (int (*)(void *, void *))acpi_hibernate_dump_worker, &dargs);
 
 	switch (error) {
 	case 0:
@@ -3904,25 +3947,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    goto backout;
 
 	default:
+	    if (error > 0)
+		break;
 	    __assert_unreachable();
 	}
 
-	/*
-	 * XXX - Re-activate the dump device.
-	 *
-	 * For now, we reactivate all devices, as re-activating just the dump device
-	 * requires some infrastructure work.
-	 */
-	if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
-	    device_printf(sc->acpi_dev,
-			  "Resuming the dump device (currently, all devices)\n");
-	    DEVICE_RESUME(root_bus);
-	    slp_state &= ~ACPI_SS_DEV_SUSPEND;
-	}
-
-	/* Save the image. */
-	device_printf(sc->acpi_dev, "Saving the dump image...\n");
-	error = dump_for_hibernate(hcb, hpcb);
+	if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0)
+		slp_state &= ~ACPI_SS_DEV_SUSPEND;
 
 	resume_other_cpus(&susp_cpus);
 	intr_restore(intr_state);
