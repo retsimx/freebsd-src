@@ -59,6 +59,7 @@
 
 #if defined(__i386__) || defined(__amd64__)
 #include <machine/clock.h>
+#include <machine/cpufunc.h>
 #include <machine/intr_machdep.h>
 #include <machine/pci_cfgreg.h>
 #include <x86/cputypes.h>
@@ -3901,20 +3902,39 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * other means to know we have to deallocate)?
 	 */
 
+	struct hibernate_dump_args dargs = {
+		.sc = sc,
+		.hcb = hcb,
+		.hpcb = hpcb,
+		.slp_state = slp_state,
+	};
+	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
+
 	/*
 	 * This is where the current CPU context is saved, and from where we
 	 * return on resume.
+	 *
+	 * On save, dumpsys_hibernate_savectx executes acpi_hibernate_dump_worker
+	 * directly on the scratch stack without unwinding, preserving the saved
+	 * return-address slot into this function completely intact in the image.
+	 *
+	 * On resume, dumpsys_hibernate_savectx returns EJUSTRETURN into this function.
 	 */
-	error = dumpsys_hibernate_savectx(hpcb);
+	error = dumpsys_hibernate_savectx(hpcb, stack_top,
+	    (int (*)(void *, void *))acpi_hibernate_dump_worker, &dargs);
 
 	switch (error) {
 	case 0:
 	    break;
 
 	case EJUSTRETURN:
+	    outb(0x3f8, '7');
 	    printf("\n[RESUME] S4 resume successfully returned from hibernate_savectx!\n");
+	    outb(0x3f8, '8');
 	    resume_other_cpus(&susp_cpus);
+	    outb(0x3f8, '9');
 	    intr_restore(intr_state);
+	    outb(0x3f8, '!');
 	    /* Free memory used to hibernate. */
 	    free(hpcb, M_TEMP);
 	    dumpsys_hibernate_free_hcb(hcb);
@@ -3931,19 +3951,11 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    goto backout;
 
 	default:
+	    if (error > 0)
+		break;
 	    __assert_unreachable();
 	}
 
-	struct hibernate_dump_args dargs = {
-		.sc = sc,
-		.hcb = hcb,
-		.hpcb = hpcb,
-		.slp_state = slp_state,
-	};
-	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
-
-	error = hibernate_call_on_stack(stack_top,
-	    (int (*)(void *, void *))acpi_hibernate_dump_worker, &dargs, NULL);
 	if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0)
 		slp_state &= ~ACPI_SS_DEV_SUSPEND;
 

@@ -94,7 +94,8 @@ hibernate_setup_identity_map(void)
  * Returns twice, the second time with EJUSTRETURN (on restore).
  */
 int
-dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
+dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb, void *stack_top,
+    int (*dump_fn)(void *, void *), void *dump_arg)
 {
 	static void *low_page = NULL;
 	struct pcb *pcb;
@@ -137,9 +138,21 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
 	error = hibernate_savectx(hpcb, pcb, low_entry_pa, low_stack_pa);
 	if (error != 0) {
 		outb(0x3f8, '4');
+		outb(0x3f8, '5');
 		fpuresume(susppcbs[0]->sp_fpususpend);
+		outb(0x3f8, '6');
 		return (EJUSTRETURN);
 	}
 
-	return (0);
+	/*
+	 * Save path: hibernate_savectx returned 0.
+	 * Do not return to the caller or unwind this frame! The suspended
+	 * thread's stack frame (including the return-address slot into
+	 * acpi_EnterSleepState) must remain completely unperturbed.
+	 * Execute the dump worker on the isolated scratch stack.
+	 */
+	if (stack_top != NULL && dump_fn != NULL)
+		error = hibernate_call_on_stack(stack_top, dump_fn, dump_arg, NULL);
+
+	return (error);
 }
