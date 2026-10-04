@@ -3951,6 +3951,12 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    curthread->td_md.md_spinlock_count = 0;
 	    hibernate_writing = false;
 	    callout_hibernate_report();
+	    /*
+	     * dump_for_hibernate() raised 'dumping' around the image write, so
+	     * the image captured it as non-zero; the logical save point had it
+	     * clear.
+	     */
+	    dumping = 0;
 #ifdef SMP
 	    /*
 	     * Track A diagnostic UP degradation (Plan 008 / Design 010):
