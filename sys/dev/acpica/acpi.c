@@ -3912,6 +3912,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		.slp_state = slp_state,
 	};
 	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
+	/*
+	 * Capture on the preserved thread stack (K9) before savectx: dump-path
+	 * code can take sleep locks / pin the CPU, so the counters frozen into
+	 * the thread page no longer match the logical save point.
+	 */
+	int saved_td_locks = curthread->td_locks;
+	int saved_td_pinned = curthread->td_pinned;
 
 	/*
 	 * This is where the current CPU context is saved, and from where we
@@ -3946,9 +3953,15 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	     * sleep lock acquired with a non-zero critical nesting.
 	     * Likewise hibernate_writing is captured as true; clear it or
 	     * every callout stays frozen after resume.
+	     * Dump-path code can also take sleep locks / pin the CPU, so the
+	     * captured td_locks / td_pinned no longer match the logical save
+	     * point; restore from the pre-savectx locals which live on the
+	     * preserved thread stack (K9).
 	     */
 	    curthread->td_critnest = 0;
 	    curthread->td_md.md_spinlock_count = 0;
+	    curthread->td_locks = saved_td_locks;
+	    curthread->td_pinned = saved_td_pinned;
 	    hibernate_writing = false;
 	    callout_hibernate_report();
 	    /*
