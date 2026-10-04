@@ -3714,8 +3714,7 @@ acpi_hibernate_dump_worker(void *arg1, void *arg2)
 
 /*
  * S4 resume stages.  EJUSTRETURN calls the
- * orchestrator once, then goto backout.  AP wake lands in a later commit at
- * the marked site inside acpi_s4_resume_scheduler_aps().
+ * orchestrator once, then goto backout.
  */
 static void
 acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
@@ -3773,15 +3772,23 @@ static void
 acpi_s4_resume_scheduler_aps(struct acpi_softc *sc, const cpuset_t *susp_cpus)
 {
 
-	(void)sc;
-	(void)susp_cpus;
 	/*
-	 * Single S4-path scheduler release, before any AP release.  AP wake
-	 * (EFER fixup + acpi_wakeup_cpus + resume_cpus when susp_cpus is
-	 * non-empty) is intentionally omitted here and lands in a later
-	 * commit at this call site.  No UP clamp.
+	 * Single S4-path scheduler release, before any AP release.  Match
+	 * resume_other_cpus(): clear scheduler_stopped BEFORE releasing APs
+	 * so an AP returning into cpu_idle cannot mi_switch while
+	 * SCHEDULER_STOPPED.  Empty susp_cpus (true UP) skips AP wake.
+	 * No UP clamp — AP wake failure panics.
 	 */
 	scheduler_stopped = false;
+#ifdef SMP
+	if (!CPU_EMPTY(susp_cpus)) {
+		acpi_wakeup_cpus(sc, *susp_cpus);
+		resume_cpus(*susp_cpus);
+	}
+#else
+	(void)sc;
+	(void)susp_cpus;
+#endif
 }
 
 static void
