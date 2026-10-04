@@ -132,13 +132,14 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb)
 
 	pcb = &susppcbs[0]->sp_pcb;
 
+	fpususpend(susppcbs[0]->sp_fpususpend);
+
 	error = hibernate_savectx(hpcb, pcb, low_entry_pa, low_stack_pa);
-	if (error == 0) {
-		fpususpend(susppcbs[0]->sp_fpususpend);
-		return (0);
+	if (error != 0) {
+		outb(0x3f8, '4');
+		fpuresume(susppcbs[0]->sp_fpususpend);
+		return (EJUSTRETURN);
 	}
 
-	outb(0x3f8, '4');
-	fpuresume(susppcbs[0]->sp_fpususpend);
-	return (EJUSTRETURN);
+	return (0);
 }
