@@ -142,7 +142,12 @@ dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb, void *stack_top,
 
 	error = hibernate_savectx(hpcb, pcb, low_entry_pa, low_stack_pa);
 	if (error != 0) {
-		fpuresume(susppcbs[0]->sp_fpususpend);
+		/*
+		 * Restore the BSP FPU state (and XCR0) later, in
+		 * acpi_s4_resume_bsp_cpu() after initializecpu(): the CPU
+		 * reset on resume leaves XCR0 at its x87-only reset value,
+		 * so an early restore does not survive.
+		 */
 		return (EJUSTRETURN);
 	}
 
