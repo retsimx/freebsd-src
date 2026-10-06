@@ -34,7 +34,8 @@
 #define HIBER_REFUSE_MAX_PROBES	16
 #define HIBER_REFUSE_TEXT_MAX	4096
 #define HIBER_TRACE_MAX		(96 * 1024)
-#define A1_BLK_CRC_MAX		65536	/* max 64 KiB blocks per chunk (~4 GiB) */
+#define HIBER_A1_BLOCK_SIZE	(16 * EFI_PAGE_SIZE)	/* fixed 64 KiB */
+#define A1_BLK_CRC_MAX		65536	/* blocks per audit window (4 GiB) */
 
 /*
  * Fixed sub-layout of the kernel-declared contiguous spare arena
@@ -525,69 +526,96 @@ struct a1_bad_stats {
 };
 
 /*
- * Single bounded pass over the direct ranges: compare each 64 KiB block's
- * in-memory CRC against the table captured while streaming. O(n), no I/O.
- * Collects an uncapped count, PA extremes, run count and a small sample.
- * Deliberately performs NO repair and NO re-read: earlier evidence shows a
- * repair read can clobber a different already-restored page (non-convergent).
+ * Cursor into the monotonically ordered direct-range stream.  Saving the
+ * cursor at a window boundary lets the fixed CRC table be replayed without
+ * storing one extent descriptor per block.
  */
-static void
-a1_scan_bad_blocks(const struct hibernate_range *chunk_direct,
-    u_int n_chunk_direct, const uint32_t *a1_blk_crc, u_int n_blk,
-    struct a1_bad_stats *st)
+struct a1_direct_cursor {
+	u_int range;
+	uint64_t pa;
+};
+
+/*
+ * Audit exactly n_blk transfer extents beginning at *cursor.  The transfer
+ * extent rule is identical to the streaming path, including short extents at
+ * direct-range boundaries.  Return false on malformed ranges, arithmetic
+ * failure, cursor exhaustion, or a table/range cardinality mismatch.
+ */
+static bool
+a1_scan_bad_window(const struct hibernate_range *chunk_direct,
+    u_int n_chunk_direct, struct a1_direct_cursor *cursor,
+    const uint32_t *a1_blk_crc, u_int n_blk, struct a1_bad_stats *st)
 {
-	u_int bi = 0;
-	bool prev_bad = false;
+	struct a1_direct_cursor cur;
+	bool prev_bad;
+	u_int bi;
 
 	memset(st, 0, sizeof(*st));
-	for (u_int dr = 0; dr < n_chunk_direct; dr++) {
-		uint64_t dir_start = chunk_direct[dr].start;
-		uint64_t dir_pages =
-		    (chunk_direct[dr].end - dir_start) / EFI_PAGE_SIZE;
-		uint64_t pages_left = dir_pages;
+	if (cursor == NULL || a1_blk_crc == NULL || n_blk == 0 ||
+	    n_blk > A1_BLK_CRC_MAX)
+		return (false);
 
-		while (pages_left > 0) {
-			uint64_t blk_pages = (pages_left > 16) ? 16 : pages_left;
-			uint64_t blk_bytes = blk_pages * EFI_PAGE_SIZE;
-			uint64_t dst_pa = dir_start +
-			    (dir_pages - pages_left) * EFI_PAGE_SIZE;
-			uint32_t got_crc;
+	cur = *cursor;
+	prev_bad = false;
+	for (bi = 0; bi < n_blk; bi++) {
+		uint64_t avail, blk_bytes, next_pa;
+		uint32_t got_crc;
 
-			if (a1_blk_crc != NULL && bi < n_blk) {
-				got_crc = hibernate_crc32_update(0xFFFFFFFF,
-				    (const void *)(uintptr_t)dst_pa,
-				    blk_bytes) ^ 0xFFFFFFFF;
-				if (got_crc != a1_blk_crc[bi]) {
-					if (st->n_bad == 0) {
-						st->first_pa = dst_pa;
-						st->min_pa = dst_pa;
-						st->max_pa = dst_pa;
-					}
-					st->last_pa = dst_pa;
-					if (dst_pa < st->min_pa)
-						st->min_pa = dst_pa;
-					if (dst_pa > st->max_pa)
-						st->max_pa = dst_pa;
-					if (!prev_bad)
-						st->n_runs++;
-					if (st->n_samples < nitems(st->sample)) {
-						st->sample[st->n_samples].pa = dst_pa;
-						st->sample[st->n_samples].exp =
-						    a1_blk_crc[bi];
-						st->sample[st->n_samples].got =
-						    got_crc;
-						st->n_samples++;
-					}
-					st->n_bad++;
-					prev_bad = true;
-				} else {
-					prev_bad = false;
-				}
-			}
-			bi++;
-			pages_left -= blk_pages;
+		while (cur.range < n_chunk_direct &&
+		    cur.pa == chunk_direct[cur.range].end) {
+			cur.range++;
+			if (cur.range < n_chunk_direct)
+				cur.pa = chunk_direct[cur.range].start;
 		}
+		if (cur.range >= n_chunk_direct ||
+		    chunk_direct[cur.range].start >=
+		    chunk_direct[cur.range].end ||
+		    cur.pa < chunk_direct[cur.range].start ||
+		    cur.pa >= chunk_direct[cur.range].end)
+			return (false);
+
+		avail = chunk_direct[cur.range].end - cur.pa;
+		blk_bytes = avail > HIBER_A1_BLOCK_SIZE ?
+		    HIBER_A1_BLOCK_SIZE : avail;
+		if (blk_bytes == 0 || (blk_bytes % EFI_PAGE_SIZE) != 0 ||
+		    cur.pa > UINT64_MAX - blk_bytes)
+			return (false);
+		next_pa = cur.pa + blk_bytes;
+		if (next_pa > chunk_direct[cur.range].end)
+			return (false);
+
+		got_crc = hibernate_crc32_update(0xFFFFFFFF,
+		    (const void *)(uintptr_t)cur.pa, (size_t)blk_bytes) ^
+		    0xFFFFFFFF;
+		if (got_crc != a1_blk_crc[bi]) {
+			if (st->n_bad == 0) {
+				st->first_pa = cur.pa;
+				st->min_pa = cur.pa;
+				st->max_pa = cur.pa;
+			}
+			st->last_pa = cur.pa;
+			if (cur.pa < st->min_pa)
+				st->min_pa = cur.pa;
+			if (cur.pa > st->max_pa)
+				st->max_pa = cur.pa;
+			if (!prev_bad)
+				st->n_runs++;
+			if (st->n_samples < nitems(st->sample)) {
+				st->sample[st->n_samples].pa = cur.pa;
+				st->sample[st->n_samples].exp =
+				    a1_blk_crc[bi];
+				st->sample[st->n_samples].got = got_crc;
+				st->n_samples++;
+			}
+			st->n_bad++;
+			prev_bad = true;
+		} else {
+			prev_bad = false;
+		}
+		cur.pa = next_pa;
 	}
+	*cursor = cur;
+	return (true);
 }
 
 static const EFI_MEMORY_DESCRIPTOR *
@@ -2118,6 +2146,472 @@ hibernate_prepare_handoff(struct hibernate_restore *hr)
 	return (true);
 }
 
+static bool
+hibernate_build_chunk_direct_ranges(
+    const struct hibernate_restore *hr, uint64_t chunk_start,
+    uint64_t chunk_size, struct hibernate_range *ranges,
+    u_int max_ranges, u_int *nranges)
+{
+	uint64_t chunk_end;
+	if (chunk_start > UINT64_MAX - chunk_size) {
+		hiber_refuse_pending = "A1 direct cursor invalid";
+		return (false);
+	}
+	chunk_end = chunk_start + chunk_size;
+	*nranges = 0;
+
+	for (u_int claim = 0; claim < hr->n_direct_claims; claim++) {
+		uint64_t start, end;
+
+		start = hr->direct_claims[claim].start;
+		end = hr->direct_claims[claim].end;
+		if (end <= chunk_start || start >= chunk_end)
+			continue;
+		if (start < chunk_start)
+			start = chunk_start;
+		if (end > chunk_end)
+			end = chunk_end;
+		if (start >= end)
+			continue;
+		if ((*nranges) >= max_ranges) {
+			hiber_log(HIBER_LOG_ERROR,
+			    "hibernate: A1 claimed-direct table overflow "
+			    "(%u entries)\n", (*nranges));
+			hiber_refuse_pending =
+			    "A1 claimed-direct table overflow";
+			return (false);
+		}
+		ranges[(*nranges)].start = start;
+		ranges[(*nranges)].end = end;
+		(*nranges)++;
+	}
+
+	/* Keep disk streaming and CRC order monotonic in physical address. */
+	for (u_int a = 0; a < (*nranges); a++) {
+		for (u_int b = a + 1; b < (*nranges); b++) {
+			if (ranges[b].start <
+			    ranges[a].start) {
+				struct hibernate_range tmp;
+
+				tmp = ranges[a];
+				ranges[a] = ranges[b];
+				ranges[b] = tmp;
+			}
+		}
+	}
+	return (true);
+}
+
+static bool
+hibernate_stream_direct_chunk(struct hibernate_restore *hr,
+    u_int ph_index, const struct hibernate_range *direct, u_int ndirect)
+{
+	EFI_STATUS status;
+	uint64_t c_start, c_size, c_offset;
+
+	c_start = hr->ph[ph_index].p_paddr;
+	c_size = hr->ph[ph_index].p_memsz != 0 ?
+	    hr->ph[ph_index].p_memsz : hr->ph[ph_index].p_filesz;
+	c_offset = hr->ph[ph_index].p_offset;
+	/*
+	 * Stream direct ranges. Record per-64KiB content CRCs so we can
+	 * audit, with a memory-only scan, whether any direct destination
+	 * was clobbered after it was written. Never re-read a clobbered
+	 * block for repair: that risks clobbering a different restored
+	 * page and does not converge.
+	 */
+	uint32_t chunk_crc_stream = 0xFFFFFFFF;
+	uint64_t direct_bytes = 0;
+	uint64_t n_blk_total = 0;
+	u_int n_window_blocks = 0;
+	u_int n_windows = 0;
+	struct a1_direct_cursor window_cursor = {
+		.range = 0,
+		.pa = direct[0].start
+	};
+
+	for (u_int dr = 0; dr < ndirect; dr++) {
+		uint64_t dir_start = direct[dr].start;
+		uint64_t dir_end = direct[dr].end;
+		uint64_t dir_bytes, dir_pages, cur_page, pages_left;
+
+		if (dir_start >= dir_end || dir_start < c_start ||
+		    dir_end > c_start + c_size ||
+		    ((dir_start | dir_end) & EFI_PAGE_MASK) != 0) {
+			hiber_refuse_pending = "A1 direct cursor invalid";
+			return (false);
+		}
+		dir_bytes = dir_end - dir_start;
+		dir_pages = dir_bytes / EFI_PAGE_SIZE;
+		cur_page = (dir_start - c_start) / EFI_PAGE_SIZE;
+		pages_left = dir_pages;
+
+		while (pages_left > 0) {
+			uint64_t blk_pages =
+			    pages_left > 16 ? 16 : pages_left;
+			uint64_t blk_bytes = blk_pages * EFI_PAGE_SIZE;
+			uint64_t image_off, disk_lba, dst_pa;
+			void *dst_ptr;
+			uint32_t blk_crc;
+
+			if (cur_page > (UINT64_MAX - HIBERNATE_IMAGE_OFFSET -
+			    c_offset) / EFI_PAGE_SIZE) {
+				hiber_refuse_pending = "A1 disk offset overflow";
+				return (false);
+			}
+			image_off = HIBERNATE_IMAGE_OFFSET + c_offset +
+			    cur_page * EFI_PAGE_SIZE;
+			if ((image_off % hr->blksz) != 0) {
+				hiber_refuse_pending = "A1 disk alignment";
+				return (false);
+			}
+			disk_lba = image_off / hr->blksz;
+			if (dir_pages - pages_left >
+			    (UINT64_MAX - dir_start) / EFI_PAGE_SIZE) {
+				hiber_refuse_pending = "A1 destination overflow";
+				return (false);
+			}
+			dst_pa = dir_start +
+			    (dir_pages - pages_left) * EFI_PAGE_SIZE;
+			if (dst_pa > UINT64_MAX - blk_bytes) {
+				hiber_refuse_pending = "A1 destination overflow";
+				return (false);
+			}
+			dst_ptr = (void *)(uintptr_t)dst_pa;
+
+			if (!hibernate_range_is_direct_claimed(hr, dst_pa,
+			    blk_bytes)) {
+				snprintf(hiber_refuse_rpt.diag,
+				    sizeof(hiber_refuse_rpt.diag),
+				    "A1_UNCLAIMED_DESTINATION chunk=%u "
+				    "dst_pa=0x%jx bytes=0x%jx",
+				    ph_index - 2, (uintmax_t)dst_pa,
+				    (uintmax_t)blk_bytes);
+				hiber_log(HIBER_LOG_ERROR,
+				    "hibernate: A1 destination 0x%jx+0x%jx "
+				    "is not retained [FAIL]\n",
+				    (uintmax_t)dst_pa,
+				    (uintmax_t)blk_bytes);
+				hiber_refuse_rpt.chk_staging_crc =
+				    HIBER_CHK_FAIL;
+				hiber_refuse_pending =
+				    "A1_UNCLAIMED_DESTINATION";
+				return (false);
+			}
+
+			status = hr->blkio->ReadBlocks(hr->blkio, hr->blkio->Media->MediaId,
+			    disk_lba, (UINTN)blk_bytes, hr->readbuf);
+			if (EFI_ERROR(status)) {
+				hiber_log(HIBER_LOG_ERROR,
+				    "hibernate: direct read error at LBA %ju (%lu)\n",
+				    (uintmax_t)disk_lba, DECODE_ERROR(status));
+				hiber_refuse_rpt.chk_read = HIBER_CHK_FAIL;
+				hiber_refuse_pending = "read failed";
+				return (false);
+			}
+
+			chunk_crc_stream = hibernate_crc32_update(
+			    chunk_crc_stream, hr->readbuf, (size_t)blk_bytes);
+			blk_crc = hibernate_crc32_update(0xFFFFFFFF,
+			    hr->readbuf, (size_t)blk_bytes) ^ 0xFFFFFFFF;
+			if (n_window_blocks >= A1_BLK_CRC_MAX) {
+				hiber_refuse_pending = "A1 table index overflow";
+				return (false);
+			}
+			hr->a1_blk_crc[n_window_blocks++] = blk_crc;
+			n_blk_total++;
+			memcpy(dst_ptr, hr->readbuf, (size_t)blk_bytes);
+
+			if (memcmp(dst_ptr, hr->readbuf, (size_t)blk_bytes) != 0) {
+				hiber_log(HIBER_LOG_ERROR,
+				    "hibernate: chunk %u immediate write mismatch "
+				    "at 0x%jx [FAIL]\n", ph_index - 2,
+				    (uintmax_t)dst_pa);
+				hiber_refuse_rpt.chk_staging_crc =
+				    HIBER_CHK_FAIL;
+				hiber_refuse_pending =
+				    "staging CRC mismatch";
+				return (false);
+			}
+
+			pages_left -= blk_pages;
+			cur_page += blk_pages;
+
+			if (n_window_blocks == A1_BLK_CRC_MAX) {
+				struct a1_bad_stats bst;
+
+				if (!a1_scan_bad_window(direct,
+				    ndirect, &window_cursor,
+				    hr->a1_blk_crc, n_window_blocks, &bst)) {
+					hiber_refuse_pending =
+					    "A1 audit cursor mismatch";
+					return (false);
+				}
+				n_windows++;
+				if (bst.n_bad != 0) {
+					snprintf(hiber_refuse_rpt.diag,
+					    sizeof(hiber_refuse_rpt.diag),
+					    "A1_POST_READ_CLOBBER chunk=%u "
+					    "window=%u n_bad=%u/%u first=0x%jx",
+					    ph_index - 2, n_windows - 1, bst.n_bad,
+					    n_window_blocks,
+					    (uintmax_t)bst.first_pa);
+					hiber_refuse_rpt.chk_staging_crc =
+					    HIBER_CHK_FAIL;
+					hiber_refuse_pending =
+					    "direct restore clobbered";
+					return (false);
+				}
+				n_window_blocks = 0;
+			}
+		}
+		if (direct_bytes > UINT64_MAX - dir_bytes) {
+			hiber_refuse_pending = "A1 byte count overflow";
+			return (false);
+		}
+		direct_bytes += dir_bytes;
+	}
+
+	if (n_window_blocks != 0) {
+		struct a1_bad_stats bst;
+
+		if (!a1_scan_bad_window(direct, ndirect,
+		    &window_cursor, hr->a1_blk_crc, n_window_blocks, &bst)) {
+			hiber_refuse_pending = "A1 audit cursor mismatch";
+			return (false);
+		}
+		n_windows++;
+		if (bst.n_bad != 0) {
+			snprintf(hiber_refuse_rpt.diag,
+			    sizeof(hiber_refuse_rpt.diag),
+			    "A1_POST_READ_CLOBBER chunk=%u window=%u "
+			    "n_bad=%u/%u first=0x%jx",
+			    ph_index - 2, n_windows - 1, bst.n_bad,
+			    n_window_blocks, (uintmax_t)bst.first_pa);
+			hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_FAIL;
+			hiber_refuse_pending = "direct restore clobbered";
+			return (false);
+		}
+	}
+
+	chunk_crc_stream ^= 0xFFFFFFFF;
+
+	{
+		uint32_t chunk_crc_mem = 0xFFFFFFFF;
+
+		for (u_int dr = 0; dr < ndirect; dr++) {
+			uint64_t dir_start = direct[dr].start;
+			uint64_t dir_bytes =
+			    direct[dr].end - dir_start;
+
+			chunk_crc_mem = hibernate_crc32_update(
+			    chunk_crc_mem,
+			    (const void *)(uintptr_t)dir_start,
+			    (size_t)dir_bytes);
+		}
+		chunk_crc_mem ^= 0xFFFFFFFF;
+
+		if (chunk_crc_mem != chunk_crc_stream) {
+			snprintf(hiber_refuse_rpt.diag,
+			    sizeof(hiber_refuse_rpt.diag),
+			    "CRC_MISMATCH chunk=%u stream=0x%08x "
+			    "mem=0x%08x n_blk=%ju windows=%u n_direct=%u",
+			    ph_index - 2, chunk_crc_stream, chunk_crc_mem,
+			    (uintmax_t)n_blk_total, n_windows,
+			    ndirect);
+			hiber_log(HIBER_LOG_ERROR,
+			    "hibernate:   chunk %2u: CRC MISMATCH "
+			    "(stream 0x%08x != mem 0x%08x) [FAIL]\n",
+			    ph_index - 2, chunk_crc_stream, chunk_crc_mem);
+			hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_FAIL;
+			hiber_refuse_pending = "staging CRC mismatch";
+			return (false);
+		}
+
+		hr->total_streamed_bytes += direct_bytes;
+		hr->direct_streamed_chunks++;
+		if (direct_bytes == c_size) {
+			hiber_log(HIBER_LOG_INFO,
+			    "hibernate:   chunk %2u: paddr 0x%016jx "
+			    "size 0x%08jx (%ju KiB) -> DIRECT "
+			    "[PASS, CRC32 0x%08x, %u window%s]\n",
+			    ph_index - 2, (uintmax_t)c_start,
+			    (uintmax_t)c_size,
+			    (uintmax_t)(c_size / 1024), chunk_crc_mem,
+			    n_windows, n_windows == 1 ? "" : "s");
+		} else {
+			hiber_log(HIBER_LOG_INFO,
+			    "hibernate:   chunk %2u: paddr 0x%016jx "
+			    "size 0x%08jx -> DEFERRED (%ju KiB direct, "
+			    "CRC32 0x%08x, %u window%s) [PASS]\n",
+			    ph_index - 2, (uintmax_t)c_start,
+			    (uintmax_t)c_size,
+			    (uintmax_t)(direct_bytes / 1024),
+			    chunk_crc_mem, n_windows,
+			    n_windows == 1 ? "" : "s");
+		}
+	}
+	return (true);
+}
+
+static bool
+hibernate_restore_direct(struct hibernate_restore *hr)
+{
+	u_int i;
+
+	hr->total_streamed_bytes = 0;
+	hr->direct_streamed_chunks = 0;
+	hiber_log(HIBER_LOG_INFO, "hibernate: === Phase A1: Direct Chunk Streaming (Pre-EBS) ===\n");
+
+	for (uint64_t e = 0; e < hr->entry_count; e++) {
+		uint64_t r_start = hr->entries[e].src_spare_pa;
+		uint64_t r_end = r_start + hr->entries[e].page_count * EFI_PAGE_SIZE;
+		bool merged = false;
+
+		for (u_int sr = 0; sr < hr->n_staging_reserved; sr++) {
+			if (r_start == hr->staging_reserved[sr].end) {
+				hr->staging_reserved[sr].end = r_end;
+				merged = true;
+				break;
+			} else if (r_end == hr->staging_reserved[sr].start) {
+				hr->staging_reserved[sr].start = r_start;
+				merged = true;
+				break;
+			}
+		}
+		if (!merged) {
+			if (hr->n_staging_reserved < nitems(hr->staging_reserved)) {
+				hr->staging_reserved[hr->n_staging_reserved].start = r_start;
+				hr->staging_reserved[hr->n_staging_reserved].end = r_end;
+				hr->n_staging_reserved++;
+			} else {
+				hiber_log(HIBER_LOG_ERROR, "hibernate: staging_reserved table overflow\n");
+				hiber_refuse_pending = "allocation failed";
+				return (false);
+			}
+		}
+	}
+
+
+	/*
+	 * The CRC table and read buffer retain their fixed arena layout.
+	 * Validate their compile-time relationship once before streaming;
+	 * table capacity limits a window, not the size of the chunk.
+	 */
+	if ((uint64_t)A1_BLK_CRC_MAX * sizeof(uint32_t) >
+	    HIBER_CSP_A1_CRC_SIZE ||
+	    HIBER_A1_BLOCK_SIZE == 0 ||
+	    HIBER_A1_BLOCK_SIZE > HIBER_CSP_READBUF_SIZE ||
+	    hr->blksz == 0 || (HIBER_A1_BLOCK_SIZE % hr->blksz) != 0) {
+		hiber_log(HIBER_LOG_ERROR,
+		    "hibernate: invalid A1 fixed workspace geometry [FAIL]\n");
+		hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "A1 workspace geometry";
+		return (false);
+	}
+	for (i = 2; i < hr->ehdr->e_phnum; i++) {
+		uint64_t c_start, c_size;
+		struct hibernate_range chunk_direct[512];
+		u_int n_chunk_direct;
+
+		c_start = hr->ph[i].p_paddr;
+		c_size = hr->ph[i].p_memsz != 0 ?
+		    hr->ph[i].p_memsz : hr->ph[i].p_filesz;
+		if (!hibernate_build_chunk_direct_ranges(hr, c_start, c_size,
+		    chunk_direct, nitems(chunk_direct), &n_chunk_direct))
+			return (false);
+		if (n_chunk_direct == 0)
+			continue;
+		if (!hibernate_stream_direct_chunk(hr, i, chunk_direct,
+		    n_chunk_direct))
+			return (false);
+	}
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: Phase A1 complete: %u chunks, %ju MiB direct streamed "
+	    "[PASS]\n",
+	    hr->direct_streamed_chunks,
+	    (uintmax_t)(hr->total_streamed_bytes / (1024 * 1024)));
+
+	return (true);
+}
+
+static bool
+hibernate_exit_boot_services(struct hibernate_restore *hr)
+{
+	uint32_t check_spare_crc;
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: === Phase A2: Deferred Chunk Integrity "
+	    "Re-verification ===\n");
+	check_spare_crc = 0xffffffff;
+	for (uint64_t e = 0; e < hr->entry_count; e++) {
+		check_spare_crc = hibernate_crc32_update(check_spare_crc,
+		    (const void *)(uintptr_t)hr->entries[e].src_spare_pa,
+		    hr->entries[e].page_count * EFI_PAGE_SIZE);
+	}
+	check_spare_crc ^= 0xffffffff;
+
+	if (check_spare_crc != hr->total_staged_crc) {
+		hiber_log(HIBER_LOG_ERROR,
+		    "hibernate: Phase A2 CRC mismatch (staged 0x%08x != "
+		    "verified 0x%08x) [FAIL]\n",
+		    hr->total_staged_crc, check_spare_crc);
+		hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "staging CRC mismatch";
+		return (false);
+	}
+	hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_PASS;
+	hiber_refuse_set_stage("A3-EBS");
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: Phase A2 complete: %ju deferred pages "
+	    "(%ju KiB) re-verified, CRC32 0x%08x [PASS]\n",
+	    (uintmax_t)hr->total_staged_pages,
+	    (uintmax_t)(hr->total_staged_pages * 4), check_spare_crc);
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: === Phase A3: ExitBootServices Transition ===\n");
+	hr->ebs_map_sz = 128 * 1024;
+	hr->ebs_map_key = 0;
+	hr->ebs_desc_sz = 0;
+	hr->ebs_desc_ver = 0;
+	hr->ebs_status = EFI_SUCCESS;
+
+	for (hr->ebs_retry = 3; hr->ebs_retry > 0; hr->ebs_retry--) {
+		hr->ebs_map_sz = 128 * 1024;
+		hr->ebs_status = BS->GetMemoryMap(&hr->ebs_map_sz,
+		    hr->post_map, &hr->ebs_map_key, &hr->ebs_desc_sz,
+		    &hr->ebs_desc_ver);
+		if (EFI_ERROR(hr->ebs_status)) {
+			hiber_log(HIBER_LOG_ERROR,
+			    "hibernate: final GetMemoryMap failed: %lu\n",
+			    DECODE_ERROR(hr->ebs_status));
+			hiber_refuse_rpt.chk_ebs = HIBER_CHK_FAIL;
+			hiber_refuse_pending = "ExitBootServices failed";
+			return (false);
+		}
+
+		hr->ebs_status = efi_exit_boot_services(hr->ebs_map_key);
+		if (!EFI_ERROR(hr->ebs_status))
+			break;
+	}
+
+	if (hr->ebs_retry == 0) {
+		hiber_log(HIBER_LOG_ERROR,
+		    "hibernate: ExitBootServices failed after retries (%lu)\n",
+		    DECODE_ERROR(hr->ebs_status));
+		hiber_refuse_rpt.chk_ebs = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "ExitBootServices failed";
+		return (false);
+	}
+
+	((void (*)(void))(uintptr_t)
+	    (hr->cb->hc_contig_spare_start + 0x30))();
+
+	for (;;)
+		__asm__ __volatile__("cli; hlt");
+}
+
 static void
 hibernate_release_restore(struct hibernate_restore *hr)
 {
@@ -2164,6 +2658,10 @@ hibernate_analyze_conflicts(pdinfo_t *part, const Elf_Ehdr *ehdr,
 		restored = hibernate_stage_deferred(&hr);
 	if (restored)
 		restored = hibernate_prepare_handoff(&hr);
+	if (restored)
+		restored = hibernate_restore_direct(&hr);
+	if (restored)
+		restored = hibernate_exit_boot_services(&hr);
 	hibernate_release_restore(&hr);
 	if (!restored && hiber_refuse_pending != NULL)
 		hibernate_refuse(hiber_refuse_pending);
