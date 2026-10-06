@@ -370,12 +370,94 @@ hiber_refuse_format(void)
 	}
 }
 
+static void
+hiber_esp_write_file(const CHAR16 *path, const char *text, size_t len,
+    const char *tag)
+{
+	static EFI_GUID sfsp_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
+	EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs;
+	EFI_FILE_PROTOCOL *root, *file;
+	EFI_STATUS status;
+	UINTN wlen;
+
+	fs = NULL;
+	root = NULL;
+	file = NULL;
+
+	if (boot_img == NULL || boot_img->DeviceHandle == NULL || text == NULL ||
+	    path == NULL) {
+		printf("%s: ESP write failed unavailable\n", tag);
+		return;
+	}
+
+	status = OpenProtocolByHandle(boot_img->DeviceHandle, &sfsp_guid,
+	    (void **)&fs);
+	if (EFI_ERROR(status) || fs == NULL) {
+		printf("%s: ESP write failed %lu\n", tag, DECODE_ERROR(status));
+		return;
+	}
+
+	status = fs->OpenVolume(fs, &root);
+	if (EFI_ERROR(status) || root == NULL) {
+		printf("%s: ESP write failed %lu\n", tag, DECODE_ERROR(status));
+		return;
+	}
+
+	/* Overwrite: delete existing file if present, then create. */
+	status = root->Open(root, &file, (CHAR16 *)(uintptr_t)path,
+	    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+	if (!EFI_ERROR(status) && file != NULL) {
+		(void)file->Delete(file);
+		file = NULL;
+	}
+
+	status = root->Open(root, &file, (CHAR16 *)(uintptr_t)path,
+	    EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+	if (EFI_ERROR(status) || file == NULL) {
+		printf("%s: ESP write failed %lu\n", tag, DECODE_ERROR(status));
+		root->Close(root);
+		return;
+	}
+
+	wlen = len;
+	status = file->Write(file, &wlen, (void *)(uintptr_t)text);
+	if (EFI_ERROR(status)) {
+		printf("%s: ESP write failed %lu\n", tag, DECODE_ERROR(status));
+	} else {
+		(void)file->Flush(file);
+	}
+	file->Close(file);
+	root->Close(root);
+}
+
+static void
+hiber_refuse_write_esp(const char *text, size_t len)
+{
+	static CHAR16 refuse_path[] = L"\\efi\\freebsd\\hiber-refuse.log";
+
+	hiber_esp_write_file(refuse_path, text, len, "hiber-refuse");
+}
+
+static void
+hiber_trace_write_esp(void)
+{
+	static CHAR16 trace_path[] = L"\\efi\\freebsd\\hiber-trace.log";
+
+	if (hiber_trace_len == 0)
+		return;
+	hiber_esp_write_file(trace_path, hiber_trace, hiber_trace_len,
+	    "hiber-trace");
+}
+
 /*
- * Single console-only refusal sink: finalize and print the bounded report.
+ * Single refuse sink: finalize report, tee to printf, overwrite ESP log.
+ * Never opens loader.env. On ESP failure print one line and continue boot.
  */
 static void
 hibernate_refuse(const char *primary)
 {
+	size_t len;
+
 	if (hiber_refuse_rpt.emitted)
 		return;
 
@@ -387,8 +469,11 @@ hibernate_refuse(const char *primary)
 		    sizeof(hiber_refuse_rpt.primary));
 
 	hiber_refuse_format();
+	len = strlen(hiber_refuse_text);
 	/* Refuse summary always hits the console (errors matter on FB). */
 	printf("%s", hiber_refuse_text);
+	hiber_refuse_write_esp(hiber_refuse_text, len);
+	hiber_trace_write_esp();
 	hiber_refuse_rpt.emitted = true;
 	hiber_refuse_pending = NULL;
 }
@@ -2568,6 +2653,15 @@ hibernate_exit_boot_services(struct hibernate_restore *hr)
 	    "(%ju KiB) re-verified, CRC32 0x%08x [PASS]\n",
 	    (uintmax_t)hr->total_staged_pages,
 	    (uintmax_t)(hr->total_staged_pages * 4), check_spare_crc);
+
+	/*
+	 * Persist the loader trace before ExitBootServices: once boot
+	 * services terminate no firmware file access remains, so this is the
+	 * last point at which a successful restore can be recorded on the
+	 * ESP.  Best-effort and bounded; a write failure must not abort the
+	 * restore.
+	 */
+	hiber_trace_write_esp();
 
 	hiber_log(HIBER_LOG_INFO,
 	    "hibernate: === Phase A3: ExitBootServices Transition ===\n");
