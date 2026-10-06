@@ -507,6 +507,109 @@ struct hibernate_range {
 	uint64_t end;
 };
 
+static uint32_t hibernate_crc32_update(uint32_t, const void *, size_t);
+
+struct a1_bad_stats {
+	u_int n_bad;		/* uncapped count of mismatching 64 KiB blocks */
+	u_int n_runs;		/* number of contiguous bad runs */
+	uint64_t first_pa;	/* first bad block (scan order) */
+	uint64_t last_pa;	/* last bad block (scan order) */
+	uint64_t min_pa;	/* lowest bad block PA */
+	uint64_t max_pa;	/* highest bad block PA */
+	u_int n_samples;
+	struct {
+		uint64_t pa;
+		uint32_t exp;
+		uint32_t got;
+	} sample[8];
+};
+
+/*
+ * Single bounded pass over the direct ranges: compare each 64 KiB block's
+ * in-memory CRC against the table captured while streaming. O(n), no I/O.
+ * Collects an uncapped count, PA extremes, run count and a small sample.
+ * Deliberately performs NO repair and NO re-read: earlier evidence shows a
+ * repair read can clobber a different already-restored page (non-convergent).
+ */
+static void
+a1_scan_bad_blocks(const struct hibernate_range *chunk_direct,
+    u_int n_chunk_direct, const uint32_t *a1_blk_crc, u_int n_blk,
+    struct a1_bad_stats *st)
+{
+	u_int bi = 0;
+	bool prev_bad = false;
+
+	memset(st, 0, sizeof(*st));
+	for (u_int dr = 0; dr < n_chunk_direct; dr++) {
+		uint64_t dir_start = chunk_direct[dr].start;
+		uint64_t dir_pages =
+		    (chunk_direct[dr].end - dir_start) / EFI_PAGE_SIZE;
+		uint64_t pages_left = dir_pages;
+
+		while (pages_left > 0) {
+			uint64_t blk_pages = (pages_left > 16) ? 16 : pages_left;
+			uint64_t blk_bytes = blk_pages * EFI_PAGE_SIZE;
+			uint64_t dst_pa = dir_start +
+			    (dir_pages - pages_left) * EFI_PAGE_SIZE;
+			uint32_t got_crc;
+
+			if (a1_blk_crc != NULL && bi < n_blk) {
+				got_crc = hibernate_crc32_update(0xFFFFFFFF,
+				    (const void *)(uintptr_t)dst_pa,
+				    blk_bytes) ^ 0xFFFFFFFF;
+				if (got_crc != a1_blk_crc[bi]) {
+					if (st->n_bad == 0) {
+						st->first_pa = dst_pa;
+						st->min_pa = dst_pa;
+						st->max_pa = dst_pa;
+					}
+					st->last_pa = dst_pa;
+					if (dst_pa < st->min_pa)
+						st->min_pa = dst_pa;
+					if (dst_pa > st->max_pa)
+						st->max_pa = dst_pa;
+					if (!prev_bad)
+						st->n_runs++;
+					if (st->n_samples < nitems(st->sample)) {
+						st->sample[st->n_samples].pa = dst_pa;
+						st->sample[st->n_samples].exp =
+						    a1_blk_crc[bi];
+						st->sample[st->n_samples].got =
+						    got_crc;
+						st->n_samples++;
+					}
+					st->n_bad++;
+					prev_bad = true;
+				} else {
+					prev_bad = false;
+				}
+			}
+			bi++;
+			pages_left -= blk_pages;
+		}
+	}
+}
+
+static const EFI_MEMORY_DESCRIPTOR *
+hibernate_find_memdesc(const EFI_MEMORY_DESCRIPTOR *map, u_int ndesc,
+    UINTN desc_sz, uint64_t pa)
+{
+	u_int j;
+	const EFI_MEMORY_DESCRIPTOR *md;
+
+	if (map == NULL || ndesc == 0 || desc_sz == 0)
+		return (NULL);
+	for (j = 0, md = map; j < ndesc;
+	    j++, md = NextMemoryDescriptor(md, desc_sz)) {
+		uint64_t start = md->PhysicalStart;
+		uint64_t end = start + md->NumberOfPages * EFI_PAGE_SIZE;
+
+		if (pa >= start && pa < end)
+			return (md);
+	}
+	return (NULL);
+}
+
 static inline void
 add_avoid_range(struct hibernate_range *ranges, u_int *nranges, u_int max_ranges,
     uint64_t start, uint64_t size)
@@ -526,6 +629,172 @@ is_page_avoided(uint64_t pa, const struct hibernate_range *avoid, u_int navoid)
 			return (true);
 	}
 	return (false);
+}
+
+/*
+ * Compact IEEE 802.3 CRC32 calculation for hibernate staging integrity.
+ */
+static uint32_t hibernate_crc32_tab[256];
+static bool hibernate_crc32_tab_inited;
+
+static void
+hibernate_crc32_init(void)
+{
+	uint32_t c;
+	int i, j;
+
+	for (i = 0; i < 256; i++) {
+		c = (uint32_t)i;
+		for (j = 0; j < 8; j++) {
+			if (c & 1)
+				c = 0xedb88320U ^ (c >> 1);
+			else
+				c >>= 1;
+		}
+		hibernate_crc32_tab[i] = c;
+	}
+	hibernate_crc32_tab_inited = true;
+}
+
+static uint32_t
+hibernate_crc32_update(uint32_t crc, const void *buf, size_t len)
+{
+	const uint8_t *bp;
+	size_t i;
+
+	if (!hibernate_crc32_tab_inited)
+		hibernate_crc32_init();
+	bp = buf;
+	for (i = 0; i < len; i++)
+		crc = hibernate_crc32_tab[(crc ^ bp[i]) & 0xff] ^ (crc >> 8);
+	return (crc);
+}
+
+struct hiber_copy_entry {
+	uint64_t src_spare_pa;
+	uint64_t dst_target_pa;
+	uint64_t page_count;
+};
+
+struct hiber_trampoline_header {
+	uint64_t magic;
+	uint64_t copy_entries_pa;
+	uint64_t entry_count;
+	uint64_t target_rsp;
+	uint64_t target_r12;
+	uint64_t target_rip;
+};
+
+/*
+ * Position-independent post-EBS resume stub.  L3 serializes it into the
+ * protected contiguous-spare arena but does not execute it.
+ */
+extern const char hibernate_tramp_stub[];
+extern const char hibernate_tramp_stub_end[];
+#define HIBERNATE_TRAMP_STUB_SIZE \
+    ((size_t)(hibernate_tramp_stub_end - hibernate_tramp_stub))
+
+__asm__(
+".text\n"
+".globl hibernate_tramp_stub\n"
+"hibernate_tramp_stub:\n"
+"	lea -0x37(%rip), %rbx\n"
+"	cli\n"
+"	cld\n"
+"	mov %cr0, %rax\n"
+"	btrq $16, %rax\n"
+"	mov %rax, %cr0\n"
+"	lea 0x2000(%rbx), %rax\n"
+"	mov %rax, %cr3\n"
+"	lea 0x18000(%rbx), %rsp\n"
+"	mov 0x08(%rbx), %rsi\n"
+"	mov 0x10(%rbx), %rcx\n"
+"	test %rcx, %rcx\n"
+"	jz 2f\n"
+"1:\n"
+"	mov (%rsi), %rax\n"
+"	mov 0x8(%rsi), %rdi\n"
+"	mov 0x10(%rsi), %rdx\n"
+"	shl $9, %rdx\n"
+"	push %rsi\n"
+"	push %rcx\n"
+"	mov %rax, %rsi\n"
+"	mov %rdx, %rcx\n"
+"	rep movsq\n"
+"	pop %rcx\n"
+"	pop %rsi\n"
+"	add $24, %rsi\n"
+"	dec %rcx\n"
+"	jnz 1b\n"
+"2:\n"
+"	mov 0x18(%rbx), %rsp\n"
+"	mov 0x20(%rbx), %r12\n"
+"	mov 0x28(%rbx), %rax\n"
+"	jmp *%rax\n"
+".globl hibernate_tramp_stub_end\n"
+"hibernate_tramp_stub_end:\n"
+);
+
+static inline bool
+hibernate_next_usable_spare(const struct hibernate_cb *cb, uint64_t *cursor,
+    const struct hibernate_range *avoid, u_int navoid, uint64_t *out_pa)
+{
+	while (*cursor < cb->hc_spare_pages_nb) {
+		uint64_t pa;
+
+		pa = cb->hc_spare_pages[*cursor];
+		(*cursor)++;
+		if (!is_page_avoided(pa, avoid, navoid)) {
+			*out_pa = pa;
+			return (true);
+		}
+	}
+	return (false);
+}
+
+static bool
+hibernate_claim_next_spare(const struct hibernate_cb *cb, uint64_t *cursor,
+    const struct hibernate_range *avoid, u_int navoid, uint64_t *out_pa,
+    uint64_t *skipped)
+{
+	for (;;) {
+		EFI_PHYSICAL_ADDRESS pa;
+
+		if (!hibernate_next_usable_spare(cb, cursor, avoid, navoid,
+		    out_pa))
+			return (false);
+		pa = *out_pa;
+		if (!EFI_ERROR(BS->AllocatePages(AllocateAddress, EfiLoaderData,
+		    1, &pa)))
+			return (true);
+		(*skipped)++;
+	}
+}
+
+static bool
+hibernate_append_copy_entry(struct hiber_copy_entry *entries,
+    uint64_t *entry_count, uint64_t max_entries, uint64_t src_pa,
+    uint64_t dst_pa)
+{
+	struct hiber_copy_entry *entry;
+
+	if (*entry_count > 0) {
+		entry = &entries[*entry_count - 1];
+		if (entry->src_spare_pa +
+		    entry->page_count * EFI_PAGE_SIZE == src_pa &&
+		    entry->dst_target_pa +
+		    entry->page_count * EFI_PAGE_SIZE == dst_pa) {
+			entry->page_count++;
+			return (true);
+		}
+	}
+	if (*entry_count >= max_entries)
+		return (false);
+	entries[*entry_count].src_spare_pa = src_pa;
+	entries[*entry_count].dst_target_pa = dst_pa;
+	entries[*entry_count].page_count = 1;
+	(*entry_count)++;
+	return (true);
 }
 
 struct hibernate_restore {
@@ -569,12 +838,357 @@ struct hibernate_restore {
 
 	struct hibernate_range active_ranges[512];
 	u_int n_active_ranges;
+	/*
+	 * Exact-address allocations backing every destination written before
+	 * ExitBootServices.  Entries are coalesced and retained until EBS.
+	 */
+	struct hibernate_range direct_claims[512];
+	u_int n_direct_claims;
 	u_int direct_chunks_cnt;
 	u_int deferred_chunks_cnt;
 	uint64_t total_direct_bytes;
 	uint64_t total_deferred_chunk_bytes;
 	uint64_t total_deferred_pages;
+
+	uint8_t *readbuf;
+	struct hiber_copy_entry *entries;
+	uint64_t entry_count;
+	uint64_t max_entries;
+	uint64_t total_staged_pages;
+	uint64_t total_staged_crc;
+	uint64_t claimed_spare_pages;
+	uint64_t skipped_spare_claims;
+	struct hiber_trampoline_header *thdr;
+	u_int collisions;
+
+	struct hibernate_range staging_reserved[1024];
+	u_int n_staging_reserved;
+	u_int direct_streamed_chunks;
+	uint64_t total_streamed_bytes;
+	UINTN ebs_map_sz;
+	UINTN ebs_map_key;
+	UINTN ebs_desc_sz;
+	UINT32 ebs_desc_ver;
+	EFI_STATUS ebs_status;
+	int ebs_retry;
 };
+
+#define HIBER_DIRECT_CLAIM_CHUNK_PAGES	4096
+
+static bool
+hibernate_append_direct_claim(struct hibernate_restore *hr, uint64_t start,
+    uint64_t end)
+{
+	struct hibernate_range *last;
+
+	if (start >= end)
+		return (false);
+	if (hr->n_direct_claims > 0) {
+		last = &hr->direct_claims[hr->n_direct_claims - 1];
+		if (last->end == start) {
+			last->end = end;
+			return (true);
+		}
+	}
+	if (hr->n_direct_claims >= nitems(hr->direct_claims))
+		return (false);
+	hr->direct_claims[hr->n_direct_claims].start = start;
+	hr->direct_claims[hr->n_direct_claims].end = end;
+	hr->n_direct_claims++;
+	return (true);
+}
+
+static bool
+hibernate_claim_direct_pages(struct hibernate_restore *hr, uint64_t start,
+    uint64_t end)
+{
+	EFI_PHYSICAL_ADDRESS requested, allocated;
+	EFI_STATUS status;
+	UINTN pages;
+
+	if (start >= end || (start & EFI_PAGE_MASK) != 0 ||
+	    (end & EFI_PAGE_MASK) != 0)
+		return (false);
+
+	requested = start;
+	allocated = requested;
+	pages = EFI_SIZE_TO_PAGES(end - start);
+	status = BS->AllocatePages(AllocateAddress, EfiLoaderData, pages,
+	    &allocated);
+	if (EFI_ERROR(status) || allocated != requested) {
+		if (!EFI_ERROR(status))
+			BS->FreePages(allocated, pages);
+		return (false);
+	}
+	if (!hibernate_append_direct_claim(hr, start, end)) {
+		BS->FreePages(allocated, pages);
+		hiber_refuse_pending = "direct claim table overflow";
+		return (false);
+	}
+	return (true);
+}
+
+static bool
+hibernate_range_is_direct_claimed(const struct hibernate_restore *hr,
+    uint64_t start, uint64_t size)
+{
+	uint64_t end;
+
+	if (size == 0 || start > UINT64_MAX - size)
+		return (false);
+	end = start + size;
+	for (u_int i = 0; i < hr->n_direct_claims; i++) {
+		if (start >= hr->direct_claims[i].start &&
+		    end <= hr->direct_claims[i].end)
+			return (true);
+	}
+	return (false);
+}
+
+static void
+hibernate_sort_merge_active(struct hibernate_restore *hr)
+{
+	u_int merged;
+
+	for (u_int a = 0; a < hr->n_active_ranges; a++) {
+		for (u_int b = a + 1; b < hr->n_active_ranges; b++) {
+			if (hr->active_ranges[b].start <
+			    hr->active_ranges[a].start) {
+				struct hibernate_range tmp;
+
+				tmp = hr->active_ranges[a];
+				hr->active_ranges[a] = hr->active_ranges[b];
+				hr->active_ranges[b] = tmp;
+			}
+		}
+	}
+
+	merged = 0;
+	for (u_int a = 0; a < hr->n_active_ranges; a++) {
+		if (merged == 0 ||
+		    hr->active_ranges[a].start >
+		    hr->active_ranges[merged - 1].end) {
+			hr->active_ranges[merged++] = hr->active_ranges[a];
+		} else if (hr->active_ranges[a].end >
+		    hr->active_ranges[merged - 1].end) {
+			hr->active_ranges[merged - 1].end =
+			    hr->active_ranges[a].end;
+		}
+	}
+	hr->n_active_ranges = merged;
+}
+
+static bool
+hibernate_append_staging_reserved(struct hibernate_restore *hr,
+    uint64_t start, uint64_t end)
+{
+	if (start >= end)
+		return (true);
+	if (hr->n_staging_reserved >= nitems(hr->staging_reserved))
+		return (false);
+	hr->staging_reserved[hr->n_staging_reserved].start = start;
+	hr->staging_reserved[hr->n_staging_reserved].end = end;
+	hr->n_staging_reserved++;
+	return (true);
+}
+
+static void
+hibernate_sort_merge_staging_reserved(struct hibernate_restore *hr)
+{
+	u_int merged;
+
+	for (u_int a = 0; a < hr->n_staging_reserved; a++) {
+		for (u_int b = a + 1; b < hr->n_staging_reserved; b++) {
+			if (hr->staging_reserved[b].start <
+			    hr->staging_reserved[a].start) {
+				struct hibernate_range tmp;
+
+				tmp = hr->staging_reserved[a];
+				hr->staging_reserved[a] =
+				    hr->staging_reserved[b];
+				hr->staging_reserved[b] = tmp;
+			}
+		}
+	}
+	merged = 0;
+	for (u_int i = 0; i < hr->n_staging_reserved; i++) {
+		if (merged == 0 ||
+		    hr->staging_reserved[i].start >
+		    hr->staging_reserved[merged - 1].end) {
+			hr->staging_reserved[merged++] =
+			    hr->staging_reserved[i];
+		} else if (hr->staging_reserved[i].end >
+		    hr->staging_reserved[merged - 1].end) {
+			hr->staging_reserved[merged - 1].end =
+			    hr->staging_reserved[i].end;
+		}
+	}
+	hr->n_staging_reserved = merged;
+}
+
+static bool
+hibernate_prepare_staging_reserved(struct hibernate_restore *hr)
+{
+	uint64_t nb_pages, max_pages;
+
+	hr->n_staging_reserved = 0;
+	if (hr->cb->hc_contig_spare_size > 0 &&
+	    !hibernate_append_staging_reserved(hr,
+	    hr->cb->hc_contig_spare_start,
+	    hr->cb->hc_contig_spare_start +
+	    hr->cb->hc_contig_spare_size)) {
+		hiber_refuse_pending = "staging reserved table overflow";
+		return (false);
+	}
+
+	nb_pages = hr->cb->hc_spare_pages_nb;
+	max_pages = hr->ph[0].p_filesz >
+	    offsetof(struct hibernate_cb, hc_spare_pages) ?
+	    (hr->ph[0].p_filesz -
+	    offsetof(struct hibernate_cb, hc_spare_pages)) /
+	    sizeof(uint64_t) : 0;
+	if (nb_pages > max_pages)
+		nb_pages = max_pages;
+
+	for (uint64_t i = 0; i < nb_pages; i++) {
+		uint64_t pa;
+
+		pa = hr->cb->hc_spare_pages[i];
+		if (hr->n_staging_reserved >=
+		    nitems(hr->staging_reserved)) {
+			hibernate_sort_merge_staging_reserved(hr);
+			if (hr->n_staging_reserved >=
+			    nitems(hr->staging_reserved)) {
+				hiber_refuse_pending =
+				    "staging reserved table overflow";
+				return (false);
+			}
+		}
+		if (!hibernate_append_staging_reserved(hr, pa,
+		    pa + EFI_PAGE_SIZE)) {
+			hiber_refuse_pending =
+			    "staging reserved table overflow";
+			return (false);
+		}
+	}
+	hibernate_sort_merge_staging_reserved(hr);
+	return (true);
+}
+
+static bool
+hibernate_claim_direct_destinations(struct hibernate_restore *hr)
+{
+	struct hibernate_range candidates[512];
+	u_int ncandidates;
+
+	hr->n_direct_claims = 0;
+	for (u_int i = 2; i < hr->ehdr->e_phnum; i++) {
+		uint64_t c_start, c_end, cur;
+
+		c_start = hr->ph[i].p_paddr;
+		c_end = c_start + (hr->ph[i].p_memsz != 0 ?
+		    hr->ph[i].p_memsz : hr->ph[i].p_filesz);
+		cur = c_start;
+		ncandidates = 0;
+
+		while (cur < c_end) {
+			uint64_t blocked_start, blocked_end;
+
+			blocked_start = c_end;
+			blocked_end = cur;
+			for (u_int r = 0; r < hr->n_active_ranges; r++) {
+				uint64_t start, end;
+
+				start = hr->active_ranges[r].start;
+				end = hr->active_ranges[r].end;
+				if (end <= cur || start >= c_end)
+					continue;
+				if (start <= cur) {
+					blocked_start = cur;
+					if (end > blocked_end)
+						blocked_end = end;
+				} else if (start < blocked_start) {
+					blocked_start = start;
+					blocked_end = end;
+				}
+			}
+			for (u_int r = 0; r < hr->n_staging_reserved; r++) {
+				uint64_t start, end;
+
+				start = hr->staging_reserved[r].start;
+				end = hr->staging_reserved[r].end;
+				if (end <= cur || start >= c_end)
+					continue;
+				if (start <= cur) {
+					blocked_start = cur;
+					if (end > blocked_end)
+						blocked_end = end;
+				} else if (start < blocked_start) {
+					blocked_start = start;
+					blocked_end = end;
+				}
+			}
+			if (blocked_start > cur) {
+				if (ncandidates >= nitems(candidates)) {
+					hiber_refuse_pending =
+					    "direct candidate table overflow";
+					return (false);
+				}
+				candidates[ncandidates].start = cur;
+				candidates[ncandidates].end = blocked_start;
+				ncandidates++;
+			}
+			if (blocked_start == c_end)
+				break;
+			cur = blocked_end > cur ? blocked_end :
+			    cur + EFI_PAGE_SIZE;
+		}
+		for (u_int d = 0; d < ncandidates; d++) {
+			uint64_t pos;
+
+			pos = candidates[d].start;
+			while (pos < candidates[d].end) {
+				uint64_t end, max_bytes;
+
+				max_bytes = (uint64_t)
+				    HIBER_DIRECT_CLAIM_CHUNK_PAGES *
+				    EFI_PAGE_SIZE;
+				end = candidates[d].end - pos > max_bytes ?
+				    pos + max_bytes : candidates[d].end;
+				if (hibernate_claim_direct_pages(hr, pos, end)) {
+					pos = end;
+					continue;
+				}
+				if (hiber_refuse_pending != NULL)
+					return (false);
+
+				for (uint64_t pa = pos; pa < end;
+				    pa += EFI_PAGE_SIZE) {
+					if (hibernate_claim_direct_pages(hr, pa,
+					    pa + EFI_PAGE_SIZE))
+						continue;
+					if (hiber_refuse_pending != NULL)
+						return (false);
+					if (hr->n_active_ranges >=
+					    nitems(hr->active_ranges)) {
+						hiber_refuse_pending =
+						    "active range overflow";
+						return (false);
+					}
+					hr->active_ranges[
+					    hr->n_active_ranges].start = pa;
+					hr->active_ranges[
+					    hr->n_active_ranges].end =
+					    pa + EFI_PAGE_SIZE;
+					hr->n_active_ranges++;
+				}
+				pos = end;
+			}
+		}
+	}
+	hibernate_sort_merge_active(hr);
+	return (true);
+}
 
 
 static bool
@@ -911,7 +1525,7 @@ hibernate_analyze_spare_capacity(struct hibernate_restore *hr,
 	    staging_verdict);
 	hiber_log(HIBER_LOG_INFO, "hibernate: revised feasibility verdict -> %s\n", revised_verdict);
 	snprintf(hiber_refuse_rpt.mmap, sizeof(hiber_refuse_rpt.mmap),
-	    "hr->total_spare_bytes=0x%jx excluded_bytes=0x%jx usable_bytes=0x%jx hr->must_stage_bytes=0x%jx verdict=%s",
+	    "total_spare_bytes=0x%jx excluded_bytes=0x%jx usable_bytes=0x%jx must_stage_bytes=0x%jx verdict=%s",
 	    (uintmax_t)hr->total_spare_bytes,
 	    (uintmax_t)hr->excluded_spare_bytes,
 	    (uintmax_t)hr->usable_spare_bytes,
@@ -930,28 +1544,11 @@ hibernate_analyze_spare_capacity(struct hibernate_restore *hr,
 }
 
 static bool
-hibernate_prepare_restore(struct hibernate_restore *hr,
-    const Elf_Ehdr *ehdr, const Elf_Phdr *ph,
-    const struct hibernate_cb *cb, uint8_t **bufp)
+hibernate_build_active_ranges(struct hibernate_restore *hr)
 {
 	EFI_MEMORY_DESCRIPTOR *p;
-	u_int i, j, r;
+	u_int j;
 
-	/* Save blkio interface before heap retention */
-	hr->blkio = (hr->part != NULL) ? hr->part->pd_blkio : NULL;
-	hr->blksz = (hr->blkio != NULL && hr->blkio->Media != NULL) ?
-	    hr->blkio->Media->BlockSize : 512;
-	hr->ehdr = ehdr;
-	hr->ph = ph;
-	hr->cb = cb;
-
-	if (!hibernate_prepare_workspace(hr, bufp))
-		return (false);
-	if (!hibernate_analyze_spare_capacity(hr, bufp))
-		return (false);
-	/*
-	 * Phase 3: PT_LOAD Chunk Classification (DIRECT vs DEFERRED)
-	 */
 	hr->n_active_ranges = 0;
 
 	/*
@@ -990,44 +1587,49 @@ hibernate_prepare_restore(struct hibernate_restore *hr,
 				hr->active_ranges[hr->n_active_ranges].end = p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE;
 				hr->n_active_ranges++;
 			} else {
-				hiber_log(HIBER_LOG_WARN, "hibernate: WARNING: hr->active_ranges array full (%u entries), cannot add 0x%jx-0x%jx (type %u)\n",
+				hiber_log(HIBER_LOG_WARN, "hibernate: WARNING: active_ranges array full (%u entries), cannot add 0x%jx-0x%jx (type %u)\n",
 				    hr->n_active_ranges, (uintmax_t)p->PhysicalStart,
 				    (uintmax_t)(p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE), p->Type);
 			}
 		}
 	}
 
-	/* Sort active_ranges by start address */
-	for (u_int a = 0; a < n_active_ranges; a++) {
-		for (u_int b = a + 1; b < n_active_ranges; b++) {
-			if (active_ranges[b].start < active_ranges[a].start) {
-				struct hibernate_range tmp = active_ranges[a];
-				active_ranges[a] = active_ranges[b];
-				active_ranges[b] = tmp;
-			}
-		}
-	}
 
+
+	hibernate_sort_merge_active(hr);
+	return (true);
+}
+
+static bool
+hibernate_classify_restore_chunks(struct hibernate_restore *hr)
+{
+	EFI_MEMORY_DESCRIPTOR *p;
+	u_int i, j, r;
 	/*
-	 * Merge overlapping or adjacent active ranges, and also absorb an
-	 * enclosed gap of at most one A1 transfer block (64 KiB).  Small
-	 * conventional-memory islands between firmware-active ranges are not
-	 * stable while EFI Block I/O is running: firmware scratch can clobber
-	 * them after they are written.  Deferring up to one existing A1 I/O
-	 * unit avoids speculative repair reads.
+	 * UEFI owns the preboot memory map: before ExitBootServices a UEFI
+	 * image may use only memory it explicitly allocated (UEFI 2.x
+	 * Section 7.2; AllocatePages Section 7.2.1).  A page reported as
+	 * EfiConventionalMemory is free, not owned.  Claim every candidate
+	 * DIRECT destination at its exact physical address and defer every
+	 * page whose claim fails; the retained claim ledger is the sole
+	 * authority for pre-EBS writes.
 	 */
-	u_int m_active = 0;
-	for (u_int a = 0; a < n_active_ranges; a++) {
-		if (m_active == 0 ||
-		    (active_ranges[a].start > active_ranges[m_active - 1].end &&
-		    active_ranges[a].start - active_ranges[m_active - 1].end >
-		    16 * EFI_PAGE_SIZE)) {
-			active_ranges[m_active++] = active_ranges[a];
-		} else if (active_ranges[a].end > active_ranges[m_active - 1].end) {
-			active_ranges[m_active - 1].end = active_ranges[a].end;
-		}
+
+	if (!hibernate_prepare_staging_reserved(hr)) {
+		hiber_refuse_rpt.chk_staging_feas = HIBER_CHK_FAIL;
+		return (false);
+
 	}
-	n_active_ranges = m_active;
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: excluded %u kernel staging workspace ranges "
+	    "from direct claims\n", hr->n_staging_reserved);
+	if (!hibernate_claim_direct_destinations(hr)) {
+		hiber_refuse_rpt.chk_staging_feas = HIBER_CHK_FAIL;
+		return (false);
+	}
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: retained %u direct destination claim ranges\n",
+	    hr->n_direct_claims);
 
 	hr->direct_chunks_cnt = 0;
 	hr->deferred_chunks_cnt = 0;
@@ -1149,16 +1751,397 @@ hibernate_prepare_restore(struct hibernate_restore *hr,
 	}
 
 
-	hr->post_ndesc = hr->post_ndesc;
-
 	return (true);
+}
 
+static bool
+hibernate_prepare_restore(struct hibernate_restore *hr,
+    const Elf_Ehdr *ehdr, const Elf_Phdr *ph,
+    const struct hibernate_cb *cb, uint8_t **bufp)
+{
+	/* Save blkio interface before heap retention. */
+	hr->blkio = hr->part != NULL ? hr->part->pd_blkio : NULL;
+	hr->blksz = hr->blkio != NULL && hr->blkio->Media != NULL ?
+	    hr->blkio->Media->BlockSize : 512;
+	hr->ehdr = ehdr;
+	hr->ph = ph;
+	hr->cb = cb;
+
+	if (!hibernate_prepare_workspace(hr, bufp))
+		return (false);
+	if (!hibernate_analyze_spare_capacity(hr, bufp))
+		return (false);
+	if (!hibernate_build_active_ranges(hr))
+		return (false);
+	return (hibernate_classify_restore_chunks(hr));
+}
+
+static bool
+hibernate_stage_deferred(struct hibernate_restore *hr)
+{
+	struct hibernate_range chunk_deferred[512];
+	EFI_STATUS status;
+	uint64_t spare_cursor;
+	u_int i, r;
+
+	if (hr->blkio == NULL || hr->blkio->Media == NULL) {
+		hiber_log(HIBER_LOG_INFO,
+		    "hibernate: blkio unavailable for staging\n");
+		hiber_refuse_rpt.chk_read = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "read failed";
+		return (false);
+	}
+
+	hr->readbuf = (uint8_t *)(uintptr_t)hr->readbuf_paddr;
+	spare_cursor = 0;
+	hr->total_staged_pages = 0;
+	hr->entries = (struct hiber_copy_entry *)(uintptr_t)
+	    (hr->csp_base + HIBER_CSP_COPY_START);
+	hr->max_entries = (HIBER_CSP_COPY_END - HIBER_CSP_COPY_START) /
+	    sizeof(struct hiber_copy_entry);
+	hr->entry_count = 0;
+	hr->claimed_spare_pages = 0;
+	hr->skipped_spare_claims = 0;
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: === Streaming Staging Engine (Spare Pages) ===\n");
+
+	for (i = 2; i < hr->ehdr->e_phnum; i++) {
+		uint64_t c_start, c_size, chunk_staged_pages;
+		uint32_t crc_disk, crc_mem;
+		u_int n_chunk_deferred;
+
+		c_start = hr->ph[i].p_paddr;
+		c_size = hr->ph[i].p_memsz != 0 ?
+		    hr->ph[i].p_memsz : hr->ph[i].p_filesz;
+		n_chunk_deferred = 0;
+
+		for (r = 0; r < hr->n_active_ranges; r++) {
+			uint64_t ov_start, ov_size;
+
+			if (range_overlap(c_start, c_size,
+			    hr->active_ranges[r].start,
+			    hr->active_ranges[r].end -
+			    hr->active_ranges[r].start,
+			    &ov_start, &ov_size) > 0) {
+				if (n_chunk_deferred < nitems(chunk_deferred)) {
+					chunk_deferred[n_chunk_deferred].start =
+					    ov_start;
+					chunk_deferred[n_chunk_deferred].end =
+					    ov_start + ov_size;
+					n_chunk_deferred++;
+				} else {
+					hiber_log(HIBER_LOG_WARN,
+					    "hibernate: WARNING: chunk_deferred "
+					    "array full (%u entries)\n",
+					    n_chunk_deferred);
+				}
+			}
+		}
+
+		if (n_chunk_deferred == 0)
+			continue;
+
+		crc_disk = 0xffffffff;
+		crc_mem = 0xffffffff;
+		chunk_staged_pages = 0;
+
+		for (u_int d = 0; d < n_chunk_deferred; d++) {
+			uint64_t cur_page, pages_left;
+
+			cur_page = (chunk_deferred[d].start - c_start) /
+			    EFI_PAGE_SIZE;
+			pages_left = (chunk_deferred[d].end -
+			    chunk_deferred[d].start) / EFI_PAGE_SIZE;
+
+			while (pages_left > 0) {
+				uint64_t blk_pages, blk_bytes, disk_lba;
+
+				blk_pages = pages_left > 16 ? 16 : pages_left;
+				blk_bytes = blk_pages * EFI_PAGE_SIZE;
+				disk_lba = (HIBERNATE_IMAGE_OFFSET +
+				    hr->ph[i].p_offset +
+				    cur_page * EFI_PAGE_SIZE) / hr->blksz;
+
+				status = hr->blkio->ReadBlocks(hr->blkio,
+				    hr->blkio->Media->MediaId, disk_lba,
+				    blk_bytes, hr->readbuf);
+				if (EFI_ERROR(status)) {
+					hiber_log(HIBER_LOG_ERROR,
+					    "hibernate: ReadBlocks error at "
+					    "LBA %ju (%lu)\n",
+					    (uintmax_t)disk_lba,
+					    DECODE_ERROR(status));
+					hiber_refuse_rpt.chk_read =
+					    HIBER_CHK_FAIL;
+					hiber_refuse_pending = "read failed";
+					return (false);
+				}
+
+				crc_disk = hibernate_crc32_update(crc_disk,
+				    hr->readbuf, blk_bytes);
+
+				for (uint64_t p_idx = 0;
+				    p_idx < blk_pages; p_idx++) {
+					uint64_t spare_pa, target_pa;
+
+					if (!hibernate_claim_next_spare(
+					    hr->cb, &spare_cursor,
+					    hr->post_avoid,
+					    hr->n_post_avoid, &spare_pa,
+					    &hr->skipped_spare_claims)) {
+						hiber_log(HIBER_LOG_ERROR,
+						    "hibernate: spare pages "
+						    "exhausted (cursor %ju >= "
+						    "%ju)\n",
+						    (uintmax_t)spare_cursor,
+						    (uintmax_t)
+						    hr->cb->hc_spare_pages_nb);
+						snprintf(hiber_refuse_rpt.mmap,
+						    sizeof(hiber_refuse_rpt.mmap),
+						    "total_spare_bytes=0x%jx "
+						    "excluded_bytes=0x%jx "
+						    "usable_bytes=0x%jx "
+						    "must_stage_bytes=0x%jx "
+						    "verdict=INSUFFICIENT",
+						    (uintmax_t)
+						    hr->total_spare_bytes,
+						    (uintmax_t)
+						    hr->excluded_spare_bytes,
+						    (uintmax_t)
+						    hr->usable_spare_bytes,
+						    (uintmax_t)
+						    hr->must_stage_bytes);
+						hiber_refuse_rpt.
+						    chk_staging_feas =
+						    HIBER_CHK_FAIL;
+						hiber_refuse_pending =
+						    "staging infeasible";
+						return (false);
+					}
+					hr->claimed_spare_pages++;
+
+					target_pa = c_start +
+					    (cur_page + p_idx) *
+					    EFI_PAGE_SIZE;
+					memcpy((void *)(uintptr_t)spare_pa,
+					    hr->readbuf +
+					    p_idx * EFI_PAGE_SIZE,
+					    EFI_PAGE_SIZE);
+					crc_mem = hibernate_crc32_update(
+					    crc_mem,
+					    (const void *)(uintptr_t)
+					    spare_pa, EFI_PAGE_SIZE);
+
+					if (!hibernate_append_copy_entry(
+					    hr->entries, &hr->entry_count,
+					    hr->max_entries, spare_pa,
+					    target_pa)) {
+						hiber_log(HIBER_LOG_ERROR,
+						    "hibernate: copy entries "
+						    "list overflow\n");
+						BS->FreePages(spare_pa, 1);
+						hr->claimed_spare_pages--;
+						hiber_refuse_pending =
+						    "COPY_LIST_CAPACITY";
+						return (false);
+					}
+					chunk_staged_pages++;
+					hr->total_staged_pages++;
+				}
+				pages_left -= blk_pages;
+				cur_page += blk_pages;
+			}
+		}
+
+		crc_disk ^= 0xffffffff;
+		crc_mem ^= 0xffffffff;
+		if (crc_disk != crc_mem) {
+			hiber_log(HIBER_LOG_ERROR,
+			    "hibernate:   chunk %2u: CRC MISMATCH "
+			    "(disk 0x%08x != mem 0x%08x) [FAIL]\n",
+			    i - 2, crc_disk, crc_mem);
+			hiber_refuse_rpt.chk_staging_crc = HIBER_CHK_FAIL;
+			hiber_refuse_pending = "staging CRC mismatch";
+			return (false);
+		}
+		hiber_log(HIBER_LOG_INFO,
+		    "hibernate:   chunk %2u: %ju pages (%ju KiB) "
+		    "staged, CRC32 0x%08x [PASS]\n",
+		    i - 2, (uintmax_t)chunk_staged_pages,
+		    (uintmax_t)(chunk_staged_pages * 4), crc_mem);
+	}
+
+	hiber_log(HIBER_LOG_ERROR,
+	    "hibernate: streaming staging complete: %ju pages (%ju KiB) "
+	    "staged into spare pages (%ju usable spare pages remaining, "
+	    "0 overflows)\n",
+	    (uintmax_t)hr->total_staged_pages,
+	    (uintmax_t)(hr->total_staged_pages * 4),
+	    (uintmax_t)((hr->usable_spare_pages >
+	    hr->total_staged_pages) ?
+	    hr->usable_spare_pages - hr->total_staged_pages : 0));
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: staging EFI claims: %ju pages, %ju skipped\n",
+	    (uintmax_t)hr->claimed_spare_pages,
+	    (uintmax_t)hr->skipped_spare_claims);
+
+	hr->total_staged_crc = 0xffffffff;
+	for (uint64_t e = 0; e < hr->entry_count; e++)
+		hr->total_staged_crc = hibernate_crc32_update(
+		    hr->total_staged_crc,
+		    (const void *)(uintptr_t)
+		    hr->entries[e].src_spare_pa,
+		    hr->entries[e].page_count * EFI_PAGE_SIZE);
+	hr->total_staged_crc ^= 0xffffffff;
+	return (true);
+}
+
+static bool
+hibernate_prepare_handoff(struct hibernate_restore *hr)
+{
+	const struct hibernate_pcb *pcb;
+	uint64_t *pml4, *pdpt;
+	uint64_t csp_end;
+	const u_int num_gb = 8;
+	u_int r;
+
+	pcb = (const struct hibernate_pcb *)
+	    ((uintptr_t)hr->workspace + hr->ph[1].p_offset);
+	hr->thdr = (struct hiber_trampoline_header *)(uintptr_t)
+	    hr->csp_base;
+
+	hr->thdr->magic = 0x53345452414d5000ULL;
+	hr->thdr->copy_entries_pa =
+	    hr->csp_base + HIBER_CSP_COPY_START;
+	hr->thdr->entry_count = hr->entry_count;
+	hr->thdr->target_rsp = pcb->rsp;
+	hr->thdr->target_r12 = pcb->r12;
+	hr->thdr->target_rip = pcb->rip;
+
+	memcpy((void *)(uintptr_t)(hr->csp_base + 0x30),
+	    hibernate_tramp_stub, HIBERNATE_TRAMP_STUB_SIZE);
+
+	pml4 = (uint64_t *)(uintptr_t)(hr->csp_base + 0x2000);
+	pdpt = (uint64_t *)(uintptr_t)(hr->csp_base + 0x3000);
+	bzero(pml4, 4096);
+	bzero(pdpt, 4096);
+	pml4[0] = (hr->csp_base + 0x3000) | 0x03;
+
+	for (u_int g = 0; g < num_gb; g++) {
+		uint64_t pd_pa, *pd;
+
+		pd_pa = hr->csp_base + 0x4000 + g * 4096;
+		pd = (uint64_t *)(uintptr_t)pd_pa;
+		bzero(pd, 4096);
+		pdpt[g] = pd_pa | 0x03;
+		for (u_int j = 0; j < 512; j++) {
+			uint64_t paddr;
+
+			paddr = ((uint64_t)g << 30) |
+			    ((uint64_t)j << 21);
+			pd[j] = paddr | 0x83;
+		}
+	}
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: private 1:1 identity page table built in "
+	    "contiguous spare (PML4=0x%016jx, %u GiB mapped)\n",
+	    (uintmax_t)(hr->csp_base + 0x2000), num_gb);
+
+	hr->collisions = 0;
+	csp_end = hr->csp_base + hr->cb->hc_contig_spare_size;
+	for (uint64_t k = 0; k < hr->entry_count; k++) {
+		uint64_t dst_start, dst_size;
+
+		dst_start = hr->entries[k].dst_target_pa;
+		dst_size = hr->entries[k].page_count * EFI_PAGE_SIZE;
+		if (range_overlap(hr->csp_base,
+		    hr->cb->hc_contig_spare_size, dst_start, dst_size,
+		    NULL, NULL) > 0)
+			hr->collisions++;
+	}
+	for (r = 0; r < hr->n_post_avoid; r++) {
+		if (hr->post_avoid[r].start == hr->csp_base &&
+		    hr->post_avoid[r].end == csp_end)
+			continue;
+		if (hr->csp_base < hr->post_avoid[r].end &&
+		    csp_end > hr->post_avoid[r].start)
+			hr->collisions++;
+	}
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: post-EBS trampoline placed at 0x%016jx "
+	    "(stub: %zu bytes, copy list: %ju entries / %ju bytes)\n",
+	    (uintmax_t)hr->csp_base,
+	    sizeof(struct hiber_trampoline_header) +
+	    HIBERNATE_TRAMP_STUB_SIZE,
+	    (uintmax_t)hr->entry_count,
+	    (uintmax_t)(hr->entry_count *
+	    sizeof(struct hiber_copy_entry)));
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate:   thdr: entries_pa=0x%jx count=%ju "
+	    "rsp=0x%jx r12=0x%jx rip=0x%jx\n",
+	    (uintmax_t)hr->thdr->copy_entries_pa,
+	    (uintmax_t)hr->thdr->entry_count,
+	    (uintmax_t)hr->thdr->target_rsp,
+	    (uintmax_t)hr->thdr->target_r12,
+	    (uintmax_t)hr->thdr->target_rip);
+
+	for (uint64_t k = 0; k < hr->entry_count; k++) {
+		hiber_log(HIBER_LOG_DEBUG,
+		    "hibernate:   entry %2ju: src 0x%016jx -> "
+		    "dst 0x%016jx (%ju pages, %ju KiB)\n",
+		    (uintmax_t)k,
+		    (uintmax_t)hr->entries[k].src_spare_pa,
+		    (uintmax_t)hr->entries[k].dst_target_pa,
+		    (uintmax_t)hr->entries[k].page_count,
+		    (uintmax_t)(hr->entries[k].page_count * 4));
+		if ((k % 32) == 0 || k + 1 == hr->entry_count)
+			hiber_log(HIBER_LOG_INFO,
+			    "hibernate:   copy-list progress %ju/%ju\n",
+			    (uintmax_t)(k + 1),
+			    (uintmax_t)hr->entry_count);
+	}
+
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: trampoline disjointness assertion: %u "
+	    "collisions (0 overlaps) [PASS]\n", hr->collisions);
+	if (hr->collisions > 0) {
+		hiber_log(HIBER_LOG_ERROR,
+		    "hibernate: trampoline collision detected [FAIL]\n");
+		hiber_refuse_rpt.chk_tramp = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "trampoline collision";
+		return (false);
+	}
+	hiber_refuse_rpt.chk_tramp = HIBER_CHK_PASS;
+	hiber_refuse_set_stage("A1");
 	return (true);
 }
 
 static void
 hibernate_release_restore(struct hibernate_restore *hr)
 {
+	/*
+	 * Release only allocations made by this restore attempt.  The direct
+	 * destination ledger records exact-address loader allocations; it never
+	 * contains the kernel's contiguous-spare arena or retained loader heap.
+	 */
+	for (u_int i = 0; i < hr->n_direct_claims; i++) {
+		BS->FreePages((EFI_PHYSICAL_ADDRESS)
+		    hr->direct_claims[i].start,
+		    EFI_SIZE_TO_PAGES(hr->direct_claims[i].end -
+		    hr->direct_claims[i].start));
+	}
+	hr->n_direct_claims = 0;
+
+	if (hr->entries != NULL) {
+		for (uint64_t e = 0; e < hr->entry_count; e++)
+			BS->FreePages((EFI_PHYSICAL_ADDRESS)
+			    hr->entries[e].src_spare_pa,
+			    hr->entries[e].page_count);
+		hr->entries = NULL;
+		hr->entry_count = 0;
+		hr->claimed_spare_pages = 0;
 	}
 	if (hr->workspace != 0) {
 		BS->FreePages(hr->workspace, hr->workspace_pages);
@@ -1172,13 +2155,17 @@ hibernate_analyze_conflicts(pdinfo_t *part, const Elf_Ehdr *ehdr,
     const Elf_Phdr *ph, const struct hibernate_cb *cb, uint8_t **bufp)
 {
 	struct hibernate_restore hr;
-	bool prepared;
+	bool restored;
 
 	bzero(&hr, sizeof(hr));
 	hr.part = part;
-	prepared = hibernate_prepare_restore(&hr, ehdr, ph, cb, bufp);
+	restored = hibernate_prepare_restore(&hr, ehdr, ph, cb, bufp);
+	if (restored)
+		restored = hibernate_stage_deferred(&hr);
+	if (restored)
+		restored = hibernate_prepare_handoff(&hr);
 	hibernate_release_restore(&hr);
-	if (!prepared && hiber_refuse_pending != NULL)
+	if (!restored && hiber_refuse_pending != NULL)
 		hibernate_refuse(hiber_refuse_pending);
 }
 
