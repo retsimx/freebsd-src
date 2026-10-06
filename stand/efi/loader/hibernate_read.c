@@ -18,29 +18,378 @@
 #include <machine/elf.h>
 #include <machine/hibernate.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stand.h>
+#include <bootstrap.h>
 
 #include <efi.h>
 #include <efilib.h>
+#include <Protocol/SimpleFileSystem.h>
 
 #include "loader_efi.h"
 
 #define HIBERNATE_IMAGE_OFFSET	65536ULL	/* 64 KiB = LBA 128 at 512b */
-#define HIBERNATE_HDR_BUF_SIZE	(512 * 1024)	/* 512 KiB */
+#define HIBERNATE_HDR_BUF_SIZE	(2 * 1024 * 1024)	/* 2 MiB */
+
+#define HIBER_REFUSE_MAX_PROBES	16
+#define HIBER_REFUSE_TEXT_MAX	4096
+#define HIBER_TRACE_MAX		(96 * 1024)
+#define A1_BLK_CRC_MAX		65536	/* max 64 KiB blocks per chunk (~4 GiB) */
+
+/*
+ * Fixed sub-layout of the kernel-declared contiguous spare arena
+ * (hc_contig_spare_start / hc_contig_spare_size).  The arena is disposable
+ * handoff memory and is never a PT_LOAD destination, so loader workspaces
+ * placed here cannot be clobbered by Phase A1 direct streaming or by EFI
+ * allocations that alias a restore destination.  All offsets are relative
+ * to hc_contig_spare_start; the arena must be >= HIBER_CSP_REQUIRED_SIZE.
+ */
+#define HIBER_CSP_PGTBL_START	0x02000		/* private 1:1 page tables */
+#define HIBER_CSP_COPY_START	0x20000		/* deferred copy-entry list */
+#define HIBER_CSP_COPY_END	0xb0000
+#define HIBER_CSP_A1_CRC_START	0xb0000		/* A1 per-64KiB-block CRCs */
+#define HIBER_CSP_A1_CRC_SIZE	0x40000		/* 65536 entries * 4 bytes */
+#define HIBER_CSP_READBUF_START	0xf0000		/* Block I/O read buffer */
+#define HIBER_CSP_READBUF_SIZE	0x10000		/* 64 KiB */
+#define HIBER_CSP_REQUIRED_SIZE	0x100000	/* 1 MiB minimum arena */
+
+/*
+ * Console verbosity for hibernate resume (loader.env hibernate_loglevel).
+ * Full message text is always teed into hiber_trace[] and flushed to
+ * \efi\freebsd\hiber-trace.log on refuse — only the EFI FB/console is gated.
+ */
+enum hiber_log_level {
+	HIBER_LOG_ERROR = 0,
+	HIBER_LOG_WARN = 1,
+	HIBER_LOG_INFO = 2,
+	HIBER_LOG_DEBUG = 3,
+};
+
+static enum hiber_log_level hiber_console_level = HIBER_LOG_INFO;
+static char hiber_trace[HIBER_TRACE_MAX];
+static size_t hiber_trace_len;
+static bool hiber_trace_truncated;
+static bool hiber_log_inited;
 
 static void
-hibernate_refuse(const char *reason)
+hiber_log_init(void)
 {
-	static char report[512];
-	size_t used;
+	const char *v;
+	char buf[32];
+	size_t n;
 
-	if (reason == NULL)
-		reason = "unspecified refusal";
-	used = (size_t)snprintf(report, sizeof(report),
-	    "Hibernate refusal: %s\n", reason);
-	if (used >= sizeof(report))
-		report[sizeof(report) - 1] = '\0';
-	printf("%s", report);
+	if (hiber_log_inited)
+		return;
+	hiber_log_inited = true;
+	hiber_trace_len = 0;
+	hiber_trace[0] = '\0';
+	hiber_trace_truncated = false;
+
+	v = getenv("hibernate_loglevel");
+	if (v == NULL)
+		v = getenv("hibernate_verbose");
+	if (v == NULL)
+		return;
+	/* Strip optional surrounding quotes from loader.env. */
+	n = strlen(v);
+	if (n >= 2 && v[0] == '"' && v[n - 1] == '"') {
+		n -= 2;
+		if (n >= sizeof(buf))
+			n = sizeof(buf) - 1;
+		memcpy(buf, v + 1, n);
+		buf[n] = '\0';
+		v = buf;
+	}
+	if (strcasecmp(v, "error") == 0 || strcasecmp(v, "quiet") == 0 ||
+	    strcmp(v, "0") == 0)
+		hiber_console_level = HIBER_LOG_ERROR;
+	else if (strcasecmp(v, "warn") == 0 || strcasecmp(v, "warning") == 0 ||
+	    strcmp(v, "1") == 0)
+		hiber_console_level = HIBER_LOG_WARN;
+	else if (strcasecmp(v, "info") == 0 || strcmp(v, "2") == 0)
+		hiber_console_level = HIBER_LOG_INFO;
+	else if (strcasecmp(v, "debug") == 0 || strcasecmp(v, "verbose") == 0 ||
+	    strcmp(v, "3") == 0)
+		hiber_console_level = HIBER_LOG_DEBUG;
+}
+
+static void
+hiber_log(enum hiber_log_level lvl, const char *fmt, ...)
+{
+	char line[384];
+	va_list ap;
+	int n;
+
+	hiber_log_init();
+	va_start(ap, fmt);
+	n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n < 0)
+		return;
+	if ((size_t)n >= sizeof(line))
+		n = (int)sizeof(line) - 1;
+
+	if (hiber_trace_len + (size_t)n < HIBER_TRACE_MAX) {
+		memcpy(hiber_trace + hiber_trace_len, line, (size_t)n);
+		hiber_trace_len += (size_t)n;
+		hiber_trace[hiber_trace_len] = '\0';
+	} else if (!hiber_trace_truncated &&
+	    hiber_trace_len + 48 < HIBER_TRACE_MAX) {
+		const char *msg = "\n[hiber-trace truncated]\n";
+		size_t m = strlen(msg);
+		memcpy(hiber_trace + hiber_trace_len, msg, m);
+		hiber_trace_len += m;
+		hiber_trace[hiber_trace_len] = '\0';
+		hiber_trace_truncated = true;
+	}
+
+	if (lvl <= hiber_console_level)
+		printf("%s", line);
+}
+
+/*
+ * Static refuse report filled as checks run, written once by
+ * hibernate_refuse() (console tee + ESP overwrite). No heap.
+ */
+enum hiber_chk {
+	HIBER_CHK_SKIP = 0,
+	HIBER_CHK_PASS,
+	HIBER_CHK_FAIL,
+};
+
+struct hiber_refuse_report {
+	char	time[32];
+	char	loader[96];
+	char	boot_current[16];
+	char	marker[64];
+	char	probes[HIBER_REFUSE_MAX_PROBES][96];
+	u_int	n_probes;
+	char	image[128];
+	char	elf[128];
+	char	cb[192];
+	char	pcb[192];
+	char	mmap[160];
+	char	stage[64];
+	char	diag[512];
+	enum hiber_chk chk_read;
+	enum hiber_chk chk_elf_ident;
+	enum hiber_chk chk_e_type;
+	enum hiber_chk chk_e_machine;
+	enum hiber_chk chk_phdr;
+	enum hiber_chk chk_cb;
+	enum hiber_chk chk_pcb;
+	enum hiber_chk chk_staging_feas;
+	enum hiber_chk chk_staging_crc;
+	enum hiber_chk chk_tramp;
+	enum hiber_chk chk_ebs;
+	char	primary[80];
+	bool	emitted;
+};
+
+static struct hiber_refuse_report hiber_refuse_rpt;
+static char hiber_refuse_text[HIBER_REFUSE_TEXT_MAX];
+static const char *hiber_refuse_pending;
+
+static const char *
+hiber_chk_str(enum hiber_chk c)
+{
+	switch (c) {
+	case HIBER_CHK_PASS:
+		return ("pass");
+	case HIBER_CHK_FAIL:
+		return ("fail");
+	default:
+		return ("skip");
+	}
+}
+
+static void
+hiber_refuse_reset(void)
+{
+	const char *var;
+	EFI_TIME t;
+	EFI_STATUS status;
+	UINT16 boot_current;
+	size_t sz;
+
+	bzero(&hiber_refuse_rpt, sizeof(hiber_refuse_rpt));
+	hiber_refuse_pending = NULL;
+	hiber_refuse_text[0] = '\0';
+
+	strlcpy(hiber_refuse_rpt.time, "n/a", sizeof(hiber_refuse_rpt.time));
+	strlcpy(hiber_refuse_rpt.loader, "n/a", sizeof(hiber_refuse_rpt.loader));
+	strlcpy(hiber_refuse_rpt.boot_current, "n/a",
+	    sizeof(hiber_refuse_rpt.boot_current));
+	strlcpy(hiber_refuse_rpt.marker, "hibernate_resume=absent",
+	    sizeof(hiber_refuse_rpt.marker));
+	strlcpy(hiber_refuse_rpt.image, "n/a", sizeof(hiber_refuse_rpt.image));
+	strlcpy(hiber_refuse_rpt.elf, "n/a", sizeof(hiber_refuse_rpt.elf));
+	strlcpy(hiber_refuse_rpt.cb, "n/a", sizeof(hiber_refuse_rpt.cb));
+	strlcpy(hiber_refuse_rpt.pcb, "n/a", sizeof(hiber_refuse_rpt.pcb));
+	strlcpy(hiber_refuse_rpt.mmap, "n/a", sizeof(hiber_refuse_rpt.mmap));
+	strlcpy(hiber_refuse_rpt.stage, "n/a", sizeof(hiber_refuse_rpt.stage));
+	hiber_refuse_rpt.diag[0] = '\0';
+
+	if (bootprog_info != NULL && bootprog_info[0] != '\0')
+		strlcpy(hiber_refuse_rpt.loader, bootprog_info,
+		    sizeof(hiber_refuse_rpt.loader));
+
+	if (RS != NULL) {
+		status = RS->GetTime(&t, NULL);
+		if (!EFI_ERROR(status)) {
+			snprintf(hiber_refuse_rpt.time,
+			    sizeof(hiber_refuse_rpt.time),
+			    "%04u-%02u-%02uT%02u:%02u:%02u",
+			    t.Year, t.Month, t.Day, t.Hour, t.Minute, t.Second);
+		}
+	}
+
+	sz = sizeof(boot_current);
+	if (efi_global_getenv("BootCurrent", &boot_current, &sz) == EFI_SUCCESS &&
+	    sz >= sizeof(boot_current)) {
+		snprintf(hiber_refuse_rpt.boot_current,
+		    sizeof(hiber_refuse_rpt.boot_current), "%04x", boot_current);
+	}
+
+	var = getenv("hibernate_resume");
+	if (var != NULL) {
+		snprintf(hiber_refuse_rpt.marker, sizeof(hiber_refuse_rpt.marker),
+		    "hibernate_resume=%s", var);
+	}
+}
+
+static void
+hiber_refuse_set_stage(const char *stage)
+{
+	if (stage == NULL)
+		return;
+	strlcpy(hiber_refuse_rpt.stage, stage, sizeof(hiber_refuse_rpt.stage));
+}
+
+static void
+hiber_refuse_add_probe(u_int part, const char *result)
+{
+	if (hiber_refuse_rpt.n_probes >= HIBER_REFUSE_MAX_PROBES)
+		return;
+	snprintf(hiber_refuse_rpt.probes[hiber_refuse_rpt.n_probes],
+	    sizeof(hiber_refuse_rpt.probes[0]),
+	    "part=%u result=%s", part, result != NULL ? result : "n/a");
+	hiber_refuse_rpt.n_probes++;
+}
+
+static void
+hiber_refuse_format(void)
+{
+	struct hiber_refuse_report *r = &hiber_refuse_rpt;
+	char *p = hiber_refuse_text;
+	size_t rem = sizeof(hiber_refuse_text);
+	int n;
+	u_int i;
+
+	n = snprintf(p, rem,
+	    "hiber-refuse v1\n"
+	    "time: %s\n"
+	    "loader: %s\n"
+	    "boot_current: %s\n"
+	    "marker: %s\n"
+	    "\n",
+	    r->time, r->loader, r->boot_current, r->marker);
+	if (n < 0)
+		n = 0;
+	if ((size_t)n >= rem)
+		n = rem > 0 ? (int)rem - 1 : 0;
+	p += n;
+	rem -= n;
+
+	if (r->n_probes == 0) {
+		n = snprintf(p, rem, "probe: n/a\n");
+		if (n > 0 && (size_t)n < rem) {
+			p += n;
+			rem -= n;
+		}
+	} else {
+		for (i = 0; i < r->n_probes; i++) {
+			n = snprintf(p, rem, "probe: %s\n", r->probes[i]);
+			if (n < 0 || (size_t)n >= rem)
+				break;
+			p += n;
+			rem -= n;
+		}
+	}
+
+	n = snprintf(p, rem,
+	    "image: %s\n"
+	    "elf: %s\n"
+	    "cb: %s\n"
+	    "pcb: %s\n"
+	    "mmap: %s\n"
+	    "stage: %s\n"
+	    "\n"
+	    "checks:\n"
+	    "  read image: %s\n"
+	    "  elf ident: %s\n"
+	    "  e_type: %s\n"
+	    "  e_machine: %s\n"
+	    "  phdr layout: %s\n"
+	    "  CB validation: %s\n"
+	    "  PCB size: %s\n"
+	    "  FACS signature: skip (not implemented)\n"
+	    "  staging feasibility: %s\n"
+	    "  staging CRC: %s\n"
+	    "  trampoline placement: %s\n"
+	    "  ExitBootServices: %s\n"
+	    "\n"
+	    "primary: %s\n",
+	    r->image, r->elf, r->cb, r->pcb, r->mmap, r->stage,
+	    hiber_chk_str(r->chk_read),
+	    hiber_chk_str(r->chk_elf_ident),
+	    hiber_chk_str(r->chk_e_type),
+	    hiber_chk_str(r->chk_e_machine),
+	    hiber_chk_str(r->chk_phdr),
+	    hiber_chk_str(r->chk_cb),
+	    hiber_chk_str(r->chk_pcb),
+	    hiber_chk_str(r->chk_staging_feas),
+	    hiber_chk_str(r->chk_staging_crc),
+	    hiber_chk_str(r->chk_tramp),
+	    hiber_chk_str(r->chk_ebs),
+	    r->primary[0] != '\0' ? r->primary : "n/a");
+	if (n < 0)
+		n = 0;
+	if ((size_t)n >= rem)
+		n = rem > 0 ? (int)rem - 1 : 0;
+	p += n;
+	rem -= n;
+
+	if (r->diag[0] != '\0') {
+		n = snprintf(p, rem, "diag: %s\n", r->diag);
+		if (n > 0 && (size_t)n < rem) {
+			p += n;
+			rem -= n;
+		}
+	}
+}
+
+/*
+ * Single console-only refusal sink: finalize and print the bounded report.
+ */
+static void
+hibernate_refuse(const char *primary)
+{
+	if (hiber_refuse_rpt.emitted)
+		return;
+
+	if (primary != NULL && primary[0] != '\0')
+		strlcpy(hiber_refuse_rpt.primary, primary,
+		    sizeof(hiber_refuse_rpt.primary));
+	if (hiber_refuse_rpt.primary[0] == '\0')
+		strlcpy(hiber_refuse_rpt.primary, "no hibernate image found",
+		    sizeof(hiber_refuse_rpt.primary));
+
+	hiber_refuse_format();
+	/* Refuse summary always hits the console (errors matter on FB). */
+	printf("%s", hiber_refuse_text);
+	hiber_refuse_rpt.emitted = true;
+	hiber_refuse_pending = NULL;
 }
 
 static bool
@@ -58,8 +407,783 @@ hibernate_resume_enabled(void)
 	return (false);
 }
 
+enum hibernate_mem_class {
+	HMC_CONVENTIONAL,
+	HMC_RECLAIMABLE,
+	HMC_LOADER_IN_USE,
+	HMC_MUST_PRESERVE,
+};
+
+static enum hibernate_mem_class
+hibernate_classify_mem_type(EFI_MEMORY_TYPE type)
+{
+	switch (type) {
+	case EfiRuntimeServicesCode:
+	case EfiRuntimeServicesData:
+	case EfiReservedMemoryType:
+	case EfiACPIMemoryNVS:
+	case EfiACPIReclaimMemory:
+	case EfiMemoryMappedIO:
+	case EfiMemoryMappedIOPortSpace:
+	case EfiPalCode:
+	case EfiPersistentMemory:
+	case EfiUnusableMemory:
+		return (HMC_MUST_PRESERVE);
+	case EfiLoaderCode:
+	case EfiLoaderData:
+		return (HMC_LOADER_IN_USE);
+	case EfiBootServicesCode:
+	case EfiBootServicesData:
+		return (HMC_RECLAIMABLE);
+	case EfiConventionalMemory:
+		return (HMC_CONVENTIONAL);
+	default:
+		return (HMC_MUST_PRESERVE);
+	}
+}
+
+static inline uint64_t
+range_overlap(uint64_t a_start, uint64_t a_size, uint64_t b_start, uint64_t b_size,
+    uint64_t *out_start, uint64_t *out_size)
+{
+	uint64_t a_end = a_start + a_size;
+	uint64_t b_end = b_start + b_size;
+	uint64_t o_start = (a_start > b_start) ? a_start : b_start;
+	uint64_t o_end = (a_end < b_end) ? a_end : b_end;
+
+	if (o_start < o_end) {
+		if (out_start != NULL)
+			*out_start = o_start;
+		if (out_size != NULL)
+			*out_size = o_end - o_start;
+		return (o_end - o_start);
+	}
+	return (0);
+}
+
+static EFI_MEMORY_DESCRIPTOR *
+hibernate_get_memmap(UINTN *map_sz, UINTN *map_key, UINTN *desc_sz, UINT32 *desc_ver)
+{
+	EFI_MEMORY_DESCRIPTOR *map;
+	EFI_STATUS status;
+	UINTN sz, key, dsz;
+	UINT32 dver;
+
+	sz = 0;
+	map = NULL;
+	key = 0;
+	dsz = 0;
+	dver = 0;
+
+	for (;;) {
+		status = BS->GetMemoryMap(&sz, map, &key, &dsz, &dver);
+		if (!EFI_ERROR(status))
+			break;
+		if (status != EFI_BUFFER_TOO_SMALL) {
+			hiber_log(HIBER_LOG_ERROR, "hibernate: GetMemoryMap error %lu\n",
+			    DECODE_ERROR(status));
+			if (map != NULL)
+				free(map);
+			return (NULL);
+		}
+		free(map);
+		map = malloc(sz + (10 * dsz));
+		if (map == NULL) {
+			hiber_log(HIBER_LOG_ERROR, "hibernate: failed to allocate memory map buffer\n");
+			return (NULL);
+		}
+	}
+
+	*map_sz = sz;
+	*map_key = key;
+	*desc_sz = dsz;
+	if (desc_ver != NULL)
+		*desc_ver = dver;
+	return (map);
+}
+
+struct hibernate_range {
+	uint64_t start;
+	uint64_t end;
+};
+
+static inline void
+add_avoid_range(struct hibernate_range *ranges, u_int *nranges, u_int max_ranges,
+    uint64_t start, uint64_t size)
+{
+	if (size == 0 || *nranges >= max_ranges)
+		return;
+	ranges[*nranges].start = start;
+	ranges[*nranges].end = start + size;
+	(*nranges)++;
+}
+
+static inline bool
+is_page_avoided(uint64_t pa, const struct hibernate_range *avoid, u_int navoid)
+{
+	for (u_int r = 0; r < navoid; r++) {
+		if (pa < avoid[r].end && (pa + EFI_PAGE_SIZE) > avoid[r].start)
+			return (true);
+	}
+	return (false);
+}
+
+struct hibernate_restore {
+	pdinfo_t *part;
+	EFI_BLOCK_IO *blkio;
+	uint32_t blksz;
+
+	uint64_t loader_start;
+	uint64_t loader_size;
+	EFI_PHYSICAL_ADDRESS heap_base;
+	UINTN heap_size;
+	EFI_PHYSICAL_ADDRESS staging_base;
+	UINTN staging_size;
+
+	EFI_PHYSICAL_ADDRESS workspace;
+	UINTN workspace_pages;
+	const Elf_Ehdr *ehdr;
+	const Elf_Phdr *ph;
+	const struct hibernate_cb *cb;
+	EFI_MEMORY_DESCRIPTOR *post_map;
+	UINTN post_map_sz;
+	UINTN post_map_key;
+	UINTN post_desc_sz;
+	UINT32 post_desc_ver;
+	u_int post_ndesc;
+
+	struct hibernate_range post_avoid[128];
+	u_int n_post_avoid;
+	bool post_contig_overlaps;
+	u_int excluded_spare_cnt;
+	uint64_t total_spare_bytes;
+	uint64_t excluded_spare_bytes;
+	uint64_t usable_spare_pages;
+	uint64_t usable_spare_bytes;
+	uint64_t must_stage_bytes;
+
+	uint64_t csp_base;
+	uint64_t csp_size;
+	EFI_PHYSICAL_ADDRESS readbuf_paddr;
+	uint32_t *a1_blk_crc;
+
+	struct hibernate_range active_ranges[512];
+	u_int n_active_ranges;
+	u_int direct_chunks_cnt;
+	u_int deferred_chunks_cnt;
+	uint64_t total_direct_bytes;
+	uint64_t total_deferred_chunk_bytes;
+	uint64_t total_deferred_pages;
+};
+
+
 static bool
-hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
+hibernate_prepare_workspace(struct hibernate_restore *hr, uint8_t **bufp)
+{
+	uint64_t readbuf_start, readbuf_size;
+	EFI_STATUS status;
+	u_int ndesc2;
+
+	hr->heap_base = 0;
+	hr->staging_base = 0;
+	hr->heap_size = 0;
+	hr->staging_size = 0;
+
+	readbuf_start = (bufp != NULL && *bufp != NULL) ?
+	    (uint64_t)(uintptr_t)*bufp : 0;
+	readbuf_size = HIBERNATE_HDR_BUF_SIZE;
+
+	hr->loader_start = (boot_img != NULL) ?
+	    (uint64_t)(uintptr_t)boot_img->ImageBase : 0;
+	hr->loader_size = (boot_img != NULL) ?
+	    (uint64_t)boot_img->ImageSize : 0;
+
+	efi_heap_get_bounds(&hr->heap_base, &hr->heap_size);
+	efi_staging_get_bounds(&hr->staging_base, &hr->staging_size);
+
+	hiber_log(HIBER_LOG_INFO, "hibernate: loader allocation audit:\n");
+	hiber_log(HIBER_LOG_INFO, "hibernate:   RESIDENT  binary  : 0x%016jx - 0x%016jx (%ju KiB)\n",
+	    (uintmax_t)hr->loader_start, (uintmax_t)(hr->loader_start + hr->loader_size),
+	    (uintmax_t)(hr->loader_size / 1024));
+	hiber_log(HIBER_LOG_INFO, "hibernate:   TRANSIENT staging : 0x%016jx - 0x%016jx (%ju MiB)\n",
+	    (uintmax_t)hr->staging_base, (uintmax_t)(hr->staging_base + hr->staging_size),
+	    (uintmax_t)(hr->staging_size / (1024 * 1024)));
+	hiber_log(HIBER_LOG_INFO, "hibernate:   TRANSIENT heap    : 0x%016jx - 0x%016jx (%ju MiB)\n",
+	    (uintmax_t)hr->heap_base, (uintmax_t)(hr->heap_base + hr->heap_size),
+	    (uintmax_t)(hr->heap_size / (1024 * 1024)));
+	hiber_log(HIBER_LOG_INFO, "hibernate:   TRANSIENT readbuf : 0x%016jx - 0x%016jx (%ju KiB)\n",
+	    (uintmax_t)readbuf_start, (uintmax_t)(readbuf_start + readbuf_size),
+	    (uintmax_t)(readbuf_size / 1024));
+
+	/*
+	 * Allocate post-allocation workspace using AllocatePages so malloc()
+	 * is never invoked while the loader heap is freed.
+	 * Workspace holds:
+	 *   [0 .. HIBERNATE_HDR_BUF_SIZE)        : Safe copy of headers (2 MiB)
+	 *   [HIBERNATE_HDR_BUF_SIZE .. +128 KiB) : Post-allocation memory map (128 KiB)
+	 */
+	hr->workspace_pages =
+	    EFI_SIZE_TO_PAGES(HIBERNATE_HDR_BUF_SIZE + 128 * 1024);
+	hr->workspace = 0;
+
+	status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+	    hr->workspace_pages, &hr->workspace);
+	if (EFI_ERROR(status)) {
+		hiber_log(HIBER_LOG_ERROR, "hibernate: failed to allocate post-allocation buffer: %lu\n",
+		    DECODE_ERROR(status));
+		hiber_refuse_pending = "allocation failed";
+		return (false);
+	}
+
+	/*
+	 * The Block I/O read buffer and the per-chunk A1 CRC table are NOT
+	 * EFI-allocated. AllocateAnyPages can return pages that lie inside a
+	 * PT_LOAD physical destination, and Phase A1 direct streaming then
+	 * overwrites the loader's own workspace (observed as a corrupted
+	 * expected-CRC table and tens of thousands of false clobber reports).
+	 * Both workspaces are instead
+	 * carved from the kernel-declared contiguous spare arena below, once
+	 * hr->cb is available.
+	 */
+	if (bufp != NULL && *bufp != NULL)
+		memcpy((void *)(uintptr_t)hr->workspace, *bufp, HIBERNATE_HDR_BUF_SIZE);
+
+	hr->ehdr = (const Elf_Ehdr *)(uintptr_t)hr->workspace;
+	hr->ph = (const Elf_Phdr *)((uintptr_t)hr->workspace +
+	    hr->ehdr->e_phoff);
+	hr->cb = (const struct hibernate_cb *)((uintptr_t)hr->workspace +
+	    hr->ph[0].p_offset);
+
+	/*
+	 * Validate and adopt the fixed contiguous-spare workspace layout
+	 * (HIBER_CSP_* above).  Refuse rather than fall back to an EFI
+	 * allocation, which could alias a restore destination.
+	 */
+	hr->csp_base = hr->cb->hc_contig_spare_start;
+	hr->csp_size = hr->cb->hc_contig_spare_size;
+	if (hr->csp_base == 0 || hr->csp_size < HIBER_CSP_REQUIRED_SIZE ||
+	    hr->csp_base + hr->csp_size < hr->csp_base) {
+		hiber_log(HIBER_LOG_ERROR,
+		    "hibernate: CSP_WORKSPACE_TOO_SMALL base=0x%jx size=0x%jx need=0x%x\n",
+		    (uintmax_t)hr->csp_base, (uintmax_t)hr->csp_size,
+		    HIBER_CSP_REQUIRED_SIZE);
+		hiber_refuse_pending = "CSP_WORKSPACE_TOO_SMALL";
+		return (false);
+	}
+	hr->readbuf_paddr = hr->csp_base + HIBER_CSP_READBUF_START;
+	hr->a1_blk_crc = (uint32_t *)(uintptr_t)(hr->csp_base + HIBER_CSP_A1_CRC_START);
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: CSP workspace: base=0x%016jx size=0x%jx "
+	    "entries=[0x%x,0x%x) crc=[0x%x,0x%x) readbuf=[0x%x,0x%x)\n",
+	    (uintmax_t)hr->csp_base, (uintmax_t)hr->csp_size,
+	    HIBER_CSP_COPY_START, HIBER_CSP_COPY_END,
+	    HIBER_CSP_A1_CRC_START,
+	    HIBER_CSP_A1_CRC_START + HIBER_CSP_A1_CRC_SIZE,
+	    HIBER_CSP_READBUF_START,
+	    HIBER_CSP_READBUF_START + HIBER_CSP_READBUF_SIZE);
+
+	/*
+	 * Retain the loader's transient allocations (header pool, staging,
+	 * heap) until ExitBootServices.  Returning them to the firmware pool
+	 * while Boot Services remain active lets firmware reuse the released
+	 * pages for storage-driver DMA/scratch, clobbering data restored into
+	 * or staged from them.  Keeping them owned also keeps any overlapping
+	 * image destination deferred until the post-EBS trampoline.
+	 */
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: retain staging [0x%016jx,0x%016jx)\n",
+	    (uintmax_t)hr->staging_base, (uintmax_t)(hr->staging_base + hr->staging_size));
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: retain heap [0x%016jx,0x%016jx)\n",
+	    (uintmax_t)hr->heap_base, (uintmax_t)(hr->heap_base + hr->heap_size));
+
+	/* Post-Allocation Memory Map Snapshot */
+	hr->post_map = (EFI_MEMORY_DESCRIPTOR *)((uintptr_t)hr->workspace +
+	    HIBERNATE_HDR_BUF_SIZE);
+	hr->post_map_sz = 128 * 1024;
+	hr->post_map_key = 0;
+	hr->post_desc_sz = 0;
+	hr->post_desc_ver = 0;
+
+	status = BS->GetMemoryMap(&hr->post_map_sz, hr->post_map, &hr->post_map_key, &hr->post_desc_sz, &hr->post_desc_ver);
+	if (EFI_ERROR(status)) {
+		hiber_log(HIBER_LOG_ERROR, "hibernate: post-allocation GetMemoryMap failed: %lu\n",
+		    DECODE_ERROR(status));
+		hiber_refuse_pending = "allocation failed";
+		return (false);
+	}
+
+	ndesc2 = (hr->post_desc_sz != 0) ? (hr->post_map_sz / hr->post_desc_sz) : 0;
+	hr->post_ndesc = ndesc2;
+	hiber_log(HIBER_LOG_INFO, "hibernate: post-allocation memory map: %u descriptors, key 0x%lx , descsize %lu\n",
+	    ndesc2, (u_long)hr->post_map_key, (u_long)hr->post_desc_sz);
+
+	return (true);
+}
+
+static bool
+hibernate_analyze_spare_capacity(struct hibernate_restore *hr,
+    uint8_t **bufp)
+{
+	EFI_MEMORY_DESCRIPTOR *p;
+	uint64_t largest_must_stage_chunk, staging_spare_pages;
+	uint64_t nb_pages, max_pages;
+	bool contig_ok, staging_ok;
+	const char *contig_verdict, *staging_verdict, *revised_verdict;
+	u_int i, j, k, r;
+
+	/*
+	 * Corrected Conflict Recomputation (must match Phase 3 active_ranges):
+	 * must-stage = PT_LOAD ∩ (MUST-PRESERVE ∪ RECLAIMABLE ∪ RESIDENT Loader ∪
+	 * Low Memory < 1 MiB): Boot Services ranges are staged before
+	 * ExitBootServices, so excluding them would understate the staging
+	 * demand and overflow mid-stage.
+	 */
+	hr->must_stage_bytes = 0;
+	largest_must_stage_chunk = 0;
+
+	for (i = 2; i < hr->ehdr->e_phnum; i++) {
+		uint64_t c_start = hr->ph[i].p_paddr;
+		uint64_t c_size = (hr->ph[i].p_memsz != 0) ? hr->ph[i].p_memsz : hr->ph[i].p_filesz;
+		uint64_t segment_must_stage = 0;
+
+		/* Low memory < 1 MiB must always be staged */
+		if (c_start < 0x100000) {
+			uint64_t low_end = (c_start + c_size < 0x100000) ? (c_start + c_size) : 0x100000;
+			segment_must_stage += (low_end - c_start);
+		}
+
+		if (hr->loader_size > 0) {
+			segment_must_stage += range_overlap(c_start, c_size,
+			    hr->loader_start, hr->loader_size, NULL, NULL);
+		}
+
+		for (j = 0, p = hr->post_map; j < hr->post_ndesc; j++, p = NextMemoryDescriptor(p, hr->post_desc_sz)) {
+			enum hibernate_mem_class cl = hibernate_classify_mem_type(p->Type);
+			uint64_t d_start, d_size, ov_start, ov_size;
+
+			if (cl != HMC_MUST_PRESERVE && cl != HMC_RECLAIMABLE)
+				continue;
+			d_start = p->PhysicalStart;
+			d_size = p->NumberOfPages * EFI_PAGE_SIZE;
+			if (range_overlap(c_start, c_size, d_start, d_size,
+			    &ov_start, &ov_size) == 0)
+				continue;
+			if (ov_start + ov_size <= 0x100000)
+				continue;
+			if (ov_start < 0x100000)
+				segment_must_stage +=
+				    ov_start + ov_size - 0x100000;
+			else
+				segment_must_stage += ov_size;
+		}
+
+		if (segment_must_stage > 0) {
+			hr->must_stage_bytes += segment_must_stage;
+			if (segment_must_stage > largest_must_stage_chunk)
+				largest_must_stage_chunk = segment_must_stage;
+		}
+	}
+
+	/*
+	 * Re-scan spare pages against post-allocation memory map:
+	 * avoid list contains strictly MUST-PRESERVE, RESIDENT Loader binary,
+	 * contiguous spare, active staging buffers, and low memory below 1 MiB.
+	 */
+	hr->n_post_avoid = 0;
+
+	/* 1. Low memory below 1 MiB */
+	add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid), 0, 0x100000);
+
+	/* 2. Resident loader binary */
+	if (hr->loader_size > 0)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    hr->loader_start, hr->loader_size);
+
+	/* 3. Contiguous spare buffer */
+	if (hr->cb->hc_contig_spare_size > 0)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    hr->cb->hc_contig_spare_start, hr->cb->hc_contig_spare_size);
+
+	/* 4. Active loader staging scratch buffers */
+	if (hr->workspace != 0)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    hr->workspace, hr->workspace_pages * EFI_PAGE_SIZE);
+
+	/*
+	 * hr->readbuf_paddr is a sub-range of the contiguous spare arena (already
+	 * added above).  Do NOT add it separately: the arena-disjointness
+	 * check below treats any non-identical overlapping entry as a
+	 * conflict, which would falsely fail feasibility.
+	 */
+
+	/* 4b. Retained loader transient allocations */
+	if (hr->heap_base != 0 && hr->heap_size > 0)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    hr->heap_base, hr->heap_size);
+	if (hr->staging_base != 0 && hr->staging_size > 0)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    hr->staging_base, hr->staging_size);
+	if (bufp != NULL && *bufp != NULL)
+		add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+		    (uint64_t)(uintptr_t)*bufp, HIBERNATE_HDR_BUF_SIZE);
+
+
+	/* 5. All HMC_MUST_PRESERVE descriptors from post-allocation memory map */
+	for (j = 0, p = hr->post_map; j < hr->post_ndesc; j++, p = NextMemoryDescriptor(p, hr->post_desc_sz)) {
+		enum hibernate_mem_class cl = hibernate_classify_mem_type(p->Type);
+		if (cl == HMC_MUST_PRESERVE) {
+			add_avoid_range(hr->post_avoid, &hr->n_post_avoid, nitems(hr->post_avoid),
+			    p->PhysicalStart, p->NumberOfPages * EFI_PAGE_SIZE);
+		}
+	}
+
+	hr->post_contig_overlaps = false;
+	if (hr->cb->hc_contig_spare_size > 0) {
+		uint64_t csp_start = hr->cb->hc_contig_spare_start;
+		uint64_t csp_end = csp_start + hr->cb->hc_contig_spare_size;
+
+		for (r = 0; r < hr->n_post_avoid; r++) {
+			if (hr->post_avoid[r].start == csp_start && hr->post_avoid[r].end == csp_end)
+				continue;
+			if (csp_start < hr->post_avoid[r].end && csp_end > hr->post_avoid[r].start) {
+				hr->post_contig_overlaps = true;
+				break;
+			}
+		}
+	}
+
+	hr->excluded_spare_cnt = 0;
+	staging_spare_pages = 0;
+	if (hr->cb->hc_spare_pages_nb > 0) {
+		nb_pages = hr->cb->hc_spare_pages_nb;
+		max_pages = (hr->ph[0].p_filesz > offsetof(struct hibernate_cb, hc_spare_pages)) ?
+		    ((hr->ph[0].p_filesz - offsetof(struct hibernate_cb, hc_spare_pages)) / sizeof(uint64_t)) : 0;
+		if (nb_pages > max_pages)
+			nb_pages = max_pages;
+		staging_spare_pages = nb_pages;
+
+		for (k = 0; k < nb_pages; k++) {
+			if (is_page_avoided(hr->cb->hc_spare_pages[k], hr->post_avoid, hr->n_post_avoid))
+				hr->excluded_spare_cnt++;
+		}
+	}
+
+	hr->total_spare_bytes = staging_spare_pages * EFI_PAGE_SIZE;
+	hr->excluded_spare_bytes = (uint64_t)hr->excluded_spare_cnt * EFI_PAGE_SIZE;
+	hr->usable_spare_pages = (staging_spare_pages > hr->excluded_spare_cnt) ?
+	    (staging_spare_pages - hr->excluded_spare_cnt) : 0;
+	hr->usable_spare_bytes = hr->usable_spare_pages * EFI_PAGE_SIZE;
+
+	hiber_log(HIBER_LOG_INFO, "hibernate: spare pages re-scan: %ju total, %u excluded (%ju KiB), %ju usable (%ju MiB)\n",
+	    (uintmax_t)staging_spare_pages,
+	    hr->excluded_spare_cnt,
+	    (uintmax_t)(hr->excluded_spare_bytes / 1024),
+	    (uintmax_t)hr->usable_spare_pages,
+	    (uintmax_t)(hr->usable_spare_bytes / (1024 * 1024)));
+
+	/* Revised Feasibility Output.
+	 * Staging consumes hc_spare_pages[] only; contig spare is trampoline/PT.
+	 */
+	contig_ok = !hr->post_contig_overlaps;
+	staging_ok = hr->usable_spare_bytes >= hr->must_stage_bytes;
+	contig_verdict = contig_ok ? "FEASIBLE" : "INSUFFICIENT";
+	staging_verdict = staging_ok ? "FEASIBLE" : "INSUFFICIENT";
+	revised_verdict = contig_ok && staging_ok ?
+	    "FEASIBLE" : "INSUFFICIENT";
+
+	hiber_log(HIBER_LOG_INFO, "hibernate: === Revised Staging Feasibility (Post-Allocation) ===\n");
+	hiber_log(HIBER_LOG_INFO, "hibernate: resident loader set: 0x%jx (%ju KiB)\n",
+	    (uintmax_t)hr->loader_size, (uintmax_t)(hr->loader_size / 1024));
+	hiber_log(HIBER_LOG_INFO, "hibernate: must-stage bytes   : 0x%jx (%ju KiB), largest chunk 0x%jx\n",
+	    (uintmax_t)hr->must_stage_bytes, (uintmax_t)(hr->must_stage_bytes / 1024),
+	    (uintmax_t)largest_must_stage_chunk);
+	hiber_log(HIBER_LOG_INFO, "hibernate: contig spare disjoint : overlaps=%s loader=%ju KiB csp=%ju KiB -> %s\n",
+	    hr->post_contig_overlaps ? "yes" : "no",
+	    (uintmax_t)(hr->loader_size / 1024),
+	    (uintmax_t)(hr->cb->hc_contig_spare_size / 1024),
+	    contig_verdict);
+	hiber_log(HIBER_LOG_INFO, "hibernate: staging spare pages: 0x%jx (%ju MiB usable) vs must-stage 0x%jx (%ju MiB) -> %s\n",
+	    (uintmax_t)hr->usable_spare_bytes,
+	    (uintmax_t)(hr->usable_spare_bytes / (1024 * 1024)),
+	    (uintmax_t)hr->must_stage_bytes,
+	    (uintmax_t)(hr->must_stage_bytes / (1024 * 1024)),
+	    staging_verdict);
+	hiber_log(HIBER_LOG_INFO, "hibernate: revised feasibility verdict -> %s\n", revised_verdict);
+	snprintf(hiber_refuse_rpt.mmap, sizeof(hiber_refuse_rpt.mmap),
+	    "hr->total_spare_bytes=0x%jx excluded_bytes=0x%jx usable_bytes=0x%jx hr->must_stage_bytes=0x%jx verdict=%s",
+	    (uintmax_t)hr->total_spare_bytes,
+	    (uintmax_t)hr->excluded_spare_bytes,
+	    (uintmax_t)hr->usable_spare_bytes,
+	    (uintmax_t)hr->must_stage_bytes,
+	    revised_verdict);
+	hiber_refuse_set_stage("classification");
+	if (!contig_ok || !staging_ok) {
+		hiber_refuse_rpt.chk_staging_feas = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "staging infeasible";
+		return (false);
+	}
+	hiber_refuse_rpt.chk_staging_feas = HIBER_CHK_PASS;
+	hiber_refuse_set_stage("staging");
+
+	return (true);
+}
+
+static bool
+hibernate_prepare_restore(struct hibernate_restore *hr,
+    const Elf_Ehdr *ehdr, const Elf_Phdr *ph,
+    const struct hibernate_cb *cb, uint8_t **bufp)
+{
+	EFI_MEMORY_DESCRIPTOR *p;
+	u_int i, j, r;
+
+	/* Save blkio interface before heap retention */
+	hr->blkio = (hr->part != NULL) ? hr->part->pd_blkio : NULL;
+	hr->blksz = (hr->blkio != NULL && hr->blkio->Media != NULL) ?
+	    hr->blkio->Media->BlockSize : 512;
+	hr->ehdr = ehdr;
+	hr->ph = ph;
+	hr->cb = cb;
+
+	if (!hibernate_prepare_workspace(hr, bufp))
+		return (false);
+	if (!hibernate_analyze_spare_capacity(hr, bufp))
+		return (false);
+	/*
+	 * Phase 3: PT_LOAD Chunk Classification (DIRECT vs DEFERRED)
+	 */
+	hr->n_active_ranges = 0;
+
+	/*
+	 * Memory below 1 MiB (0x0 .. 0x100000) must NEVER be touched pre-EBS,
+	 * as UEFI Boot Services / legacy structures (IVT, BDA, EBDA) reside there,
+	 * and physical address 0 is NULL in UEFI Block I/O.
+	 * Mark 0 .. 0x100000 as active (deferred).
+	 */
+	if (hr->n_active_ranges < nitems(hr->active_ranges)) {
+		hr->active_ranges[hr->n_active_ranges].start = 0;
+		hr->active_ranges[hr->n_active_ranges].end = 0x100000;
+		hr->n_active_ranges++;
+	}
+
+	if (hr->loader_size > 0 && hr->n_active_ranges < nitems(hr->active_ranges)) {
+		hr->active_ranges[hr->n_active_ranges].start = hr->loader_start;
+		hr->active_ranges[hr->n_active_ranges].end = hr->loader_start + hr->loader_size;
+		hr->n_active_ranges++;
+	}
+
+	for (j = 0, p = hr->post_map; j < hr->post_ndesc;
+	    j++, p = NextMemoryDescriptor(p, hr->post_desc_sz)) {
+		enum hibernate_mem_class cl = hibernate_classify_mem_type(p->Type);
+		if (cl == HMC_MUST_PRESERVE || cl == HMC_RECLAIMABLE || cl == HMC_LOADER_IN_USE) {
+			if (cl == HMC_LOADER_IN_USE) {
+				if (hr->loader_size == 0 || p->PhysicalStart < hr->loader_start ||
+				    p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE > hr->loader_start + hr->loader_size) {
+					hiber_log(HIBER_LOG_DEBUG, "hibernate: active loader allocation in map: 0x%jx - 0x%jx (%lu pages, type %u)\n",
+					    (uintmax_t)p->PhysicalStart,
+					    (uintmax_t)(p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE),
+					    (u_long)p->NumberOfPages, p->Type);
+				}
+			}
+			if (hr->n_active_ranges < nitems(hr->active_ranges)) {
+				hr->active_ranges[hr->n_active_ranges].start = p->PhysicalStart;
+				hr->active_ranges[hr->n_active_ranges].end = p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE;
+				hr->n_active_ranges++;
+			} else {
+				hiber_log(HIBER_LOG_WARN, "hibernate: WARNING: hr->active_ranges array full (%u entries), cannot add 0x%jx-0x%jx (type %u)\n",
+				    hr->n_active_ranges, (uintmax_t)p->PhysicalStart,
+				    (uintmax_t)(p->PhysicalStart + p->NumberOfPages * EFI_PAGE_SIZE), p->Type);
+			}
+		}
+	}
+
+	/* Sort active_ranges by start address */
+	for (u_int a = 0; a < n_active_ranges; a++) {
+		for (u_int b = a + 1; b < n_active_ranges; b++) {
+			if (active_ranges[b].start < active_ranges[a].start) {
+				struct hibernate_range tmp = active_ranges[a];
+				active_ranges[a] = active_ranges[b];
+				active_ranges[b] = tmp;
+			}
+		}
+	}
+
+	/*
+	 * Merge overlapping or adjacent active ranges, and also absorb an
+	 * enclosed gap of at most one A1 transfer block (64 KiB).  Small
+	 * conventional-memory islands between firmware-active ranges are not
+	 * stable while EFI Block I/O is running: firmware scratch can clobber
+	 * them after they are written.  Deferring up to one existing A1 I/O
+	 * unit avoids speculative repair reads.
+	 */
+	u_int m_active = 0;
+	for (u_int a = 0; a < n_active_ranges; a++) {
+		if (m_active == 0 ||
+		    (active_ranges[a].start > active_ranges[m_active - 1].end &&
+		    active_ranges[a].start - active_ranges[m_active - 1].end >
+		    16 * EFI_PAGE_SIZE)) {
+			active_ranges[m_active++] = active_ranges[a];
+		} else if (active_ranges[a].end > active_ranges[m_active - 1].end) {
+			active_ranges[m_active - 1].end = active_ranges[a].end;
+		}
+	}
+	n_active_ranges = m_active;
+
+	hr->direct_chunks_cnt = 0;
+	hr->deferred_chunks_cnt = 0;
+	hr->total_direct_bytes = 0;
+	hr->total_deferred_chunk_bytes = 0;
+	hr->total_deferred_pages = 0;
+
+	hiber_log(HIBER_LOG_INFO, "hibernate: === PT_LOAD Chunk Classification (Pre-EBS) ===\n");
+
+	for (i = 2; i < hr->ehdr->e_phnum; i++) {
+		uint64_t c_start = hr->ph[i].p_paddr;
+		uint64_t c_size = (hr->ph[i].p_memsz != 0) ? hr->ph[i].p_memsz : hr->ph[i].p_filesz;
+		uint64_t c_deferred_bytes = 0;
+		uint32_t types_hit = 0;
+
+		for (r = 0; r < hr->n_active_ranges; r++) {
+			uint64_t ov_start, ov_size;
+			if (range_overlap(c_start, c_size, hr->active_ranges[r].start,
+			    hr->active_ranges[r].end - hr->active_ranges[r].start, &ov_start, &ov_size) > 0) {
+				c_deferred_bytes += ov_size;
+			}
+		}
+
+		for (j = 0, p = hr->post_map; j < hr->post_ndesc; j++, p = NextMemoryDescriptor(p, hr->post_desc_sz)) {
+			if (hr->workspace != 0 && p->PhysicalStart == hr->workspace)
+				continue;
+
+			uint64_t d_start = p->PhysicalStart;
+			uint64_t d_size = p->NumberOfPages * EFI_PAGE_SIZE;
+			uint64_t ov_start, ov_size;
+
+			if (range_overlap(c_start, c_size, d_start, d_size, &ov_start, &ov_size) > 0) {
+				uint64_t in_loader = 0;
+				if (hr->loader_size > 0)
+					in_loader = range_overlap(ov_start, ov_size,
+					    hr->loader_start, hr->loader_size, NULL, NULL);
+
+				if (p->Type == EfiLoaderCode || p->Type == EfiLoaderData) {
+					types_hit |= (1U << p->Type);
+				} else if (in_loader > 0) {
+					types_hit |= (1U << EfiLoaderCode);
+					if (ov_size > in_loader && p->Type != EfiConventionalMemory)
+						types_hit |= (1U << p->Type);
+				} else if (p->Type != EfiConventionalMemory) {
+					types_hit |= (1U << p->Type);
+				}
+			}
+		}
+
+		if (c_deferred_bytes == 0) {
+			hr->direct_chunks_cnt++;
+			hr->total_direct_bytes += c_size;
+			hiber_log(HIBER_LOG_DEBUG, "hibernate:   chunk %2u: paddr 0x%016jx size 0x%08jx (%ju KiB) -> DIRECT\n",
+			    i - 2, (uintmax_t)c_start, (uintmax_t)c_size, (uintmax_t)(c_size / 1024));
+		} else {
+			char types_buf[256];
+			bool first = true;
+			int t;
+
+			hr->deferred_chunks_cnt++;
+			hr->total_deferred_chunk_bytes += c_deferred_bytes;
+			hr->total_deferred_pages += c_deferred_bytes / EFI_PAGE_SIZE;
+			uint64_t c_direct_bytes = c_size - c_deferred_bytes;
+			hr->total_direct_bytes += c_direct_bytes;
+
+			types_buf[0] = '\0';
+			if (c_start < 0x100000) {
+				strlcat(types_buf, "LowMemory", sizeof(types_buf));
+				first = false;
+			}
+			for (t = 0; t < 32; t++) {
+				if ((types_hit & (1U << t)) != 0) {
+					if (!first)
+						strlcat(types_buf, ", ", sizeof(types_buf));
+					strlcat(types_buf, efi_memory_type((EFI_MEMORY_TYPE)t),
+					    sizeof(types_buf));
+					first = false;
+				}
+			}
+
+			if (c_direct_bytes > 0) {
+				hiber_log(HIBER_LOG_DEBUG, "hibernate:   chunk %2u: paddr 0x%016jx size 0x%08jx (%ju KiB) -> DEFERRED (%ju KiB deferred, %ju KiB direct) [%s]\n",
+				    i - 2, (uintmax_t)c_start, (uintmax_t)c_size, (uintmax_t)(c_size / 1024),
+				    (uintmax_t)(c_deferred_bytes / 1024), (uintmax_t)(c_direct_bytes / 1024),
+				    types_buf);
+			} else {
+				hiber_log(HIBER_LOG_DEBUG, "hibernate:   chunk %2u: paddr 0x%016jx size 0x%08jx (%ju KiB) -> DEFERRED (%ju KiB deferred) [%s]\n",
+				    i - 2, (uintmax_t)c_start, (uintmax_t)c_size, (uintmax_t)(c_size / 1024),
+				    (uintmax_t)(c_deferred_bytes / 1024),
+				    types_buf);
+			}
+		}
+	}
+
+	uint64_t total_image_mem = hr->total_direct_bytes + hr->total_deferred_chunk_bytes;
+	hiber_log(HIBER_LOG_INFO, "hibernate: Classification summary: %u DIRECT, %u DEFERRED (total %u chunks, %ju MiB)\n",
+	    hr->direct_chunks_cnt, hr->deferred_chunks_cnt,
+	    (hr->ehdr->e_phnum >= 2) ? (hr->ehdr->e_phnum - 2) : 0,
+	    (uintmax_t)(total_image_mem / (1024 * 1024)));
+	hiber_log(HIBER_LOG_INFO, "hibernate:   deferred data: %ju pages (%ju KiB / %ju MiB)\n",
+	    (uintmax_t)hr->total_deferred_pages,
+	    (uintmax_t)(hr->total_deferred_chunk_bytes / 1024),
+	    (uintmax_t)(hr->total_deferred_chunk_bytes / (1024 * 1024)));
+
+	/* Phase 3 deferred demand must fit staging spare pages. */
+	if (hr->total_deferred_chunk_bytes > hr->usable_spare_bytes) {
+		hiber_log(HIBER_LOG_ERROR, "hibernate: deferred %ju KiB exceeds usable spare %ju KiB -> INSUFFICIENT\n",
+		    (uintmax_t)(hr->total_deferred_chunk_bytes / 1024),
+		    (uintmax_t)(hr->usable_spare_bytes / 1024));
+		snprintf(hiber_refuse_rpt.mmap, sizeof(hiber_refuse_rpt.mmap),
+		    "total_spare_bytes=0x%jx excluded_bytes=0x%jx usable_bytes=0x%jx must_stage_bytes=0x%jx verdict=INSUFFICIENT",
+		    (uintmax_t)hr->total_spare_bytes,
+		    (uintmax_t)hr->excluded_spare_bytes,
+		    (uintmax_t)hr->usable_spare_bytes,
+		    (uintmax_t)hr->total_deferred_chunk_bytes);
+		hiber_refuse_rpt.chk_staging_feas = HIBER_CHK_FAIL;
+		hiber_refuse_pending = "staging infeasible";
+		return (false);
+	}
+
+
+	hr->post_ndesc = hr->post_ndesc;
+
+	return (true);
+
+	return (true);
+}
+
+static void
+hibernate_release_restore(struct hibernate_restore *hr)
+{
+	}
+	if (hr->workspace != 0) {
+		BS->FreePages(hr->workspace, hr->workspace_pages);
+		hr->workspace = 0;
+		hr->workspace_pages = 0;
+	}
+}
+
+static void
+hibernate_analyze_conflicts(pdinfo_t *part, const Elf_Ehdr *ehdr,
+    const Elf_Phdr *ph, const struct hibernate_cb *cb, uint8_t **bufp)
+{
+	struct hibernate_restore hr;
+	bool prepared;
+
+	bzero(&hr, sizeof(hr));
+	hr.part = part;
+	prepared = hibernate_prepare_restore(&hr, ehdr, ph, cb, bufp);
+	hibernate_release_restore(&hr);
+	if (!prepared && hiber_refuse_pending != NULL)
+		hibernate_refuse(hiber_refuse_pending);
+}
+
+static bool
+hibernate_probe_partition(pdinfo_t *part, uint8_t **bufp)
 {
 	EFI_BLOCK_IO *blkio;
 	EFI_STATUS status;
@@ -69,51 +1193,89 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 	struct hibernate_pcb *pcb;
 	uint64_t blocks_needed, lba, total_mem;
 	uint32_t blksz;
-	u_int i, load_chunks;
+	u_int i, load_chunks, part_u;
+	uint8_t *buf;
+
+	if (bufp == NULL || *bufp == NULL)
+		return (false);
+	buf = *bufp;
+	part_u = part->pd_unit;
 
 	blkio = part->pd_blkio;
-	if (blkio == NULL || blkio->Media == NULL)
+	if (blkio == NULL || blkio->Media == NULL) {
+		hiber_refuse_add_probe(part_u, "skipped: read failed");
 		return (false);
+	}
 
 	blksz = blkio->Media->BlockSize;
-	if (blksz == 0 || (blksz & (blksz - 1)) != 0)
+	if (blksz == 0 || (blksz & (blksz - 1)) != 0) {
+		hiber_refuse_add_probe(part_u, "skipped: read failed");
 		return (false);
+	}
 
-	if (HIBERNATE_IMAGE_OFFSET % blksz != 0)
+	if (HIBERNATE_IMAGE_OFFSET % blksz != 0) {
+		hiber_refuse_add_probe(part_u, "skipped: read failed");
 		return (false);
+	}
 
 	lba = HIBERNATE_IMAGE_OFFSET / blksz;
-	if (blkio->Media->LastBlock < lba)
+	if (blkio->Media->LastBlock < lba) {
+		hiber_refuse_add_probe(part_u, "skipped: read failed");
 		return (false);
+	}
 
 	/* Read 1 block to probe for ELF header */
 	status = blkio->ReadBlocks(blkio, blkio->Media->MediaId, lba,
 	    blksz, buf);
-	if (status != EFI_SUCCESS)
+	if (status != EFI_SUCCESS) {
+		hiber_refuse_add_probe(part_u, "skipped: read failed");
 		return (false);
+	}
 
 	ehdr = (Elf_Ehdr *)buf;
-	if (!IS_ELF(*ehdr))
+	if (!IS_ELF(*ehdr) ||
+	    ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
+	    ehdr->e_ident[EI_DATA] != ELFDATA2LSB ||
+	    ehdr->e_ident[EI_VERSION] != EV_CURRENT ||
+	    (ehdr->e_version != 0 && ehdr->e_version != EV_CURRENT)) {
+		hiber_refuse_add_probe(part_u, "skipped: bad elf ident");
 		return (false);
-	if (ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
-	    ehdr->e_ident[EI_DATA] != ELFDATA2LSB)
+	}
+	if (ehdr->e_type != ET_FREEBSD_HIBERNATE_IMAGE) {
+		hiber_refuse_add_probe(part_u, "skipped: bad e_type");
 		return (false);
-	if (ehdr->e_ident[EI_VERSION] != EV_CURRENT)
+	}
+	if (ehdr->e_machine != EM_X86_64) {
+		hiber_refuse_add_probe(part_u, "skipped: bad e_machine");
 		return (false);
-	if (ehdr->e_version != 0 && ehdr->e_version != EV_CURRENT)
+	}
+	if (ehdr->e_phentsize != sizeof(Elf_Phdr)) {
+		hiber_refuse_add_probe(part_u, "skipped: bad phdr layout");
 		return (false);
-	if (ehdr->e_type != ET_FREEBSD_HIBERNATE_IMAGE)
-		return (false);
-	if (ehdr->e_machine != EM_X86_64)
-		return (false);
-	if (ehdr->e_phentsize != sizeof(Elf_Phdr))
-		return (false);
+	}
 
 	/* Candidate image partition found; read complete 512 KiB headers */
+	hiber_refuse_add_probe(part_u, "candidate");
+	hiber_refuse_set_stage("headers");
+	snprintf(hiber_refuse_rpt.image, sizeof(hiber_refuse_rpt.image),
+	    "part=%u lba=%ju blksz=%u bytes_read=%u status=ok",
+	    part_u, (uintmax_t)lba, blksz, blksz);
+	hiber_refuse_rpt.chk_read = HIBER_CHK_PASS;
+	hiber_refuse_rpt.chk_elf_ident = HIBER_CHK_PASS;
+	hiber_refuse_rpt.chk_e_type = HIBER_CHK_PASS;
+	hiber_refuse_rpt.chk_e_machine = HIBER_CHK_PASS;
+	snprintf(hiber_refuse_rpt.elf, sizeof(hiber_refuse_rpt.elf),
+	    "ident=ok e_type=0x%04x e_machine=0x%04x e_phnum=%u",
+	    ehdr->e_type, ehdr->e_machine, (u_int)ehdr->e_phnum);
+
 	blocks_needed = HIBERNATE_HDR_BUF_SIZE / blksz;
 	if (lba + blocks_needed - 1 > blkio->Media->LastBlock) {
 		printf("Hibernate: partition %u too small for headers\n",
-		    part->pd_unit);
+		    part_u);
+		snprintf(hiber_refuse_rpt.image, sizeof(hiber_refuse_rpt.image),
+		    "part=%u lba=%ju blksz=%u bytes_read=%u status=too-small",
+		    part_u, (uintmax_t)lba, blksz, blksz);
+		hiber_refuse_rpt.chk_read = HIBER_CHK_FAIL;
 		hibernate_refuse("read failed");
 		return (false);
 	}
@@ -122,15 +1284,27 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 	    HIBERNATE_HDR_BUF_SIZE, buf);
 	if (status != EFI_SUCCESS) {
 		printf("Hibernate: failed to read headers from partition %u (%lu)\n",
-		    part->pd_unit, DECODE_ERROR(status));
+		    part_u, DECODE_ERROR(status));
+		snprintf(hiber_refuse_rpt.image, sizeof(hiber_refuse_rpt.image),
+		    "part=%u lba=%ju blksz=%u bytes_read=0 status=EFI error %lu",
+		    part_u, (uintmax_t)lba, blksz, DECODE_ERROR(status));
+		hiber_refuse_rpt.chk_read = HIBER_CHK_FAIL;
 		hibernate_refuse("read failed");
 		return (false);
 	}
+	snprintf(hiber_refuse_rpt.image, sizeof(hiber_refuse_rpt.image),
+	    "part=%u lba=%ju blksz=%u bytes_read=%u status=ok",
+	    part_u, (uintmax_t)lba, blksz, (u_int)HIBERNATE_HDR_BUF_SIZE);
 
 	ehdr = (Elf_Ehdr *)buf;
+	snprintf(hiber_refuse_rpt.elf, sizeof(hiber_refuse_rpt.elf),
+	    "ident=ok e_type=0x%04x e_machine=0x%04x e_phnum=%u",
+	    ehdr->e_type, ehdr->e_machine, (u_int)ehdr->e_phnum);
+
 	if (ehdr->e_phnum < 2) {
 		printf("Hibernate: invalid phnum %u (expected >= 2)\n",
 		    (u_int)ehdr->e_phnum);
+		hiber_refuse_rpt.chk_phdr = HIBER_CHK_FAIL;
 		hibernate_refuse("bad phdr layout");
 		return (false);
 	}
@@ -139,6 +1313,7 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 	    HIBERNATE_HDR_BUF_SIZE) {
 		printf("Hibernate: phdrs exceed buffer size (phoff 0x%jx, phnum %u)\n",
 		    (uintmax_t)ehdr->e_phoff, (u_int)ehdr->e_phnum);
+		hiber_refuse_rpt.chk_phdr = HIBER_CHK_FAIL;
 		hibernate_refuse("bad phdr layout");
 		return (false);
 	}
@@ -149,27 +1324,48 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 	if (ph[0].p_type != PT_FREEBSD_HIBERNATE_CB) {
 		printf("Hibernate: phdr[0] is not PT_FREEBSD_HIBERNATE_CB (type 0x%x)\n",
 		    ph[0].p_type);
+		hiber_refuse_rpt.chk_phdr = HIBER_CHK_FAIL;
+		snprintf(hiber_refuse_rpt.cb, sizeof(hiber_refuse_rpt.cb),
+		    "phdr=missing hc_version=n/a hcb_size=n/a validate=fail "
+		    "hc_hardware_signature=n/a live_facs=not-checked "
+		    "policy=unknown-proceed(deferred)");
 		hibernate_refuse("bad phdr layout");
 		return (false);
 	}
 	if (ph[0].p_offset + ph[0].p_filesz > HIBERNATE_HDR_BUF_SIZE) {
 		printf("Hibernate: CB exceeds buffer size (offset 0x%jx, size 0x%jx)\n",
 		    (uintmax_t)ph[0].p_offset, (uintmax_t)ph[0].p_filesz);
+		hiber_refuse_rpt.chk_phdr = HIBER_CHK_FAIL;
 		hibernate_refuse("bad phdr layout");
 		return (false);
 	}
 	cb = (struct hibernate_cb *)(buf + ph[0].p_offset);
+	snprintf(hiber_refuse_rpt.cb, sizeof(hiber_refuse_rpt.cb),
+	    "phdr=found hc_version=%ju hcb_size=%ju validate=%s "
+	    "hc_hardware_signature=0x%016jx live_facs=not-checked "
+	    "policy=unknown-proceed(deferred)",
+	    (uintmax_t)cb->hc_version, (uintmax_t)ph[0].p_filesz,
+	    hcb_validate(cb, ph[0].p_filesz) ? "ok" : "fail",
+	    (uintmax_t)cb->hc_hardware_signature);
 	if (!hcb_validate(cb, ph[0].p_filesz)) {
 		printf("Hibernate: CB validation failed (version %ju, size %ju)\n",
 		    (uintmax_t)cb->hc_version, (uintmax_t)ph[0].p_filesz);
+		hiber_refuse_rpt.chk_phdr = HIBER_CHK_PASS;
+		hiber_refuse_rpt.chk_cb = HIBER_CHK_FAIL;
 		hibernate_refuse("CB validation failed");
 		return (false);
 	}
+	hiber_refuse_rpt.chk_phdr = HIBER_CHK_PASS;
+	hiber_refuse_rpt.chk_cb = HIBER_CHK_PASS;
 
 	/* Validate phdr[1]: PT_FREEBSD_HIBERNATE_PCB */
 	if (ph[1].p_type != PT_FREEBSD_HIBERNATE_PCB) {
 		printf("Hibernate: phdr[1] is not PT_FREEBSD_HIBERNATE_PCB (type 0x%x)\n",
 		    ph[1].p_type);
+		snprintf(hiber_refuse_rpt.pcb, sizeof(hiber_refuse_rpt.pcb),
+		    "phdr=missing size=n/a/48 cr0=n/a cr3=n/a cr4=n/a "
+		    "rsp=n/a rip=n/a r12=n/a");
+		hiber_refuse_rpt.chk_pcb = HIBER_CHK_FAIL;
 		hibernate_refuse("bad phdr layout");
 		return (false);
 	}
@@ -178,16 +1374,29 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 		printf("Hibernate: PCB invalid size (filesz %ju, memsz %ju, expected %zu)\n",
 		    (uintmax_t)ph[1].p_filesz, (uintmax_t)ph[1].p_memsz,
 		    sizeof(struct hibernate_pcb));
+		snprintf(hiber_refuse_rpt.pcb, sizeof(hiber_refuse_rpt.pcb),
+		    "phdr=found size=%ju/48 cr0=n/a cr3=n/a cr4=n/a "
+		    "rsp=n/a rip=n/a r12=n/a",
+		    (uintmax_t)ph[1].p_filesz);
+		hiber_refuse_rpt.chk_pcb = HIBER_CHK_FAIL;
 		hibernate_refuse("PCB size mismatch");
 		return (false);
 	}
 	if (ph[1].p_offset + ph[1].p_filesz > HIBERNATE_HDR_BUF_SIZE) {
 		printf("Hibernate: PCB exceeds buffer size (offset 0x%jx, size 0x%jx)\n",
 		    (uintmax_t)ph[1].p_offset, (uintmax_t)ph[1].p_filesz);
+		hiber_refuse_rpt.chk_pcb = HIBER_CHK_FAIL;
 		hibernate_refuse("PCB size mismatch");
 		return (false);
 	}
 	pcb = (struct hibernate_pcb *)(buf + ph[1].p_offset);
+	snprintf(hiber_refuse_rpt.pcb, sizeof(hiber_refuse_rpt.pcb),
+	    "phdr=found size=%zu/48 cr0=0x%016jx cr3=0x%016jx cr4=0x%016jx "
+	    "rsp=0x%016jx rip=0x%016jx r12=0x%016jx",
+	    sizeof(struct hibernate_pcb),
+	    (uintmax_t)pcb->cr0, (uintmax_t)pcb->cr3, (uintmax_t)pcb->cr4,
+	    (uintmax_t)pcb->rsp, (uintmax_t)pcb->rip, (uintmax_t)pcb->r12);
+	hiber_refuse_rpt.chk_pcb = HIBER_CHK_PASS;
 
 	/* Validate phdr[2..N+1]: PT_LOAD */
 	load_chunks = 0;
@@ -196,6 +1405,7 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 		if (ph[i].p_type != PT_LOAD) {
 			printf("Hibernate: phdr[%u] is not PT_LOAD (type 0x%x)\n",
 			    i, ph[i].p_type);
+			hiber_refuse_rpt.chk_phdr = HIBER_CHK_FAIL;
 			hibernate_refuse("bad phdr layout");
 			return (false);
 		}
@@ -206,7 +1416,7 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 	/* Descriptive summary to serial console */
 	printf("=== Hibernate Image Probe (Read-Only Bring-Up) ===\n");
 	printf("Hibernate: found image on partition %u (LBA %ju, blocksize %u)\n",
-	    part->pd_unit, (uintmax_t)lba, blksz);
+	    part_u, (uintmax_t)lba, blksz);
 	printf("Hibernate ELF Header:\n");
 	printf("  type: 0x%04x  machine: 0x%04x  phnum: %u  phentsize: %u\n",
 	    ehdr->e_type, ehdr->e_machine, (u_int)ehdr->e_phnum,
@@ -236,6 +1446,8 @@ hibernate_probe_partition(pdinfo_t *part, uint8_t *buf)
 		    (uintmax_t)(ph[i].p_filesz / 1024),
 		    (uintmax_t)ph[i].p_offset);
 	}
+	hiber_refuse_set_stage("classification");
+	hibernate_analyze_conflicts(part, ehdr, ph, cb, bufp);
 	printf("=== Validation Successful: Continuing Normal Boot ===\n");
 	return (true);
 }
@@ -250,6 +1462,15 @@ hibernate_probe(void)
 
 	if (!hibernate_resume_enabled())
 		return;
+
+	hiber_log_init();
+	hiber_log(HIBER_LOG_INFO,
+	    "hibernate: console loglevel=%u (0=error 1=warn 2=info 3=debug); "
+	    "full trace -> \\efi\\freebsd\\hiber-trace.log\n",
+	    (unsigned)hiber_console_level);
+
+	hiber_refuse_reset();
+	hiber_refuse_set_stage("probe");
 
 	if (boot_img == NULL || boot_img->DeviceHandle == NULL) {
 		printf("Hibernate: boot_img or DeviceHandle is NULL\n");
@@ -277,8 +1498,13 @@ hibernate_probe(void)
 
 	found = false;
 	STAILQ_FOREACH(part, &parent->pd_part, pd_link) {
-		if (hibernate_probe_partition(part, buf)) {
+		if (hibernate_probe_partition(part, &buf)) {
 			found = true;
+			break;
+		}
+		/* Candidate abandon already called hibernate_refuse(). */
+		if (hiber_refuse_rpt.emitted) {
+			found = true; /* suppress no-image primary */
 			break;
 		}
 	}
@@ -286,7 +1512,8 @@ hibernate_probe(void)
 	if (!found)
 		hibernate_refuse("no hibernate image found");
 
-	BS->FreePool(buf);
+	if (buf != NULL)
+		BS->FreePool(buf);
 }
 
 #else /* !defined(__amd64__) */

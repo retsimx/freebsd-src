@@ -68,5 +68,7 @@ int bi_load(char *args, vm_offset_t *modulep, vm_offset_t *kernendp,
     bool exit_bs);
 
 void	hibernate_probe(void);
+void	efi_heap_get_bounds(EFI_PHYSICAL_ADDRESS *base, UINTN *size);
+void	efi_staging_get_bounds(EFI_PHYSICAL_ADDRESS *base, UINTN *size);
 
 #endif	/* _LOADER_EFI_COPY_H_ */
