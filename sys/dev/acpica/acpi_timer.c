@@ -60,7 +60,6 @@ struct acpi_timer_softc {
 	device_t	dev;
 	struct resource *reg;
 	struct timecounter *tc;
-	struct timecounter *old_tc;
 };
 
 #define	ACPI_TIMER_FREQUENCY	(14318182 / 4)
@@ -74,6 +73,15 @@ static void	acpi_timer_suspend_handler(struct acpi_timer_softc *,
 		    enum power_stype);
 static u_int	acpi_timer_get_timecount(struct timecounter *tc);
 static int	acpi_timer_sysctl_freq(SYSCTL_HANDLER_ARGS);
+
+/*
+ * Hibernate state.  Hibernate entry suspends the timecounter explicitly
+ * and may be followed by a redundant suspend (EJUSTRETURN); the first
+ * saved non-ACPI timecounter must survive until resume.
+ */
+static struct acpi_timer_softc *acpi_timer_sc;
+static struct timecounter *acpi_timer_saved_tc;
+static eventhandler_tag acpi_timer_eh;
 
 static device_method_t acpi_timer_methods[] = {
     DEVMETHOD(device_identify,	acpi_timer_identify),
@@ -165,7 +173,6 @@ static int
 acpi_timer_attach(device_t dev)
 {
     struct acpi_timer_softc *sc = device_get_softc(dev);
-    eventhandler_tag eh;
     int rtype;
 
     ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
@@ -186,18 +193,15 @@ acpi_timer_attach(device_t dev)
     if (sc->reg == NULL)
 	return (ENXIO);
 
-    /* Register resume and suspend event handlers. */
-    eh = EVENTHANDLER_REGISTER(power_suspend, acpi_timer_suspend_handler,
-	sc, EVENTHANDLER_PRI_LAST);
-    if (eh == NULL) {
-	device_printf(dev, "failed to register suspend event handler\n");
-	bus_release_resource(dev, sc->reg);
-	return (ENXIO);
-    }
-    if (EVENTHANDLER_REGISTER(power_resume, acpi_timer_resume_handler,
+    /*
+     * Register the suspend event handler.  The matching resume handler
+     * is registered on demand by acpi_timer_suspend_handler() so that it
+     * only exists while a switch to our suspend-safe timecounter is
+     * outstanding.
+     */
+    if (EVENTHANDLER_REGISTER(power_suspend, acpi_timer_suspend_handler,
 	sc, EVENTHANDLER_PRI_LAST) == NULL) {
-	device_printf(dev, "failed to register resume event handler\n");
-	EVENTHANDLER_DEREGISTER(power_suspend, eh);
+	device_printf(dev, "failed to register suspend event handler\n");
 	bus_release_resource(dev, sc->reg);
 	return (ENXIO);
     }
@@ -209,6 +213,7 @@ acpi_timer_attach(device_t dev)
     acpi_timer_timecounter.tc_frequency = ACPI_TIMER_FREQUENCY;
     acpi_timer_timecounter.tc_priv = sc;
     sc->tc = &acpi_timer_timecounter;
+    acpi_timer_sc = sc;
 
     tc_init(sc->tc);
 
@@ -224,9 +229,9 @@ acpi_timer_resume_handler(struct acpi_timer_softc *sc, enum power_stype stype)
 {
 	struct timecounter *newtc, *tc;
 
+	newtc = acpi_timer_saved_tc;
+	acpi_timer_saved_tc = NULL;
 	tc = timecounter;
-	newtc = sc->old_tc;
-	sc->old_tc = NULL;
 	if (newtc != NULL && tc != newtc) {
 		if (bootverbose)
 			device_printf(sc->dev,
@@ -243,28 +248,63 @@ acpi_timer_suspend_handler(struct acpi_timer_softc *sc, enum power_stype stype)
 	struct timecounter *tc;
 
 	tc = timecounter;
-	sc->old_tc = NULL;
 	if ((tc->tc_flags & TC_FLAGS_SUSPEND_SAFE) != 0) {
 		/*
 		 * If we are using a suspend safe timecounter, don't
-		 * save/restore it across suspend/resume.
+		 * save/restore it across suspend/resume.  Leave the first
+		 * saved timecounter and the resume handler intact so a
+		 * redundant suspend call does not lose them.
 		 */
 		return;
 	}
 
 	/*
-	  * Our timecounter is suspend safe, so must not be currently
-	  * active.
-	  */
-	MPASS(tc != sc->tc);
+	 * Our timecounter is suspend safe, so must not be currently
+	 * active.
+	 */
+	KASSERT(sc->tc == &acpi_timer_timecounter,
+	    ("acpi_timer_suspend_handler: wrong timecounter"));
+
+	/* Replace any prior resume handler before registering a new one. */
+	if (acpi_timer_eh != NULL) {
+		EVENTHANDLER_DEREGISTER(power_resume, acpi_timer_eh);
+		acpi_timer_eh = NULL;
+	}
 
 	if (bootverbose)
 		device_printf(sc->dev, "switching timecounter, %s -> %s\n",
 		    tc->tc_name, sc->tc->tc_name);
 	(void)acpi_timer_read(sc);
 	(void)acpi_timer_read(sc);
+	/*
+	 * Preserve the first saved non-ACPI timecounter across redundant
+	 * suspend calls (hibernate entry + EJUSTRETURN).
+	 */
+	if (acpi_timer_saved_tc == NULL)
+		acpi_timer_saved_tc = tc;
 	timecounter = sc->tc;
-	sc->old_tc = tc;
+	acpi_timer_eh = EVENTHANDLER_REGISTER(power_resume,
+	    acpi_timer_resume_handler, sc, EVENTHANDLER_PRI_LAST);
+}
+
+void
+acpi_timer_suspend(void)
+{
+	if (acpi_timer_sc == NULL)
+		return;
+	acpi_timer_suspend_handler(acpi_timer_sc, POWER_STYPE_OS_HIBERNATE);
+}
+
+void
+acpi_timer_resume(void)
+{
+	if (acpi_timer_sc != NULL)
+		acpi_timer_resume_handler(acpi_timer_sc,
+		    POWER_STYPE_OS_HIBERNATE);
+	if (acpi_timer_eh != NULL) {
+		EVENTHANDLER_DEREGISTER(power_resume, acpi_timer_eh);
+		acpi_timer_eh = NULL;
+	}
 }
 
 static u_int

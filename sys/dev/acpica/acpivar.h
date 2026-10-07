@@ -68,6 +68,7 @@ struct acpi_softc {
     enum power_stype	acpi_lid_switch_stype;
 
     int			acpi_standby_sx;
+    bool		acpi_s4bios;
     bool		acpi_s4bios_supported;
 
     int			acpi_sleep_delay;
@@ -500,6 +501,13 @@ acpi_d_state_to_str(int state)
     return (strs[state]);
 }
 
+static __inline bool
+acpi_should_do_s4bios(struct acpi_softc *sc)
+{
+    MPASS(!sc->acpi_s4bios || sc->acpi_s4bios_supported);
+    return (sc->acpi_s4bios);
+}
+
 char		*acpi_name(ACPI_HANDLE handle);
 int		acpi_avoid(ACPI_HANDLE handle);
 int		acpi_disabled(char *subsys);
@@ -510,6 +518,11 @@ void		acpi_install_wakeup_handler(struct acpi_softc *sc);
 int		acpi_sleep_machdep(struct acpi_softc *sc, int state);
 int		acpi_wakeup_machdep(struct acpi_softc *sc, int state,
 		    int sleep_result, int intr_enabled);
+#if defined(__amd64__)
+void		acpi_wakeup_cpus(struct acpi_softc *sc, cpuset_t map);
+#endif
+void		acpi_timer_suspend(void);
+void		acpi_timer_resume(void);
 int		acpi_table_quirks(int *quirks);
 int		acpi_machdep_quirks(int *quirks);
 int		acpi_pnpinfo(ACPI_HANDLE handle, struct sbuf *sb);

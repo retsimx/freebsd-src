@@ -64,6 +64,7 @@
 #include <machine/segments.h>
 #include <machine/efi.h>
 #include <machine/kexec.h>
+#include <machine/hibernate.h>
 
 ASSYM(P_VMSPACE, offsetof(struct proc, p_vmspace));
 ASSYM(VM_PMAP, offsetof(struct vmspace, vm_pmap));
@@ -156,6 +157,15 @@ ASSYM(PCB_SIZE, sizeof(struct pcb));
 ASSYM(PCB_FULL_IRET, PCB_FULL_IRET);
 ASSYM(PCB_DBREGS, PCB_DBREGS);
 ASSYM(PCB_32BIT, PCB_32BIT);
+
+/* Hibernate */
+ASSYM(HPCB_CR0, offsetof(struct hibernate_pcb, cr0));
+ASSYM(HPCB_CR3, offsetof(struct hibernate_pcb, cr3));
+ASSYM(HPCB_CR4, offsetof(struct hibernate_pcb, cr4));
+ASSYM(HPCB_RSP, offsetof(struct hibernate_pcb, rsp));
+ASSYM(HPCB_RIP, offsetof(struct hibernate_pcb, rip));
+ASSYM(HPCB_R12, offsetof(struct hibernate_pcb, r12));
+ASSYM(EJUSTRETURN, EJUSTRETURN);
 
 ASSYM(TSS_RSP0, offsetof(struct amd64tss, tss_rsp0));
 

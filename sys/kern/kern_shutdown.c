@@ -223,18 +223,18 @@ const char *panicstr __read_mostly;
 bool scheduler_stopped __read_frequently;
 
 int dumping __read_mostly;		/* system is dumping */
+bool hibernate_writing __read_frequently;	/* writing hibernate image */
 int rebooting __read_mostly;		/* system is rebooting */
 bool dumped_core __read_mostly;		/* system successfully dumped core */
 /*
  * Used to serialize between sysctl kern.shutdown.dumpdevname and list
  * modifications via ioctl.
  */
-static struct mtx dumpconf_list_lk;
+struct mtx dumpconf_list_lk;
 MTX_SYSINIT(dumper_configs, &dumpconf_list_lk, "dumper config list", MTX_DEF);
 
 /* Our selected dumper(s). */
-static TAILQ_HEAD(dumpconflist, dumperinfo) dumper_configs =
-    TAILQ_HEAD_INITIALIZER(dumper_configs);
+struct dumpconflist dumper_configs = TAILQ_HEAD_INITIALIZER(dumper_configs);
 
 /* Context information for dump-debuggers, saved by the dump_savectx() macro. */
 struct pcb dumppcb;			/* Registers. */
@@ -1250,6 +1250,17 @@ dumper_create(const struct dumperinfo *di_template, const char *devname,
 	if (dip == NULL)
 		return (EINVAL);
 
+	/*
+	 * This constraint comes from the fact that we emit a specific header
+	 * before and after the dump (see dump_finish() ->
+	 * dump_write_headers()), each of which we reserve a single block for.
+	 * It does not exist for the live vnode dumper, but since the latter
+	 * uses PAGE_SIZE as the block size, we don't have to special case the
+	 * check for it.
+	 */
+	if (di_template->blocksize < sizeof(struct kerneldumpheader))
+		return (EOPNOTSUPP);
+
 	/* Allocate a new dumper */
 	newdi = malloc(sizeof(*newdi) + strlen(devname) + 1, M_DUMPER,
 	    M_WAITOK | M_ZERO);
@@ -1573,7 +1584,7 @@ dump_write_headers(struct dumperinfo *di, struct kerneldumpheader *kdh)
 
 	hdrsz = sizeof(*kdh);
 	if (hdrsz > di->blocksize)
-		return (ENOMEM);
+		return (EOPNOTSUPP);
 
 #ifdef EKCD
 	kdc = di->kdcrypto;
@@ -1616,12 +1627,6 @@ dump_write_headers(struct dumperinfo *di, struct kerneldumpheader *kdh)
 		    di->blocksize, di->blocksize);
 	return (error);
 }
-
-/*
- * Don't touch the first SIZEOF_METADATA bytes on the dump device.  This is to
- * protect us from metadata and metadata from us.
- */
-#define	SIZEOF_METADATA		(64 * 1024)
 
 /*
  * Do some preliminary setup for a kernel dump: initialize state for encryption,
@@ -1669,7 +1674,7 @@ dump_start(struct dumperinfo *di, struct kerneldumpheader *kdh)
 #endif
 
 	if (di->dumper_start != NULL) {
-		error = di->dumper_start(di, key, keysize);
+		error = di->dumper_start(di, kdh, key, keysize);
 	} else {
 		dumpextent = dtoh64(kdh->dumpextent);
 		span = SIZEOF_METADATA + dumpextent + 2 * di->blocksize +
