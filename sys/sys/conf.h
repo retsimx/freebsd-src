@@ -130,7 +130,8 @@ typedef int dumper_t(
 	void *_virtual,		/* Virtual (mapped) address. */
 	off_t _offset,		/* Byte-offset to write at. */
 	size_t _length);	/* Number of bytes to dump. */
-typedef int dumper_start_t(struct dumperinfo *di, void *key, uint32_t keysize);
+typedef int dumper_start_t(struct dumperinfo *di, struct kerneldumpheader *kdh,
+    void *key, uint32_t keysize);
 typedef int dumper_hdr_t(struct dumperinfo *di, struct kerneldumpheader *kdh);
 
 #endif /* _KERNEL */
@@ -365,6 +366,7 @@ struct dumperinfo {
 };
 
 extern int dumping;		/* system is dumping */
+extern bool hibernate_writing;	/* writing hibernate image */
 extern bool dumped_core;	/* system successfully dumped kernel core */
 
 /*

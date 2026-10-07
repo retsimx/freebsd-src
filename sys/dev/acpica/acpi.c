@@ -37,6 +37,7 @@
 #include <sys/param.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
+#include <sys/kerneldump.h>
 #include <sys/proc.h>
 #include <sys/fcntl.h>
 #include <sys/malloc.h>
@@ -57,14 +58,23 @@
 #include <sys/uuid.h>
 
 #if defined(__i386__) || defined(__amd64__)
+#include <vm/vm.h>
+#include <vm/pmap.h>
 #include <machine/clock.h>
+#include <machine/fpu.h>
 #include <machine/intr_machdep.h>
+#include <machine/pcb.h>
 #include <machine/pci_cfgreg.h>
+#include <machine/pvclock.h>
+#include <x86/apicvar.h>
 #include <x86/cputypes.h>
 #include <x86/x86_var.h>
 #endif
 #include <machine/resource.h>
 #include <machine/bus.h>
+#ifdef OS_HIBERNATE_SUPPORT
+#include <machine/hibernate.h>
+#endif
 #include <sys/rman.h>
 #include <isa/isavar.h>
 #include <isa/pnpvar.h>
@@ -188,6 +198,7 @@ static int	acpi_wake_prep_walk(struct acpi_softc *sc, enum power_stype stype);
 static int	acpi_wake_sysctl_walk(device_t dev);
 static int	acpi_wake_set_sysctl(SYSCTL_HANDLER_ARGS);
 static int	acpi_supported_sleep_state_sysctl(SYSCTL_HANDLER_ARGS);
+static int	acpi_s4bios_sysctl(SYSCTL_HANDLER_ARGS);
 static void	acpi_system_eventhandler_sleep(struct acpi_softc *const sc,
 		    const enum power_stype stype);
 static void	acpi_system_eventhandler_wakeup(struct acpi_softc *const sc,
@@ -352,6 +363,12 @@ TUNABLE_INT("debug.acpi.quirks", &acpi_quirks);
 int acpi_susp_bounce;
 SYSCTL_INT(_debug_acpi, OID_AUTO, suspend_bounce, CTLFLAG_RW,
     &acpi_susp_bounce, 0, "Don't actually suspend, just test devices.");
+
+#ifdef OS_HIBERNATE_SUPPORT
+bool acpi_hibernate_susp_bounce = true;
+SYSCTL_BOOL(_debug_acpi, OID_AUTO, hibernate_suspend_bounce, CTLFLAG_RW,
+    &acpi_hibernate_susp_bounce, 0, "Don't actually hibernate, just test.");
+#endif
 
 #if defined(__amd64__) || defined(__i386__)
 int acpi_override_isa_irq_polarity;
@@ -650,8 +667,8 @@ acpi_attach(device_t dev)
      * Mark whether S4BIOS is available according to the FACS, and if it is,
      * enable it by default.
      */
-    sc->acpi_s4bios_supported = AcpiGbl_FACS != NULL &&
-	(AcpiGbl_FACS->Flags & ACPI_FACS_S4_BIOS_PRESENT) != 0;
+    if (AcpiGbl_FACS != NULL && AcpiGbl_FACS->Flags & ACPI_FACS_S4_BIOS_PRESENT)
+	sc->acpi_s4bios = sc->acpi_s4bios_supported = true;
 
     /*
      * Probe all supported ACPI sleep states.  Awake (S0) is always supported,
@@ -670,6 +687,14 @@ acpi_attach(device_t dev)
 	    sc->acpi_supported_stypes[acpi_sstate_to_stype(state)] = true;
 	}
     }
+    MPASS(!sc->acpi_supported_stypes[POWER_STYPE_OS_HIBERNATE]);
+#ifdef OS_HIBERNATE_SUPPORT
+    /*
+     * OS-initiated hibernate is unconditional.  If S4 is not supported, we will
+     * just poweroff the machine by the usual means.
+     */
+    sc->acpi_supported_stypes[POWER_STYPE_OS_HIBERNATE] = true;
+#endif
     /*
      * Prevent users from requesting firmware-supported image saving if firmware
      * does not indicate it as supported.
@@ -793,6 +818,10 @@ acpi_attach(device_t dev)
 	&acpi_button_replay_secs, 0,
 	"Seconds after resume to ignore firmware-replayed power/sleep "
 	"button presses (0 disables)");
+    SYSCTL_ADD_PROC(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
+	OID_AUTO, "s4bios", CTLTYPE_U8 | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	sc, 0, acpi_s4bios_sysctl, "CU",
+	"On hibernate, have the firmware save/restore the machine state (S4BIOS).");
     SYSCTL_ADD_BOOL(&sc->acpi_sysctl_ctx, SYSCTL_CHILDREN(sc->acpi_sysctl_tree),
 	OID_AUTO, "s4bios_supported", CTLFLAG_RD, &sc->acpi_s4bios_supported, 0,
 	"Whether firmware supports saving/restoring the machine state (S4BIOS).");
@@ -855,10 +884,9 @@ acpi_stype_to_sstate(const struct acpi_softc *const sc,
 	case POWER_STYPE_POWEROFF:
 		return (ACPI_STATE_S5);
 	case POWER_STYPE_SUSPEND_TO_IDLE:
-	case POWER_STYPE_UNKNOWN:
+	default:
 		return (ACPI_STATE_UNKNOWN);
 	}
-	return (ACPI_STATE_UNKNOWN);
 }
 
 /*
@@ -3665,6 +3693,195 @@ do_idle(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 }
 #endif
 
+#ifdef OS_HIBERNATE_SUPPORT
+/*
+ * XXX - To move elsewhere, maybe in a new 'subr_suspend.c' file.
+ */
+static void
+suspend_other_cpus(cpuset_t *const susp_cpus)
+{
+#ifdef SMP
+	*susp_cpus = all_cpus;
+	/*
+	 * XXX - Done in other places too but generally incorrect as this is
+	 * racy and multiple suspensions/stops are anyway not supported.
+	 * Though, this is probably enough to support the "call from debugger"
+	 * case.
+	 */
+	CPU_ANDNOT(susp_cpus, susp_cpus, &stopped_cpus);
+	CPU_CLR(PCPU_GET(cpuid), susp_cpus);
+	if (!CPU_EMPTY(susp_cpus))
+		suspend_cpus(*susp_cpus);
+#endif
+	scheduler_stopped = true;
+}
+
+static void
+resume_other_cpus(const cpuset_t *const susp_cpus)
+{
+    scheduler_stopped = false;
+#ifdef SMP
+    if (!CPU_EMPTY(susp_cpus))
+	resume_cpus(*susp_cpus);
+#endif
+}
+
+static char hibernate_dump_stack[HIBERNATE_SCRATCH_STACK_SIZE]
+    __aligned(PAGE_SIZE);
+
+struct hibernate_dump_args {
+	struct acpi_softc	*sc;
+	struct hibernate_cb	*hcb;
+	struct hibernate_pcb	*hpcb;
+	int			slp_state;
+};
+
+static int
+acpi_hibernate_dump_worker(void *arg1, void *arg2)
+{
+	struct hibernate_dump_args *args = arg1;
+	int error = 0;
+
+	(void)arg2;
+	if ((args->slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
+		device_printf(args->sc->acpi_dev,
+		    "Resuming the dump device (currently, all devices)\n");
+		DEVICE_RESUME(root_bus);
+	}
+
+	device_printf(args->sc->acpi_dev, "Saving the dump image...\n");
+	error = dump_for_hibernate(args->hcb, args->hpcb);
+	return (error);
+}
+
+/*
+ * S4 resume stages.  EJUSTRETURN calls the
+ * orchestrator once, then goto backout.
+ */
+static void
+acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
+    struct lock_list_entry *saved_td_sleeplocks)
+{
+	/*
+	 * The hibernate image is a live snapshot of physical memory taken by
+	 * the dump worker, so nesting counters / dump flags captured mid-dump
+	 * must be discarded before sleep-lock acquisitions on the resume path.
+	 * Pre-savectx td_* values live on the preserved thread stack.
+	 */
+	curthread->td_critnest = 0;
+	curthread->td_md.md_spinlock_count = 0;
+	curthread->td_locks = saved_td_locks;
+	curthread->td_pinned = saved_td_pinned;
+	curthread->td_sleeplocks = saved_td_sleeplocks;
+	hibernate_writing = false;
+	callout_hibernate_report();
+	dumping = 0;
+#if defined(__i386__) || defined(__amd64__)
+	pvclock_resume();
+#endif
+}
+
+#ifdef __amd64__
+extern struct susppcb **susppcbs;
+#endif
+
+static void
+acpi_s4_resume_bsp_cpu(void)
+{
+
+	pmap_init_pat();
+	initializecpu();
+	/*
+	 * Restore the BSP FPU state, including XCR0.  This must happen
+	 * after initializecpu() and before the scheduler is released or
+	 * any interrupt can switch threads: the CPU reset on resume leaves
+	 * XCR0 at its x87-only reset value, so XRSTOR of a thread's saved
+	 * SSE/AVX state would fault (observed #GP on the X13).
+	 */
+	fpuresume(susppcbs[0]->sp_fpususpend);
+	PCPU_SET(switchtime, 0);
+	PCPU_SET(switchticks, ticks);
+}
+
+static void
+acpi_s4_resume_lapic(void)
+{
+
+	lapic_xapic_mode();
+}
+
+static void
+acpi_s4_resume_scheduler_aps(struct acpi_softc *sc, const cpuset_t *susp_cpus)
+{
+
+	/*
+	 * Single S4-path scheduler release, before any AP release.  Match
+	 * resume_other_cpus(): clear scheduler_stopped BEFORE releasing APs
+	 * so an AP returning into cpu_idle cannot mi_switch while
+	 * SCHEDULER_STOPPED.  Empty susp_cpus (true UP) skips AP wake.
+	 * No UP clamp — AP wake failure panics.
+	 */
+	scheduler_stopped = false;
+#ifdef SMP
+	if (!CPU_EMPTY(susp_cpus)) {
+		acpi_wakeup_cpus(sc, *susp_cpus);
+		resume_cpus(*susp_cpus);
+	}
+#else
+	(void)sc;
+	(void)susp_cpus;
+#endif
+}
+
+static void
+acpi_s4_resume_interrupts(register_t intr_state)
+{
+
+	intr_resume(false);
+	intr_restore(intr_state);
+}
+
+static void
+acpi_s4_resume_clocks(struct acpi_softc *sc)
+{
+
+	resumeclock();
+#if defined(__i386__) || defined(__amd64__)
+	resume_TSC();
+#endif
+	acpi_resync_clock(sc);
+	acpi_enable_fixed_events(sc);
+}
+
+static void
+acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
+    const cpuset_t *susp_cpus, register_t intr_state,
+    struct hibernate_pcb *hpcb, struct hibernate_cb *hcb,
+    int saved_td_locks, int saved_td_pinned,
+    struct lock_list_entry *saved_td_sleeplocks)
+{
+
+	acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
+	    saved_td_sleeplocks);
+	device_printf(sc->acpi_dev, "Resumed from hibernate image\n");
+	acpi_s4_resume_bsp_cpu();
+	acpi_s4_resume_lapic();
+	acpi_s4_resume_scheduler_aps(sc, susp_cpus);
+	acpi_s4_resume_interrupts(intr_state);
+	acpi_s4_resume_clocks(sc);
+	free(hpcb, M_TEMP);
+	dumpsys_hibernate_free_hcb(hcb);
+	/*
+	 * Cold-boot firmware re-initialized devices while the restored kernel
+	 * expects them configured.  Force DEVICE_RESUME via backout.
+	 */
+	*slp_state |= ACPI_SS_DEV_SUSPEND;
+	if (!sc->acpi_supported_sstates[ACPI_STATE_S4])
+		*slp_state &= ~ACPI_SS_GPE_SET;
+}
+
+#endif
+
 static void
 check_post_suspend_to_idle(device_t dev)
 {
@@ -3708,7 +3925,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
     register_t intr;
     ACPI_STATUS status;
     enum acpi_sleep_state slp_state;
-    int acpi_sstate;
+    int acpi_sstate = ACPI_STATE_UNKNOWN;
 
     ACPI_FUNCTION_TRACE_U32((char *)(uintptr_t)__func__, stype);
 
@@ -3718,6 +3935,40 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	device_printf(sc->acpi_dev, "Sleep type %s not supported on this "
 	    "platform\n", power_stype_to_name(stype));
 	return (AE_SUPPORT);
+    }
+
+    if (stype == POWER_STYPE_OS_HIBERNATE) {
+#ifndef OS_HIBERNATE_SUPPORT
+	KASSERT(stype != POWER_STYPE_OS_HIBERNATE,
+	    ("%s: Platform does not support OS hibernate, "
+	     "but that request could pass the initial guard.", __func__));
+	return_ACPI_STATUS (AE_NOT_IMPLEMENTED);
+#else
+	/*
+	 * Without a dumper, we cannot proceed.  Because there's no hold on
+	 * dumpers, this has to be retested once other CPUs have been
+	 * stopped, but in most cases the problem will be caught here,
+	 * before we even start suspending devices (in vain).
+	 */
+	if (!has_dumpers()) {
+	    device_printf(sc->acpi_dev,
+		"Hibernate: No dump device configured!");
+	    return_ACPI_STATUS (AE_NOT_CONFIGURED);
+	}
+	if (!sc->acpi_supported_sstates[ACPI_STATE_S4]) {
+	    /*
+	     * Print the warning now instead of just before shutdown to give
+	     * users more chance to see the message.
+	     */
+	    device_printf(sc->acpi_dev,
+		"Will hibernate using power-off, "
+		"wake events may not work.\n");
+	    MPASS(acpi_sstate == ACPI_STATE_UNKNOWN);
+	} else
+	    acpi_sstate = ACPI_STATE_S4;
+#endif
+    } else {
+	acpi_sstate = acpi_stype_to_sstate(sc, stype);
     }
 
     /* Re-entry once we're suspending is not allowed. */
@@ -3737,10 +3988,30 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	return_ACPI_STATUS (AE_OK);
     }
 
+    slp_state = ACPI_SS_NONE;
+
     EVENTHANDLER_INVOKE(power_suspend_early, stype);
     stop_all_proc();
     suspend_all_fs();
-    EVENTHANDLER_INVOKE(power_suspend, stype);
+#ifdef OS_HIBERNATE_SUPPORT
+    if (stype != POWER_STYPE_OS_HIBERNATE) {
+#endif
+	EVENTHANDLER_INVOKE(power_suspend, stype);
+#ifdef OS_HIBERNATE_SUPPORT
+    } else {
+	/*
+	 * Bare power_resume contract: do not fire power_suspend on the
+	 * hibernate dump path.  Disk drivers (ada/nda) would spindown and
+	 * freeze CAM queues, breaking the dump.  Consumers bridged here:
+	 *   - acpi_timer: acpi_timer_suspend/resume
+	 *   - vt: power_suspend_early (above) + power_resume
+	 *   - adaresume: tolerates bare resume (skips OS_HIBERNATE)
+	 *   - acpi_stop_beep / linuxkpi: resume-only or suspend_early paired
+	 * power_resume still runs for vt and peers.
+	 */
+	acpi_timer_suspend();
+    }
+#endif
 
 #ifdef EARLY_AP_STARTUP
     MPASS(mp_ncpus == 1 || smp_started);
@@ -3755,9 +4026,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
     }
 #endif
 
-    slp_state = ACPI_SS_NONE;
     sc->acpi_stype = stype;
-    acpi_sstate = acpi_stype_to_sstate(sc, stype);
 
     /*
      * Be sure to hold bus topology lock across DEVICE_SUSPEND/RESUME.
@@ -3765,8 +4034,10 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
     bus_topo_lock();
 
     /* Enable any GPEs as appropriate and requested by the user. */
-    acpi_wake_prep_walk(sc, stype);
-    slp_state |= ACPI_SS_GPE_SET;
+    if (stype != POWER_STYPE_OS_HIBERNATE) {
+	acpi_wake_prep_walk(sc, stype);
+	slp_state |= ACPI_SS_GPE_SET;
+    }
 
     /*
      * Inform all devices that we are going to sleep.  If at least one
@@ -3776,13 +4047,154 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
      * followed by a "real thing" pass would be better, but the current
      * bus interface does not provide for this.
      */
-    if (DEVICE_SUSPEND(root_bus) != 0) {
-        device_printf(sc->acpi_dev, "device_suspend failed\n");
-        status = AE_ERROR;
-        goto backout;
+    /*
+     * XXX - OS-hibernate: Hangs in VirtualBox, so just forego suspending
+     * devices for now.
+     */
+    if (stype != POWER_STYPE_OS_HIBERNATE) {
+	if (DEVICE_SUSPEND(root_bus) != 0) {
+	    device_printf(sc->acpi_dev, "device_suspend failed\n");
+	    status = AE_ERROR;
+	    goto backout;
+	}
+	/*
+	 * XXX - When this block is run also for POWER_STYPE_OS_HIBERNATE,
+	 * forego invoking 'acpi_post_dev_suspend' until after the second
+	 * suspend.
+	 */
+	EVENTHANDLER_INVOKE(acpi_post_dev_suspend, stype);
+	slp_state |= ACPI_SS_DEV_SUSPEND;
     }
-    EVENTHANDLER_INVOKE(acpi_post_dev_suspend, stype);
-    slp_state |= ACPI_SS_DEV_SUSPEND;
+
+#ifdef OS_HIBERNATE_SUPPORT
+    if (stype == POWER_STYPE_OS_HIBERNATE) {
+	/* FACS hardware signature (in the lower 32-bit). */
+	const uint64_t hardware_signature = AcpiGbl_FACS != NULL ?
+	    AcpiGbl_FACS->HardwareSignature : 0;
+	struct hibernate_cb *hcb = NULL;
+	struct hibernate_pcb *hpcb;
+	cpuset_t susp_cpus;
+	register_t intr_state;
+	int error;
+
+	device_printf(sc->acpi_dev, "Creating hibernate control block...\n");
+	error = dumpsys_hibernate_create_hcb(hardware_signature, &hcb);
+	if (error != 0) {
+	    device_printf(sc->acpi_dev, "Not enough specific memory.\n");
+	    goto backout;
+	}
+	hpcb = malloc(sizeof(*hpcb), M_TEMP, M_WAITOK);
+
+	device_printf(sc->acpi_dev, "Suspending other CPUs...\n");
+	suspend_other_cpus(&susp_cpus);
+
+	intr_state = intr_disable();
+
+	/*
+	 * TODO - Take a snapshot of the whole memory, or just enough to stay
+	 * consistent.
+	 *
+	 * Allocate memory a little earlier (before device suspension)?
+	 *
+	 * slp_state |= ACPI_SS_SNAPSHOT; to mark memory allocation (or some
+	 * other means to know we have to deallocate)?
+	 */
+
+	struct hibernate_dump_args dargs = {
+		.sc = sc,
+		.hcb = hcb,
+		.hpcb = hpcb,
+		.slp_state = slp_state,
+	};
+	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
+	/*
+	 * Capture on the preserved thread stack before savectx: dump-path
+	 * code can take sleep locks / pin the CPU, so the counters frozen
+	 * into the thread page do not match the logical save point.
+	 */
+	int saved_td_locks = curthread->td_locks;
+	int saved_td_pinned = curthread->td_pinned;
+	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
+
+	/*
+	 * This is where the current CPU context is saved, and from where we
+	 * return on resume.
+	 *
+	 * On save, dumpsys_hibernate_savectx executes
+	 * acpi_hibernate_dump_worker directly on the scratch stack without
+	 * unwinding, preserving the saved return-address slot into this
+	 * function completely intact in the image.
+	 *
+	 * On resume, dumpsys_hibernate_savectx returns EJUSTRETURN into this
+	 * function.
+	 */
+	error = dumpsys_hibernate_savectx(hpcb, stack_top,
+	    (int (*)(void *, void *))acpi_hibernate_dump_worker, &dargs);
+
+	switch (error) {
+	case 0:
+	    break;
+
+	case EJUSTRETURN:
+	    acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state,
+		hpcb, hcb, saved_td_locks, saved_td_pinned,
+		saved_td_sleeplocks);
+	    status = AE_OK;
+	    goto backout;
+
+	default:
+	    if (error > 0)
+		break;
+	    __assert_unreachable();
+	}
+
+	if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0)
+		slp_state &= ~ACPI_SS_DEV_SUSPEND;
+
+	resume_other_cpus(&susp_cpus);
+	intr_restore(intr_state);
+
+	if (error != 0) {
+	    device_printf(sc->acpi_dev, "Could not dump the image!\n");
+	    status = AE_NO_HANDLER; /* XXX - Something. */
+	    goto backout;
+	}
+
+	/*
+	 * XXX - Retire this bool and replace with 'acpi_susp_bounce' (different
+	 * default) when image saving is mature enough.
+	 */
+	if (acpi_hibernate_susp_bounce) {
+	    /* Free memory used to hibernate. */
+	    free(hpcb, M_TEMP);
+	    dumpsys_hibernate_free_hcb(hcb);
+	    goto backout;
+	}
+
+	if (!sc->acpi_supported_sstates[ACPI_STATE_S4]) {
+	    /*
+	     * Not going to follow the usual suspend path, as we are going to
+	     * do a regular shutdown right now (without syncing).
+	     */
+	    kern_reboot(RB_POWEROFF | RB_NOSYNC);
+	    /* NOTREACHED */
+	}
+
+	/*
+	 * XXX - Re-suspend the dump device.
+	 *
+	 * As above, for now, re-suspending all peripherals.
+	 */
+	device_printf(sc->acpi_dev,
+		      "Suspending the dump device (currently, all devices)...\n");
+	EVENTHANDLER_INVOKE(power_suspend, stype);
+	if (DEVICE_SUSPEND(root_bus) != 0) {
+	    device_printf(sc->acpi_dev, "Second device suspend failed\n");
+	    goto backout;
+	}
+	slp_state |= ACPI_SS_DEV_SUSPEND;
+    }
+#endif /* OS_HIBERNATE_SUPPORT */
 
     if (stype != POWER_STYPE_SUSPEND_TO_IDLE) {
 	status = acpi_EnterSleepStatePrep(sc->acpi_dev, acpi_sstate);
@@ -3802,6 +4214,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	break;
     case POWER_STYPE_FW_SUSPEND:
     case POWER_STYPE_FW_HIBERNATE:
+    case POWER_STYPE_OS_HIBERNATE:
 	do_sleep(sc, &slp_state, intr, acpi_sstate);
 	break;
     case POWER_STYPE_SUSPEND_TO_IDLE:
@@ -3871,6 +4284,9 @@ backout:
 
     resume_all_fs();
     resume_all_proc();
+
+    if (stype == POWER_STYPE_OS_HIBERNATE)
+	acpi_timer_resume();
 
     EVENTHANDLER_INVOKE(power_resume, stype);
 
@@ -4587,6 +5003,25 @@ acpiioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flag, struct thread *t
     }
 
     return (error);
+}
+
+static int
+acpi_s4bios_sysctl(SYSCTL_HANDLER_ARGS)
+{
+    struct acpi_softc *const sc = arg1;
+    bool val;
+    int error;
+
+    val = sc->acpi_s4bios;
+    error = sysctl_handle_bool(oidp, &val, 0, req);
+    if (error != 0 || req->newptr == NULL)
+	return (error);
+
+    if (val && !sc->acpi_s4bios_supported)
+	return (EOPNOTSUPP);
+    sc->acpi_s4bios = val;
+
+    return (0);
 }
 
 static int
