@@ -325,6 +325,9 @@ struct hibernate_attempt {
 	struct hibernate_marker_result ha_marker_result;
 };
 
+#define HIBERNATE_ATTEMPT_INIT \
+	{ .ha_marker_result = { .hmr_class = HMC_ABSENT, .hmr_error = 0 } }
+
 int hibernate_image_decode(const void *, size_t, struct hibernate_image *);
 int hibernate_image_interval_next(struct hibernate_image_iterator *,
     struct hibernate_image_interval *);
@@ -338,30 +341,16 @@ int hibernate_image_interval_next(struct hibernate_image_iterator *,
  *     by the last call to obtain the canonical CRC32C digest
  *   - intermediate calls chain: crc = hibernate_crc32c_update(crc, ...)
  *
+ * The whole-image CRC covers [I, I + image_length) in encoded order.
+ * Consumers virtually supply only the eight encoded hc_crc32c bytes at
+ * CB+0x078 as zero.  They do not mutate the encoded image.  K-6 and K-8
+ * stream metadata, encoded zero gaps, and payload through this primitive.
+ *
  * Vectors (initial 0xffffffff, final XOR 0xffffffff applied):
  *   empty input   -> 0x00000000
  *   "123456789"   -> 0xe3069283
  */
 uint32_t hibernate_crc32c_update(uint32_t crc, const void *buf, size_t len);
-
-/*
- * hibernate_image_crc32c: compute the whole-image CRC32C.
- *
- * Walks every byte of [0, image->hi_image_length) in encoded order
- * using the decoded interval iterator.  The eight bytes of the CB
- * field hc_crc32c at image->hi_crc_zero_offset (length
- * image->hi_crc_zero_length = HIBERNATE_CB_WIDTH_CRC32C = 8) are
- * fed as zero regardless of their stored value.  No other byte is
- * substituted.  The borrowed prefix buffer is never mutated.
- *
- * The convention is initial 0xffffffff / final XOR 0xffffffff;
- * *crc_out receives the final XORed value (the canonical digest).
- *
- * Returns 0 on success, or the errno returned by the iterator on
- * any failure.
- */
-int hibernate_image_crc32c(const struct hibernate_image *image,
-    uint32_t *crc_out);
 
 #ifndef _LOCORE
 /*

@@ -303,6 +303,7 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	uint64_t cb_aligned, pcb_aligned, payload_aligned, payload_start;
 	uint64_t prev_file_end, prev_dest_end, prev_load_file_end;
 	uint64_t load_count, cb_count, pcb_count;
+	uint64_t load_bytes, load_pages;
 	uint64_t first_load_index, last_load_index;
 	uint64_t tmp;
 	int error;
@@ -371,6 +372,8 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	cb_count = 0;
 	pcb_count = 0;
 	load_count = 0;
+	load_bytes = 0;
+	load_pages = 0;
 	cb_offset = 0;
 	pcb_offset = 0;
 	prev_file_end = phdr_table_end;
@@ -442,6 +445,13 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 			if (load_count > 0 && p_offset < prev_load_file_end)
 				return (EINVAL);
 			prev_load_file_end = seg_end;
+
+			if (__builtin_add_overflow(load_bytes, p_filesz,
+				&load_bytes))
+				return (EOVERFLOW);
+			if (__builtin_add_overflow(load_pages,
+				p_filesz / HIB_PAGE_SIZE, &load_pages))
+				return (EOVERFLOW);
 
 			if (first_load_index == (uint64_t)-1)
 				first_load_index = i;
@@ -546,6 +556,10 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	if (img.hi_cb.hc_saved_pcb_size != HIBERNATE_PCB_ENCODED_SIZE)
 		return (EINVAL);
 	if (img.hi_cb.hc_saved_pcb_offset != pcb_aligned)
+		return (EINVAL);
+	if (img.hi_cb.hc_destination_bytes != load_bytes)
+		return (EINVAL);
+	if (img.hi_cb.hc_destination_pages != load_pages)
 		return (EINVAL);
 
 	/*
@@ -851,154 +865,4 @@ hibernate_crc32c_update(uint32_t crc, const void *buf, size_t len)
 		}
 	}
 	return (crc);
-}
-
-/*
- * hibernate_image_crc32c: whole-image CRC32C with virtual-zero CB field.
- *
- * Walks [0, image_length) via the decoded interval iterator.  For each
- * HIIC_STORED interval the bytes are read from image->hi_prefix (metadata)
- * or are noted as payload-relative (callers that own payload I/O pass the
- * full image buffer; for metadata-only use the prefix is sufficient).
- *
- * Virtual-zero split:
- *   The 8 bytes at [hi_crc_zero_offset, hi_crc_zero_offset +
- *   hi_crc_zero_length) are fed as zero without mutating the buffer.
- *   Any STORED interval that intersects this range is split into up to
- *   three sub-intervals:
- *     [interval_start, zero_start)   — real bytes
- *     [zero_start, zero_end)         — eight zero bytes
- *     [zero_end, interval_end)       — real bytes
- *   HIIC_ZERO_GAP intervals are fed as zero unconditionally (they carry
- *   no stored bytes).
- *
- * The prefix buffer (image->hi_prefix, length image->hi_prefix_length)
- *   covers [0, payload_start).  Metadata intervals always fall within it.
- *   Payload STORED intervals start at or after payload_start; they are
- *   not accessible via the prefix.  This function feeds only the metadata
- *   portion of the image CRC (payload feeding is the caller's
- *   responsibility when the full image buffer is available).
- *
- * NOTE: this function covers the complete image via the iterator.
- *   For intervals in the payload region (>= hi_payload_start) that are
- *   HIIC_STORED, the function returns ENOTSUP because the prefix buffer
- *   does not contain payload bytes.  Callers with the full image buffer
- *   should supply it as the backing store; for metadata-only offline
- *   verification this limitation is documented.
- *
- *   In the current K-2 scope the function is correct for the metadata
- *   prefix and zero-gap payload regions; payload STORED intervals require
- *   the caller to have mapped the full image.  This is the expected use
- *   model: K-6/K-8 stream payload bytes independently.
- *
- * Returns 0 and sets *crc_out on success; returns errno on failure.
- */
-int
-hibernate_image_crc32c(const struct hibernate_image *image, uint32_t *crc_out)
-{
-	struct hibernate_image_iterator it;
-	struct hibernate_image_interval iv;
-	static const uint8_t zero8[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-	uint32_t crc;
-	uint64_t zero_start, zero_end;
-	int error;
-
-	if (image == NULL || crc_out == NULL)
-		return (EINVAL);
-
-	it.hii_image = image;
-	it.hii_next_index = 0;
-	it.hii_cursor = 0;
-	it.hii_phase = HIIP_METADATA;
-	it.hii_error = 0;
-
-	zero_start = image->hi_crc_zero_offset;
-	zero_end = zero_start + image->hi_crc_zero_length;
-
-	crc = UINT32_C(0xffffffff); /* initial value */
-
-	for (;;) {
-		error = hibernate_image_interval_next(&it, &iv);
-		if (error == ENOENT)
-			break;
-		if (error != 0)
-			return (error);
-
-		if (iv.hii_class == HIIC_ZERO_GAP) {
-			/*
-			 * Zero-gap interval: feed zeros without touching any
-			 * buffer.  Accumulate byte-by-byte via the primitive
-			 * with a zero-filled scratch of up to 8 bytes at a
-			 * time.
-			 */
-			uint64_t remaining = iv.hii_length;
-			while (remaining > 0) {
-				uint64_t chunk = remaining < 8 ? remaining : 8;
-				crc = hibernate_crc32c_update(crc, zero8,
-				    (size_t)chunk);
-				remaining -= chunk;
-			}
-		} else {
-			/* HIIC_STORED: bytes live in hi_prefix or payload. */
-			uint64_t iv_start = iv.hii_offset;
-			uint64_t iv_end = iv_start + iv.hii_length;
-
-			/*
-			 * Determine the overlap with the virtual-zero range
-			 * [zero_start, zero_end).
-			 */
-			uint64_t ov_start = (iv_start > zero_start) ?
-			    iv_start :
-			    zero_start;
-			uint64_t ov_end = (iv_end < zero_end) ? iv_end :
-								zero_end;
-			bool has_zero_overlap = (ov_start < ov_end);
-
-			if (!has_zero_overlap) {
-				/*
-				 * No overlap with virtual-zero range.
-				 * Feed bytes directly from the prefix.
-				 */
-				if (iv_end > image->hi_prefix_length)
-					return (ENOTSUP);
-				crc = hibernate_crc32c_update(crc,
-				    image->hi_prefix + iv_start,
-				    (size_t)iv.hii_length);
-			} else {
-				/* Feed [iv_start, ov_start) — real bytes. */
-				if (iv_start < ov_start) {
-					if (ov_start > image->hi_prefix_length)
-						return (ENOTSUP);
-					crc = hibernate_crc32c_update(crc,
-					    image->hi_prefix + iv_start,
-					    (size_t)(ov_start - iv_start));
-				}
-
-				/* Feed [ov_start, ov_end) — virtual zeros. */
-				{
-					uint64_t zlen = ov_end - ov_start;
-					uint64_t rem = zlen;
-					while (rem > 0) {
-						uint64_t chunk = rem < 8 ? rem :
-									   8;
-						crc = hibernate_crc32c_update(
-						    crc, zero8, (size_t)chunk);
-						rem -= chunk;
-					}
-				}
-
-				/* Feed [ov_end, iv_end) — real bytes. */
-				if (ov_end < iv_end) {
-					if (iv_end > image->hi_prefix_length)
-						return (ENOTSUP);
-					crc = hibernate_crc32c_update(crc,
-					    image->hi_prefix + ov_end,
-					    (size_t)(iv_end - ov_end));
-				}
-			}
-		}
-	}
-
-	*crc_out = crc ^ UINT32_C(0xffffffff); /* final XOR */
-	return (0);
 }
