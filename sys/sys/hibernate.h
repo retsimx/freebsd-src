@@ -11,6 +11,8 @@
 #include <sys/types.h>
 #include <sys/_stdint.h>
 
+struct dumperinfo;
+
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
@@ -332,6 +334,8 @@ struct hibernate_marker_result {
 
 struct hibernate_attempt {
 	struct hibernate_marker_result ha_marker_result;
+	struct dumperinfo *ha_dumper; /* Borrowed; NULL means unbound. */
+	off_t ha_marker_offset;	      /* Validated absolute marker offset P. */
 };
 
 #define HIBERNATE_ATTEMPT_INIT \
@@ -340,6 +344,20 @@ struct hibernate_attempt {
 int hibernate_image_decode(const void *, size_t, struct hibernate_image *);
 int hibernate_image_interval_next(struct hibernate_image_iterator *,
     struct hibernate_image_interval *);
+
+/*
+ * Marker operations use one attempt-bound, ordered dumper.  The caller must
+ * keep the dumper admission regime closed against competing image and marker
+ * writers for the complete read-modify-write sequence through its flush.
+ * Dump execution owns the operation through dumping; hibernation additionally
+ * marks hibernate_writing.  K-3 adds no lock (design sections 3.3 and 11.7).
+ */
+int hibernate_marker_read(struct hibernate_attempt *ha,
+    struct hibernate_marker *out);
+int hibernate_marker_write(struct hibernate_attempt *ha,
+    const struct hibernate_marker *m);
+int hibernate_marker_clear(struct hibernate_attempt *ha);
+int hibernate_marker_flush(struct hibernate_attempt *ha);
 
 /*
  * CRC32C primitive: reflected Castagnoli polynomial 0x82f63b78.

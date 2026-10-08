@@ -130,9 +130,15 @@ typedef int dumper_t(
 	void *_virtual,		/* Virtual (mapped) address. */
 	off_t _offset,		/* Byte-offset to write at. */
 	size_t _length);	/* Number of bytes to dump. */
+typedef int dumper_read_t(
+	void *_priv,		/* Private to the driver. */
+	void *_virtual,		/* Virtual destination address. */
+	off_t _offset,		/* Byte-offset to read at. */
+	size_t _length);	/* Number of bytes to read. */
 typedef int dumper_start_t(struct dumperinfo *di, struct kerneldumpheader *kdh,
     void *key, uint32_t keysize);
 typedef int dumper_hdr_t(struct dumperinfo *di, struct kerneldumpheader *kdh);
+typedef int dumper_flush_t(struct dumperinfo *di);
 
 #endif /* _KERNEL */
 
@@ -345,8 +351,10 @@ struct kerneldumpheader;
 
 struct dumperinfo {
 	dumper_t *dumper;	/* Dumping function. */
+	dumper_read_t *dumper_read; /* Dumper callback for reading. */
 	dumper_start_t *dumper_start; /* Dumper callback for dump_start(). */
 	dumper_hdr_t *dumper_hdr; /* Dumper callback for writing headers. */
+	dumper_flush_t *dumper_flush; /* Dumper callback for flushing. */
 	void	*priv;		/* Private parts. */
 	u_int	blocksize;	/* Size of block in bytes. */
 	u_int	maxiosize;	/* Max size allowed for an individual I/O */

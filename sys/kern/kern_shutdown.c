@@ -1795,7 +1795,16 @@ dump_finish(struct dumperinfo *di, struct kerneldumpheader *kdh)
 	if (error != 0)
 		return (error);
 
-	(void)dump_write(di, NULL, 0, 0);
+	/*
+	 * A missing callback preserves legacy crash-dump success, but makes
+	 * no new durability guarantee.  Hibernation durability is established
+	 * solely by hibernate_marker_flush(), which fails closed.
+	 */
+	if (di->dumper_flush != NULL) {
+		error = di->dumper_flush(di);
+		if (error != 0)
+			return (error);
+	}
 	return (0);
 }
 

@@ -74,6 +74,32 @@
 #include <sys/elf64.h>
 #include <sys/elf_common.h>
 
+#ifndef DEV_BSIZE
+#define DEV_BSIZE 512
+#endif
+
+#ifndef EOPNOTSUPP
+#define EOPNOTSUPP ENOTSUP
+#endif
+
+struct dumperinfo;
+
+typedef int dumper_t(void *_priv, void *_virtual, off_t _offset,
+    size_t _length);
+typedef int dumper_read_t(void *_priv, void *_virtual, off_t _offset,
+    size_t _length);
+typedef int dumper_flush_t(struct dumperinfo *di);
+
+struct dumperinfo {
+	dumper_t *dumper;
+	dumper_read_t *dumper_read;
+	dumper_flush_t *dumper_flush;
+	void *priv;
+	u_int blocksize;
+	off_t mediaoffset;
+	off_t mediasize;
+};
+
 /* ELFCLASS64 / ELFDATA2LSB / EV_CURRENT are always exposed. */
 /* ET_FREEBSD_HIBERNATE_IMAGE and PT_FREEBSD_HIBERNATE_* are in elf_common.h. */
 
