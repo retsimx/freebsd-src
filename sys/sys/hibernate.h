@@ -39,6 +39,15 @@
 #define HIBERNATE_MARKER_OFF_RESERVED_024   0x024
 #define HIBERNATE_MARKER_WIDTH_RESERVED_024 4
 
+/*
+ * ABI 1 marker values.  Zero magic means clear/absent; the magic value is
+ * opaque to K-3 and owned by K-4 classification.
+ */
+#define HIBERNATE_MARKER_VERSION	 1
+#define HIBERNATE_MARKER_STATE_PENDING	 1
+#define HIBERNATE_MARKER_STATE_CONSUMING 2
+#define HIBERNATE_MARKER_STATE_CONSUMED	 3
+
 /* Control-block encoding. */
 #define HIBERNATE_CB_OFF_MAGIC			   0x000
 #define HIBERNATE_CB_WIDTH_MAGIC		   8
