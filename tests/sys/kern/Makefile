@@ -165,6 +165,7 @@ TESTS_SUBDIRS+=	acct
 TESTS_SUBDIRS+=	execve
 TESTS_SUBDIRS+=	pipe
 TESTS_SUBDIRS+=	tty
+TESTS_SUBDIRS+=	hibernate
 
 .include <netbsd-tests.test.mk>
 

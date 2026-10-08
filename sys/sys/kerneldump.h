@@ -213,14 +213,14 @@ EVENTHANDLER_DECLARE(livedumper_finish, livedump_finish_fn);
 #define HIBERNATE_DEFAULT_SPARE_SIZE	(256 * 1024 * 1024)
 #define HIBERNATE_PADDR_MIN		(258 * 1024 * 1024)
 
-struct hibernate_cb;
-struct hibernate_pcb;
+struct hibernate_save_cb;
+struct hibernate_save_pcb;
 
 int dumpsys_hibernate_create_hcb(uint64_t _hardware_signature,
-    struct hibernate_cb **_hcb_out);
-void dumpsys_hibernate_free_hcb(struct hibernate_cb *);
-int dump_for_hibernate(const struct hibernate_cb *,
-    const struct hibernate_pcb *);
+    struct hibernate_save_cb **_hcb_out);
+void dumpsys_hibernate_free_hcb(struct hibernate_save_cb *);
+int dump_for_hibernate(const struct hibernate_save_cb *,
+    const struct hibernate_save_pcb *);
 #endif /* OS_HIBERNATE_SUPPORT */
 
 #endif /* _KERNEL */

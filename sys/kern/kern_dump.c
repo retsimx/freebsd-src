@@ -317,7 +317,7 @@ const uint64_t contig_spare_pages_nb = howmany(HIBERNATE_CONTIG_SPARE_SIZE,
 
 int
 dumpsys_hibernate_create_hcb(uint64_t hardware_signature,
-    struct hibernate_cb **hcb_out)
+    struct hibernate_save_cb **hcb_out)
 {
 	const int max_contig_tries = 2;
 	const int max_spare_tries = 2;
@@ -331,7 +331,7 @@ dumpsys_hibernate_create_hcb(uint64_t hardware_signature,
 	 * have allocated.
 	 */
 	const int vm_req = VM_ALLOC_NOWAIT | VM_ALLOC_ZERO | VM_ALLOC_NODUMP;
-	struct hibernate_cb *hcb;
+	struct hibernate_save_cb *hcb;
 	vm_page_t p;
 	uint64_t spare_mb, spare_pages_nb;
 	int contig_tries = 0;
@@ -418,7 +418,7 @@ free_hcb:
 }
 
 void
-dumpsys_hibernate_free_hcb(struct hibernate_cb *hcb)
+dumpsys_hibernate_free_hcb(struct hibernate_save_cb *hcb)
 {
 	vm_paddr_t phys;
 	vm_page_t p;
@@ -500,21 +500,22 @@ dumpsys_hibernate_aux_headers(struct dumperinfo *di, struct kerneldumpheader *kd
 /*
  * Hibernate's additional ELF program headers.
  *
- * Two additional headers, one containing a 'struct hibernate_cb'
- * (PT_FREEBSD_HIBERNATE_CB) and another containing a 'struct hibernate_pcb'
+ * Two additional headers, one containing a 'struct hibernate_save_cb'
+ * (PT_FREEBSD_HIBERNATE_CB) and another containing a
+ * 'struct hibernate_save_pcb'
  * (PT_FREEBSD_HIBERNATE_PCB).
  */
 static const int hibernate_addphdr_nb = 2;
 
 static inline size_t
-dumpsys_hibernate_addphdr_size(const struct hibernate_cb *const hcb)
+dumpsys_hibernate_addphdr_size(const struct hibernate_save_cb *const hcb)
 {
-	return (hcb_size(hcb) + sizeof(struct hibernate_pcb));
+	return (hcb_size(hcb) + sizeof(struct hibernate_save_pcb));
 }
 
 static int
 dumpsys_hibernate_addphdr_write_elf_headers(struct dumperinfo *di, uint64_t offset,
-    const struct hibernate_cb *const hcb)
+    const struct hibernate_save_cb *const hcb)
 {
 	Elf_Phdr phdr;
 	int error;
@@ -537,7 +538,7 @@ dumpsys_hibernate_addphdr_write_elf_headers(struct dumperinfo *di, uint64_t offs
 	phdr.p_type = PT_FREEBSD_HIBERNATE_PCB;
 	phdr.p_flags = PF_R;
 	phdr.p_offset = offset + hcb_size(hcb);
-	phdr.p_filesz = sizeof(struct hibernate_pcb);
+	phdr.p_filesz = sizeof(struct hibernate_save_pcb);
 	phdr.p_memsz = phdr.p_filesz;
 	error = dumpsys_buf_write(di, (char *)&phdr, sizeof(phdr));
 	return (error);
@@ -545,7 +546,8 @@ dumpsys_hibernate_addphdr_write_elf_headers(struct dumperinfo *di, uint64_t offs
 
 static int
 dumpsys_hibernate_addphdr_write(struct dumperinfo *di,
-    const struct hibernate_cb *const hcb, const struct hibernate_pcb *const hpcb)
+    const struct hibernate_save_cb *const hcb,
+    const struct hibernate_save_pcb *const hpcb)
 {
 	int error;
 
@@ -565,8 +567,9 @@ dumpsys_hibernate_addphdr_write(struct dumperinfo *di,
  */
 /* Keep out-of-line: issue #2 requires this symbol under static inspection. */
 static __noinline int
-dumpsys_hibernate(struct dumperinfo *di, const struct hibernate_cb *const hcb,
-    const struct hibernate_pcb *const hpcb)
+dumpsys_hibernate(struct dumperinfo *di,
+    const struct hibernate_save_cb *const hcb,
+    const struct hibernate_save_pcb *const hpcb)
 {
 	static struct kerneldumpheader kdh;
 	Elf_Ehdr ehdr;
@@ -700,8 +703,8 @@ fail:
  * XXX - Factor this out with existing dump functions?
  */
 int
-dump_for_hibernate(const struct hibernate_cb *const hcb,
-    const struct hibernate_pcb *const hpcb)
+dump_for_hibernate(const struct hibernate_save_cb *const hcb,
+    const struct hibernate_save_pcb *const hpcb)
 {
 	struct dumperinfo *di;
 	int error = ENXIO;

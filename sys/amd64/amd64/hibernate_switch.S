@@ -14,17 +14,17 @@
 	.text
 
 /*
- * int hibernate_savectx(struct hibernate_pcb *hpcb, struct pcb *pcb,
+ * int hibernate_savectx(struct hibernate_save_pcb *hpcb, struct pcb *pcb,
  *     uint64_t low_entry, uint64_t low_stack)
  *
- * Saves CPU context using savectx(), fills the hibernate_pcb with register
+ * Saves CPU context using savectx(), fills the hibernate_save_pcb with register
  * state and low transition entry/stack pointers, and returns twice:
  *   - returns 0 on initial save (when savectx returns 1)
  *   - returns EJUSTRETURN on resume (when resumectx returns 0)
  */
 ENTRY(hibernate_savectx)
 	/*
-	 * %rdi = struct hibernate_pcb *hpcb
+	 * %rdi = struct hibernate_save_pcb *hpcb
 	 * %rsi = struct pcb *pcb
 	 * %rdx = uint64_t low_entry (physical address < 4 GiB)
 	 * %rcx = uint64_t low_stack (physical address < 4 GiB)
