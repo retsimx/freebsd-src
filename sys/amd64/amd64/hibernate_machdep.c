@@ -94,7 +94,7 @@ hibernate_setup_identity_map(void)
  * Returns twice, the second time with EJUSTRETURN (on restore).
  */
 int
-dumpsys_hibernate_savectx(struct hibernate_pcb *hpcb, void *stack_top,
+dumpsys_hibernate_savectx(struct hibernate_save_pcb *hpcb, void *stack_top,
     int (*dump_fn)(void *, void *), void *dump_arg)
 {
 	static void *low_page = NULL;

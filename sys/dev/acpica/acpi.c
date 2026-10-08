@@ -3731,8 +3731,8 @@ static char hibernate_dump_stack[HIBERNATE_SCRATCH_STACK_SIZE]
 
 struct hibernate_dump_args {
 	struct acpi_softc	*sc;
-	struct hibernate_cb	*hcb;
-	struct hibernate_pcb	*hpcb;
+	struct hibernate_save_cb	*hcb;
+	struct hibernate_save_pcb	*hpcb;
 	int			slp_state;
 };
 
@@ -3856,7 +3856,7 @@ acpi_s4_resume_clocks(struct acpi_softc *sc)
 static void
 acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
     const cpuset_t *susp_cpus, register_t intr_state,
-    struct hibernate_pcb *hpcb, struct hibernate_cb *hcb,
+    struct hibernate_save_pcb *hpcb, struct hibernate_save_cb *hcb,
     int saved_td_locks, int saved_td_pinned,
     struct lock_list_entry *saved_td_sleeplocks)
 {
@@ -4071,8 +4071,8 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	/* FACS hardware signature (in the lower 32-bit). */
 	const uint64_t hardware_signature = AcpiGbl_FACS != NULL ?
 	    AcpiGbl_FACS->HardwareSignature : 0;
-	struct hibernate_cb *hcb = NULL;
-	struct hibernate_pcb *hpcb;
+	struct hibernate_save_cb *hcb = NULL;
+	struct hibernate_save_pcb *hpcb;
 	cpuset_t susp_cpus;
 	register_t intr_state;
 	int error;

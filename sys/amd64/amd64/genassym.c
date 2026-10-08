@@ -159,12 +159,12 @@ ASSYM(PCB_DBREGS, PCB_DBREGS);
 ASSYM(PCB_32BIT, PCB_32BIT);
 
 /* Hibernate */
-ASSYM(HPCB_CR0, offsetof(struct hibernate_pcb, cr0));
-ASSYM(HPCB_CR3, offsetof(struct hibernate_pcb, cr3));
-ASSYM(HPCB_CR4, offsetof(struct hibernate_pcb, cr4));
-ASSYM(HPCB_RSP, offsetof(struct hibernate_pcb, rsp));
-ASSYM(HPCB_RIP, offsetof(struct hibernate_pcb, rip));
-ASSYM(HPCB_R12, offsetof(struct hibernate_pcb, r12));
+ASSYM(HPCB_CR0, offsetof(struct hibernate_save_pcb, cr0));
+ASSYM(HPCB_CR3, offsetof(struct hibernate_save_pcb, cr3));
+ASSYM(HPCB_CR4, offsetof(struct hibernate_save_pcb, cr4));
+ASSYM(HPCB_RSP, offsetof(struct hibernate_save_pcb, rsp));
+ASSYM(HPCB_RIP, offsetof(struct hibernate_save_pcb, rip));
+ASSYM(HPCB_R12, offsetof(struct hibernate_save_pcb, r12));
 ASSYM(EJUSTRETURN, EJUSTRETURN);
 
 ASSYM(TSS_RSP0, offsetof(struct amd64tss, tss_rsp0));
