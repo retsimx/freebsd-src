@@ -98,6 +98,8 @@ struct disk {
 	disk_strategy_t		*d_strategy;
 	disk_ioctl_t		*d_ioctl;
 	dumper_t		*d_dump;
+	dumper_read_t		*d_dump_read;
+	dumper_flush_t		*d_dump_flush;
 	disk_getattr_t		*d_getattr;
 	disk_gone_t		*d_gone;
 

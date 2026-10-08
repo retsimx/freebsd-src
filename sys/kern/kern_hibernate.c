@@ -37,6 +37,7 @@
 #else
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/conf.h>
 #include <sys/elf64.h>
 #include <sys/elf_common.h>
 #include <sys/endian.h>
@@ -112,6 +113,254 @@ is_all_zero(const uint8_t *buf, size_t len)
 			return (false);
 	}
 	return (true);
+}
+
+/*
+ * Validate an attempt's marker-sector binding and callback requirements.
+ * mediasize is the byte length of the provider extent beginning at
+ * mediaoffset.
+ *
+ * The caller must own the attempt-bound dumper's admission regime and keep it
+ * closed against competing image and marker writers for the complete
+ * read-modify-write sequence through its flush.  Dump execution owns the
+ * operation through dumping; hibernation additionally marks
+ * hibernate_writing.  K-3 adds no lock (design sections 3.3 and 11.7).
+ *
+ * No invariant assertion is safe here: legitimate restore and completion
+ * callers can hold admission closed without both global flags being set.
+ */
+static int
+hibernate_marker_binding(struct hibernate_attempt *ha, bool need_read,
+    bool need_write, struct dumperinfo **dip, off_t *offsetp)
+{
+	struct dumperinfo *di;
+	off_t media_end, marker_end, offset;
+
+	if (ha == NULL || ha->ha_dumper == NULL)
+		return (EINVAL);
+	di = ha->ha_dumper;
+	if ((need_read && di->dumper_read == NULL) ||
+	    (need_write && di->dumper == NULL))
+		return (EOPNOTSUPP);
+	if (di->blocksize != DEV_BSIZE)
+		return (EINVAL);
+	if (di->mediaoffset < 0 || di->mediasize <= 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(di->mediaoffset, di->mediasize, &media_end))
+		return (EOVERFLOW);
+
+	offset = ha->ha_marker_offset;
+	if (offset < di->mediaoffset || offset % DEV_BSIZE != 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(offset, (off_t)DEV_BSIZE, &marker_end))
+		return (EOVERFLOW);
+	if (marker_end > media_end)
+		return (EINVAL);
+
+	*dip = di;
+	*offsetp = offset;
+	return (0);
+}
+
+static int
+hibernate_marker_image_valid(const struct dumperinfo *di,
+    const struct hibernate_marker *m)
+{
+	uint64_t image_end, media_end, mediaoffset;
+
+	if (di->mediaoffset < 0 || di->mediasize <= 0)
+		return (EINVAL);
+	mediaoffset = (uint64_t)di->mediaoffset;
+	if (__builtin_add_overflow(mediaoffset, (uint64_t)di->mediasize,
+		&media_end))
+		return (EOVERFLOW);
+	if (m->hm_image_length == 0 ||
+	    __builtin_add_overflow(m->hm_image_offset, m->hm_image_length,
+		&image_end))
+		return (EINVAL);
+	if (m->hm_image_offset < mediaoffset || image_end > media_end)
+		return (EINVAL);
+	return (0);
+}
+
+static int
+hibernate_marker_decode(const struct dumperinfo *di, const uint8_t *buf,
+    struct hibernate_marker *out)
+{
+	struct hibernate_marker m;
+	uint32_t reserved;
+	int error;
+
+	m.hm_magic = le64dec(buf + HIBERNATE_MARKER_OFF_MAGIC);
+	m.hm_version = le32dec(buf + HIBERNATE_MARKER_OFF_VERSION);
+	m.hm_state = le32dec(buf + HIBERNATE_MARKER_OFF_STATE);
+	m.hm_image_offset = le64dec(buf + HIBERNATE_MARKER_OFF_IMAGE_OFFSET);
+	m.hm_image_length = le64dec(buf + HIBERNATE_MARKER_OFF_IMAGE_LENGTH);
+	m.hm_crc32c = le32dec(buf + HIBERNATE_MARKER_OFF_CRC32C);
+	reserved = le32dec(buf + HIBERNATE_MARKER_OFF_RESERVED_024);
+
+	if (m.hm_magic == 0) {
+		if (m.hm_version != 0 || m.hm_state != 0 ||
+		    m.hm_image_offset != 0 || m.hm_image_length != 0 ||
+		    m.hm_crc32c != 0 || reserved != 0)
+			return (EINVAL);
+		*out = m;
+		return (0);
+	}
+	if (m.hm_version != HIBERNATE_MARKER_VERSION || reserved != 0)
+		return (EINVAL);
+	switch (m.hm_state) {
+	case HIBERNATE_MARKER_STATE_PENDING:
+	case HIBERNATE_MARKER_STATE_CONSUMING:
+	case HIBERNATE_MARKER_STATE_CONSUMED:
+		break;
+	default:
+		return (EINVAL);
+	}
+	error = hibernate_marker_image_valid(di, &m);
+	if (error != 0)
+		return (error);
+	*out = m;
+	return (0);
+}
+
+static void
+hibernate_marker_encode(uint8_t *buf, const struct hibernate_marker *m)
+{
+	le64enc(buf + HIBERNATE_MARKER_OFF_MAGIC, m->hm_magic);
+	le32enc(buf + HIBERNATE_MARKER_OFF_VERSION, m->hm_version);
+	le32enc(buf + HIBERNATE_MARKER_OFF_STATE, m->hm_state);
+	le64enc(buf + HIBERNATE_MARKER_OFF_IMAGE_OFFSET, m->hm_image_offset);
+	le64enc(buf + HIBERNATE_MARKER_OFF_IMAGE_LENGTH, m->hm_image_length);
+	le32enc(buf + HIBERNATE_MARKER_OFF_CRC32C, m->hm_crc32c);
+	le32enc(buf + HIBERNATE_MARKER_OFF_RESERVED_024, 0);
+}
+
+static bool
+hibernate_marker_immutable_equal(const struct hibernate_marker *a,
+    const struct hibernate_marker *b)
+{
+	return (a->hm_magic == b->hm_magic && a->hm_version == b->hm_version &&
+	    a->hm_image_offset == b->hm_image_offset &&
+	    a->hm_image_length == b->hm_image_length &&
+	    a->hm_crc32c == b->hm_crc32c);
+}
+
+int
+hibernate_marker_read(struct hibernate_attempt *ha,
+    struct hibernate_marker *out)
+{
+	struct hibernate_marker m;
+	struct dumperinfo *di;
+	uint8_t sector[DEV_BSIZE];
+	off_t offset;
+	int error;
+
+	if (out == NULL)
+		return (EINVAL);
+	error = hibernate_marker_binding(ha, true, false, &di, &offset);
+	if (error != 0)
+		return (error);
+	error = di->dumper_read(di->priv, sector, offset, sizeof(sector));
+	if (error != 0)
+		return (error);
+	error = hibernate_marker_decode(di, sector, &m);
+	if (error != 0)
+		return (error);
+	*out = m;
+	return (0);
+}
+
+int
+hibernate_marker_write(struct hibernate_attempt *ha,
+    const struct hibernate_marker *m)
+{
+	struct hibernate_marker current;
+	struct dumperinfo *di;
+	uint8_t sector[DEV_BSIZE];
+	uint64_t image_offset;
+	off_t offset;
+	int error;
+
+	if (m == NULL)
+		return (EINVAL);
+	error = hibernate_marker_binding(ha, true, true, &di, &offset);
+	if (error != 0)
+		return (error);
+
+	switch (m->hm_state) {
+	case HIBERNATE_MARKER_STATE_PENDING:
+		if (m->hm_magic == 0 ||
+		    m->hm_version != HIBERNATE_MARKER_VERSION)
+			return (EINVAL);
+		if (__builtin_add_overflow((uint64_t)di->mediaoffset,
+			HIBERNATE_METADATA_SIZE, &image_offset))
+			return (EOVERFLOW);
+		if (m->hm_image_offset != image_offset)
+			return (EINVAL);
+		error = hibernate_marker_image_valid(di, m);
+		if (error != 0)
+			return (error);
+		break;
+	case HIBERNATE_MARKER_STATE_CONSUMING:
+	case HIBERNATE_MARKER_STATE_CONSUMED:
+		break;
+	default:
+		return (EINVAL);
+	}
+
+	error = di->dumper_read(di->priv, sector, offset, sizeof(sector));
+	if (error != 0)
+		return (error);
+
+	if (m->hm_state == HIBERNATE_MARKER_STATE_PENDING) {
+		hibernate_marker_encode(sector, m);
+	} else {
+		error = hibernate_marker_decode(di, sector, &current);
+		if (error != 0)
+			return (error);
+		if (!hibernate_marker_immutable_equal(&current, m))
+			return (EINVAL);
+		if ((m->hm_state == HIBERNATE_MARKER_STATE_CONSUMING &&
+			current.hm_state != HIBERNATE_MARKER_STATE_PENDING) ||
+		    (m->hm_state == HIBERNATE_MARKER_STATE_CONSUMED &&
+			current.hm_state != HIBERNATE_MARKER_STATE_CONSUMING))
+			return (EINVAL);
+		le32enc(sector + HIBERNATE_MARKER_OFF_STATE, m->hm_state);
+	}
+
+	return (di->dumper(di->priv, sector, offset, sizeof(sector)));
+}
+
+int
+hibernate_marker_clear(struct hibernate_attempt *ha)
+{
+	struct dumperinfo *di;
+	uint8_t sector[DEV_BSIZE];
+	off_t offset;
+	int error;
+
+	error = hibernate_marker_binding(ha, true, true, &di, &offset);
+	if (error != 0)
+		return (error);
+	error = di->dumper_read(di->priv, sector, offset, sizeof(sector));
+	if (error != 0)
+		return (error);
+	__builtin_memset(sector, 0, HIBERNATE_MARKER_ENCODED_SIZE);
+	return (di->dumper(di->priv, sector, offset, sizeof(sector)));
+}
+
+int
+hibernate_marker_flush(struct hibernate_attempt *ha)
+{
+	struct dumperinfo *di;
+
+	if (ha == NULL || ha->ha_dumper == NULL)
+		return (EINVAL);
+	di = ha->ha_dumper;
+	if (di->dumper_flush == NULL)
+		return (EOPNOTSUPP);
+	return (di->dumper_flush(di));
 }
 
 /*

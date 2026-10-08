@@ -851,6 +851,8 @@ static struct ada_quirk_entry ada_quirk_table[] =
 
 static	disk_strategy_t	adastrategy;
 static	dumper_t	adadump;
+static dumper_read_t adadump_read;
+static dumper_flush_t adadump_flush;
 static	periph_init_t	adainit;
 static	void		adadiskgonecb(struct disk *dp);
 static	periph_oninv_t	adaoninvalidate;
@@ -1122,6 +1124,116 @@ adastrategy(struct bio *bp)
 }
 
 static int
+ada_dump_flush_periph(struct ada_softc *softc, struct cam_periph *periph)
+{
+	struct ccb_ataio ataio;
+	int error;
+
+	if ((periph->flags & CAM_PERIPH_INVALID) != 0)
+		return (ENXIO);
+	if ((softc->flags & ADA_FLAG_CAN_FLUSHCACHE) == 0)
+		return (EOPNOTSUPP);
+
+	memset(&ataio, 0, sizeof(ataio));
+	xpt_setup_ccb(&ataio.ccb_h, periph->path, CAM_PRIORITY_NORMAL);
+
+	/*
+	 * Tell the drive to flush its internal cache. if we
+	 * can't flush in 5s we have big problems. No need to
+	 * wait the default 60s to detect problems.
+	 */
+	ataio.ccb_h.ccb_state = ADA_CCB_DUMP;
+	cam_fill_ataio(&ataio, 0, NULL, CAM_DIR_NONE, 0, NULL, 0, 5 * 1000);
+
+	if (softc->flags & ADA_FLAG_CAN_48BIT)
+		ata_48bit_cmd(&ataio, ATA_FLUSHCACHE48, 0, 0, 0);
+	else
+		ata_28bit_cmd(&ataio, ATA_FLUSHCACHE, 0, 0, 0);
+	error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
+	    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+	if (error != 0)
+		xpt_print(periph->path, "Synchronize cache failed\n");
+	return (error);
+}
+
+static int
+adadump_read(void *arg, void *virtual, off_t offset, size_t length)
+{
+	struct ada_softc *softc;
+	struct cam_periph *periph;
+	struct ccb_ataio ataio;
+	struct disk *dp;
+	uint64_t count, last_lba, lba;
+	u_int secsize;
+	int error;
+
+	dp = arg;
+	if (dp == NULL || virtual == NULL)
+		return (EINVAL);
+	periph = dp->d_drv1;
+	if (periph == NULL || (periph->flags & CAM_PERIPH_INVALID) != 0)
+		return (ENXIO);
+	softc = (struct ada_softc *)periph->softc;
+	if (softc == NULL)
+		return (ENXIO);
+	secsize = softc->params.secsize;
+	if (secsize == 0 || offset < 0 || length == 0 ||
+	    (offset % secsize) != 0 || (length % secsize) != 0)
+		return (EINVAL);
+	lba = (uint64_t)offset / secsize;
+	count = length / secsize;
+	if (count == 0 || count > UINT16_MAX || length > UINT32_MAX ||
+	    lba > UINT64_MAX - (count - 1))
+		return (EINVAL);
+	last_lba = lba + count - 1;
+	if (last_lba > 0xffffffffffffULL)
+		return (EINVAL);
+	if (last_lba > ATA_MAX_28BIT_LBA || count > UINT8_MAX) {
+		if ((softc->flags & ADA_FLAG_CAN_48BIT) == 0)
+			return (EINVAL);
+	} else if (lba > UINT32_MAX) {
+		return (EINVAL);
+	}
+
+	memset(&ataio, 0, sizeof(ataio));
+	xpt_setup_ccb(&ataio.ccb_h, periph->path, CAM_PRIORITY_NORMAL);
+	ataio.ccb_h.ccb_state = ADA_CCB_DUMP;
+	cam_fill_ataio(&ataio, 0, NULL, CAM_DIR_IN, 0, (uint8_t *)virtual,
+	    (uint32_t)length, ada_default_timeout * 1000);
+	if (last_lba > ATA_MAX_28BIT_LBA || count > UINT8_MAX)
+		ata_48bit_cmd(&ataio, ATA_READ_DMA48, 0, lba, (uint16_t)count);
+	else
+		ata_28bit_cmd(&ataio, ATA_READ_DMA, 0, (uint32_t)lba,
+		    (uint8_t)count);
+	error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
+	    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+	if (error == 0 && ataio.resid != 0)
+		error = EIO;
+	if (error != 0)
+		printf("Aborting dump due to I/O error.\n");
+	return (error);
+}
+
+static int
+adadump_flush(struct dumperinfo *di)
+{
+	struct ada_softc *softc;
+	struct cam_periph *periph;
+	struct disk *dp;
+
+	if (di == NULL || di->priv == NULL)
+		return (EINVAL);
+	dp = di->priv;
+	periph = dp->d_drv1;
+	if (periph == NULL || (periph->flags & CAM_PERIPH_INVALID) != 0)
+		return (ENXIO);
+	softc = (struct ada_softc *)periph->softc;
+	if (softc == NULL)
+		return (ENXIO);
+	return (ada_dump_flush_periph(softc, periph));
+}
+
+static int
 adadump(void *arg, void *virtual, off_t offset, size_t length)
 {
 	struct	    cam_periph *periph;
@@ -1163,42 +1275,17 @@ adadump(void *arg, void *virtual, off_t offset, size_t length)
 			ata_28bit_cmd(&ataio, ATA_WRITE_DMA,
 			    0, lba, count);
 		}
-		error = cam_periph_runccb((union ccb *)&ataio, adaerror,
-		    0, SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+		error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
+		    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+		if (error == 0 && ataio.resid != 0)
+			error = EIO;
 		if (error != 0)
 			printf("Aborting dump due to I/O error.\n");
 
 		return (error);
 	}
 
-	if (softc->flags & ADA_FLAG_CAN_FLUSHCACHE) {
-		xpt_setup_ccb(&ataio.ccb_h, periph->path, CAM_PRIORITY_NORMAL);
-
-		/*
-		 * Tell the drive to flush its internal cache. if we
-		 * can't flush in 5s we have big problems. No need to
-		 * wait the default 60s to detect problems.
-		 */
-		ataio.ccb_h.ccb_state = ADA_CCB_DUMP;
-		cam_fill_ataio(&ataio,
-				    0,
-				    NULL,
-				    CAM_DIR_NONE,
-				    0,
-				    NULL,
-				    0,
-				    5*1000);
-
-		if (softc->flags & ADA_FLAG_CAN_48BIT)
-			ata_48bit_cmd(&ataio, ATA_FLUSHCACHE48, 0, 0, 0);
-		else
-			ata_28bit_cmd(&ataio, ATA_FLUSHCACHE, 0, 0, 0);
-		error = cam_periph_runccb((union ccb *)&ataio, adaerror,
-		    0, SF_NO_RECOVERY | SF_NO_RETRY, NULL);
-		if (error != 0)
-			xpt_print(periph->path, "Synchronize cache failed\n");
-	}
-	return (error);
+	return (ada_dump_flush_periph(softc, periph));
 }
 
 static void
@@ -1908,8 +1995,11 @@ adaregister(struct cam_periph *periph, void *arg)
 	softc->disk->d_close = adaclose;
 	softc->disk->d_strategy = adastrategy;
 	softc->disk->d_getattr = adagetattr;
-	if (cam_sim_pollable(periph->sim))
+	if (cam_sim_pollable(periph->sim)) {
 		softc->disk->d_dump = adadump;
+		softc->disk->d_dump_read = adadump_read;
+		softc->disk->d_dump_flush = adadump_flush;
+	}
 	softc->disk->d_gone = adadiskgonecb;
 	softc->disk->d_name = "ada";
 	softc->disk->d_drv1 = periph;

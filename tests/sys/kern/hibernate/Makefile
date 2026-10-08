@@ -16,9 +16,13 @@ PACKAGE=	tests
 TESTSDIR=	${TESTSBASE}/sys/kern/hibernate
 
 ATF_TESTS_C+=	hibernate_format_test
+ATF_TESTS_C+=	hibernate_marker_test
 
 SRCS.hibernate_format_test+=	hibernate_format_test.c
 SRCS.hibernate_format_test+=	kern_hibernate.c
+
+SRCS.hibernate_marker_test+=	hibernate_marker_test.c
+SRCS.hibernate_marker_test+=	kern_hibernate.c
 
 # Pull in kern_hibernate.c from the kernel source tree.
 .PATH:	${SRCTOP}/sys/kern
@@ -38,6 +42,7 @@ CFLAGS.kern_hibernate.c+=	-Wno-missing-prototypes
 # sys/sys/hibernate.h uses _Static_assert and HIBERNATE_LAYOUT_ASSERT;
 # those are compile-time-only and are safe in userland with C11.
 CFLAGS.hibernate_format_test.c+=	-D_HIBERNATE_USERLAND_BUILD
+CFLAGS.hibernate_marker_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 
 WARNS?=	3
 

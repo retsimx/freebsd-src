@@ -187,6 +187,8 @@ g_disk_kerneldump(struct bio *bp, struct disk *dp)
 		return;
 	}
 	gkd->di.dumper = dp->d_dump;
+	gkd->di.dumper_read = dp->d_dump_read;
+	gkd->di.dumper_flush = dp->d_dump_flush;
 	gkd->di.priv = dp;
 	gkd->di.blocksize = dp->d_sectorsize;
 	gkd->di.maxiosize = dp->d_maxsize;
