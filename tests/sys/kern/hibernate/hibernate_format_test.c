@@ -18,9 +18,9 @@
  *   golden_xsave_valid          — valid XSAVE + zero tail
  *   golden_padding_payload_start— valid padding/payload_start
  *   golden_pt_load_intervals    — valid PT_LOAD intervals
- *   golden_phnum_1              — 1 phdr success
- *   golden_phnum_2              — 2 phdr success
- *   golden_phnum_3              — 3 phdr success
+ *   golden_phnum_1              — literal phnum 1 rejected
+ *   golden_phnum_2              — literal phnum 2 rejected
+ *   golden_phnum_3              — minimum valid: CB + PCB + one PT_LOAD
  *   golden_phnum_900            — exact 900-phdr success
  *   malformed_phnum_0           — phdr count 0 rejected
  *   malformed_phnum_901         — phdr count 901 rejected
@@ -53,10 +53,14 @@
  *   malformed_metadata_too_large— metadata_length > 64029 rejected
  *   malformed_payload_start_too_large — payload_start > 65536 rejected
  *   malformed_payload_after_image — payload_start > image_length rejected
+ *   malformed_checked_overflow  — checked PT_LOAD end overflow rejected
+ *   malformed_payload_gap       — nonzero encoded zero gap rejected
+ *   malformed_destination_totals — CB/PT_LOAD totals mismatch rejected
+ *   arithmetic_boundaries       — 4 GiB through 2 TiB boundary vectors
+ *   attempt_initializer         — explicit absent-marker initialization
  *   crc_vector_empty            — CRC32C("") == 0x00000000
  *   crc_vector_123456789        — CRC32C("123456789") == 0xe3069283
- *   crc_whole_image_recompute   — independent whole-image CRC with zeroed CB
- * bytes crc_copy_list_bound_changes — changing hc_copy_list_bound changes CRC
+ *   crc_whole_image_recompute   — independent full-image CRC and mutations
  *   iterator_ordering           — intervals are strictly increasing
  *   iterator_adjacency          — intervals are adjacent (no gaps or overlaps)
  *   iterator_coverage           — exact [0, image_length) coverage
@@ -138,6 +142,23 @@ test_crc32c(const void *buf, size_t len)
 {
 	return (test_crc32c_update(UINT32_C(0xffffffff), buf, len) ^
 	    UINT32_C(0xffffffff));
+}
+
+static uint32_t
+test_image_crc32c(const uint8_t *buf, size_t len, size_t zero_offset)
+{
+	static const uint8_t zero[HIBERNATE_CB_WIDTH_CRC32C] = { 0 };
+	uint32_t crc;
+
+	ATF_REQUIRE(zero_offset <= len);
+	ATF_REQUIRE(HIBERNATE_CB_WIDTH_CRC32C <= len - zero_offset);
+	crc = UINT32_C(0xffffffff);
+	crc = test_crc32c_update(crc, buf, zero_offset);
+	crc = test_crc32c_update(crc, zero, sizeof(zero));
+	crc = test_crc32c_update(crc,
+	    buf + zero_offset + HIBERNATE_CB_WIDTH_CRC32C,
+	    len - zero_offset - HIBERNATE_CB_WIDTH_CRC32C);
+	return (crc ^ UINT32_C(0xffffffff));
 }
 
 /* ------------------------------------------------------------------ */
@@ -293,7 +314,7 @@ write_cb(uint8_t *buf, uint64_t cb_offset, uint64_t image_length,
 
 /*
  * write_pcb: encode a valid 1024-byte PCB at buf+pcb_offset.
- * Uses x87+SSE only (XCR0 = 0x3, xsave_length = 512).
+ * Uses x87+SSE only (XCR0 = 0x3, xsave_length = 576).
  */
 static void
 write_pcb(uint8_t *buf, uint64_t pcb_offset)
@@ -554,37 +575,37 @@ ATF_TC_WITHOUT_HEAD(golden_phnum_1);
 ATF_TC_BODY(golden_phnum_1, tc)
 {
 	static uint8_t buf[HIB_PAGE_SIZE * 5];
-	uint64_t ps;
 	struct hibernate_image img;
+	uint64_t ps;
 
 	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
-	ATF_CHECK_EQ(0, hibernate_image_decode(buf, ps, &img));
-	ATF_CHECK_EQ(1U, img.hi_load_count);
-	ATF_CHECK_EQ(3U, img.hi_phnum); /* CB + PCB + 1 load */
+	le16enc_p(buf + EHDR_OFF_E_PHNUM, 1);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
 }
 
 ATF_TC_WITHOUT_HEAD(golden_phnum_2);
 ATF_TC_BODY(golden_phnum_2, tc)
 {
-	static uint8_t buf[HIB_PAGE_SIZE * 6];
-	uint64_t ps;
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
 	struct hibernate_image img;
+	uint64_t ps;
 
-	ps = build_image(buf, sizeof(buf), 2, HIB_PAGE_SIZE * 6);
-	ATF_CHECK_EQ(0, hibernate_image_decode(buf, ps, &img));
-	ATF_CHECK_EQ(2U, img.hi_load_count);
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	le16enc_p(buf + EHDR_OFF_E_PHNUM, 2);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
 }
 
 ATF_TC_WITHOUT_HEAD(golden_phnum_3);
 ATF_TC_BODY(golden_phnum_3, tc)
 {
-	static uint8_t buf[HIB_PAGE_SIZE * 7];
-	uint64_t ps;
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
 	struct hibernate_image img;
+	uint64_t ps;
 
-	ps = build_image(buf, sizeof(buf), 3, HIB_PAGE_SIZE * 7);
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
 	ATF_CHECK_EQ(0, hibernate_image_decode(buf, ps, &img));
-	ATF_CHECK_EQ(3U, img.hi_load_count);
+	ATF_CHECK_EQ(1U, img.hi_load_count);
+	ATF_CHECK_EQ(3U, img.hi_phnum);
 }
 
 ATF_TC_WITHOUT_HEAD(golden_phnum_900);
@@ -1068,6 +1089,88 @@ ATF_TC_BODY(malformed_payload_after_image, tc)
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 }
 
+ATF_TC_WITHOUT_HEAD(malformed_checked_overflow);
+ATF_TC_BODY(malformed_checked_overflow, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint8_t *ph;
+	uint64_t ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	ph = buf + EHDR_SIZE + 2 * PHDR_SIZE;
+	le64enc_p(ph + PHDR_OFF_P_OFFSET, UINT64_MAX - HIB_PAGE_SIZE + 1);
+	ATF_CHECK_EQ(EOVERFLOW, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_payload_gap);
+ATF_TC_BODY(malformed_payload_gap, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t cb_off, pcb_off, pcb_end, ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
+	pcb_off = align_up(cb_off + HIBERNATE_CB_ENCODED_SIZE, HIB_PAGE_SIZE);
+	pcb_end = pcb_off + HIBERNATE_PCB_ENCODED_SIZE;
+	ATF_REQUIRE(pcb_end < ps);
+	buf[pcb_end] = 0xa5;
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_destination_totals);
+ATF_TC_BODY(malformed_destination_totals, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t cb_off, ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
+	le64enc_p(buf + cb_off + HIBERNATE_CB_OFF_DESTINATION_PAGES, 2);
+	le64enc_p(buf + cb_off + HIBERNATE_CB_OFF_DESTINATION_BYTES,
+	    2 * HIB_PAGE_SIZE);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(arithmetic_boundaries);
+ATF_TC_BODY(arithmetic_boundaries, tc)
+{
+	static const uint64_t bounds[] = { UINT64_C(4) * 1024 * 1024 * 1024,
+		UINT64_C(16) * 1024 * 1024 * 1024,
+		UINT64_C(1) * 1024 * 1024 * 1024 * 1024,
+		UINT64_C(2) * 1024 * 1024 * 1024 * 1024 };
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint8_t *ph;
+	uint64_t cb_off, ps;
+	size_t i;
+
+	for (i = 0; i < nitems(bounds); i++) {
+		ps = build_image(buf, sizeof(buf), 1, bounds[i]);
+		cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
+		ph = buf + EHDR_SIZE + 2 * PHDR_SIZE;
+
+		le64enc_p(ph + PHDR_OFF_P_OFFSET, bounds[i] - HIB_PAGE_SIZE);
+		ATF_CHECK_EQ_MSG(0, hibernate_image_decode(buf, ps, &img),
+		    "exact boundary %#jx", (uintmax_t)bounds[i]);
+
+		le64enc_p(ph + PHDR_OFF_P_OFFSET, bounds[i]);
+		ATF_CHECK_EQ_MSG(EINVAL, hibernate_image_decode(buf, ps, &img),
+		    "first page over boundary %#jx", (uintmax_t)bounds[i]);
+	}
+}
+
+ATF_TC_WITHOUT_HEAD(attempt_initializer);
+ATF_TC_BODY(attempt_initializer, tc)
+{
+	struct hibernate_attempt attempt = HIBERNATE_ATTEMPT_INIT;
+
+	ATF_CHECK_EQ(HMC_ABSENT, attempt.ha_marker_result.hmr_class);
+	ATF_CHECK_EQ(0, attempt.ha_marker_result.hmr_error);
+}
+
 /* ------------------------------------------------------------------ */
 /* CRC tests                                                            */
 /* ------------------------------------------------------------------ */
@@ -1098,150 +1201,41 @@ ATF_TC_BODY(crc_vector_123456789, tc)
 ATF_TC_WITHOUT_HEAD(crc_whole_image_recompute);
 ATF_TC_BODY(crc_whole_image_recompute, tc)
 {
-	/*
-	 * Build a valid image, compute the whole-image CRC using the
-	 * independent oracle (zeroing only the 8 CB CRC bytes), then
-	 * verify hibernate_image_crc32c() agrees.
-	 *
-	 * Oracle approach: compute CRC over the entire metadata prefix
-	 * with the 8 bytes at cb_off+0x078 treated as zero.
-	 */
 	static uint8_t buf[HIB_PAGE_SIZE * 5];
-	uint64_t ps;
 	struct hibernate_image img;
-	uint32_t oracle_crc, prod_crc;
-	int err;
+	uint64_t cb_off, crc_off, image_len, ps;
+	uint32_t crc, stored;
+	size_t i;
 
-	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
-	err = hibernate_image_decode(buf, ps, &img);
-	ATF_REQUIRE_EQ(0, err);
+	image_len = sizeof(buf);
+	ps = build_image(buf, sizeof(buf), 1, image_len);
+	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
+	crc_off = cb_off + HIBERNATE_CB_OFF_CRC32C;
 
-	/*
-	 * Independent oracle: walk [0, ps) with the 8 CRC bytes zeroed.
-	 * The image has no payload STORED intervals reachable via prefix,
-	 * so hibernate_image_crc32c covers only the metadata portion.
+	/* Supply nonzero bytes in the real PT_LOAD payload. */
+	for (i = (size_t)ps; i < (size_t)ps + HIB_PAGE_SIZE; i++)
+		buf[i] = (uint8_t)(i * 37U + 11U);
+
+	crc = test_image_crc32c(buf, sizeof(buf), (size_t)crc_off);
+	le64enc_p(buf + crc_off, crc);
+	ATF_REQUIRE_EQ(0, hibernate_image_decode(buf, ps, &img));
+	stored = img.hi_cb.hc_crc32c;
+	ATF_CHECK_EQ(stored,
+	    test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
+
+	/* The stored field is virtually zero and cannot affect recomputation.
 	 */
-	{
-		uint64_t zero_start = img.hi_crc_zero_offset;
-		uint64_t zero_end = zero_start + img.hi_crc_zero_length;
-		uint32_t crc = UINT32_C(0xffffffff);
-		static const uint8_t zbytes[8] = { 0 };
+	le32enc_p(buf + crc_off, stored ^ UINT32_C(0x5a5a5a5a));
+	ATF_CHECK_EQ(crc, test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
 
-		ATF_REQUIRE(zero_end <= ps);
-		ATF_REQUIRE_EQ(8U, (unsigned)img.hi_crc_zero_length);
+	/* Every other covered mutation must affect recomputation. */
+	le32enc_p(buf + crc_off, stored);
+	buf[cb_off + HIBERNATE_CB_OFF_COPY_LIST_BOUND] ^= 1;
+	ATF_CHECK(crc != test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
+	buf[cb_off + HIBERNATE_CB_OFF_COPY_LIST_BOUND] ^= 1;
 
-		/* [0, zero_start) */
-		crc = test_crc32c_update(crc, buf, (size_t)zero_start);
-		/* [zero_start, zero_end): virtual zeros */
-		crc = test_crc32c_update(crc, zbytes,
-		    (size_t)(zero_end - zero_start));
-		/* [zero_end, ps) */
-		crc = test_crc32c_update(crc, buf + zero_end,
-		    (size_t)(ps - zero_end));
-		/*
-		 * The image has PT_LOAD segments beyond ps.  The iterator
-		 * will walk those as ZERO_GAP (since we don't have the
-		 * payload buffer).  For metadata-only verification we only
-		 * compare the metadata prefix CRC contribution; full-image
-		 * CRC requires the payload buffer which is not supplied.
-		 *
-		 * hibernate_image_crc32c returns ENOTSUP when it hits a
-		 * payload STORED interval without a backing buffer.  Test
-		 * that it does NOT return ENOTSUP here because our PT_LOAD
-		 * intervals start at payload_start (>= ps), i.e., outside
-		 * the prefix.
-		 *
-		 * Actually: for a single PT_LOAD the iterator will emit
-		 * HIIC_STORED for the PT_LOAD region which is beyond
-		 * hi_prefix_length.  So hibernate_image_crc32c returns
-		 * ENOTSUP.  We test the metadata-prefix portion separately.
-		 */
-		oracle_crc = crc ^ UINT32_C(0xffffffff);
-	}
-
-	/*
-	 * For a full-image CRC test, use a fixture with no PT_LOAD
-	 * beyond the prefix.  We do this by checking the oracle against
-	 * the production CRC on the metadata region only.
-	 *
-	 * The simplest check: changing hc_copy_list_bound in the CB must
-	 * change what hibernate_image_crc32c returns if it is recomputed
-	 * over the actual stored bytes (the CRC field itself is zeroed).
-	 * This is tested in crc_copy_list_bound_changes.
-	 *
-	 * Here we just verify oracle_crc is deterministic (non-trivial
-	 * value that is not 0x00000000 or 0xffffffff).
-	 */
-	ATF_CHECK(oracle_crc != UINT32_C(0x00000000));
-	ATF_CHECK(oracle_crc != UINT32_C(0xffffffff));
-
-	/*
-	 * Verify hibernate_image_crc32c returns ENOTSUP (expected when
-	 * payload STORED intervals cannot be backed by the prefix alone).
-	 */
-	err = hibernate_image_crc32c(&img, &prod_crc);
-	ATF_CHECK_EQ(ENOTSUP, err);
-
-	(void)prod_crc;
-}
-
-ATF_TC_WITHOUT_HEAD(crc_copy_list_bound_changes);
-ATF_TC_BODY(crc_copy_list_bound_changes, tc)
-{
-	/*
-	 * Build two images differing only in hc_copy_list_bound.
-	 * Compute the independent oracle CRC over the metadata prefix
-	 * (zeroing the 8 CRC bytes) for each; verify they differ.
-	 */
-	static uint8_t buf1[HIB_PAGE_SIZE * 5];
-	static uint8_t buf2[HIB_PAGE_SIZE * 5];
-	uint64_t ps1, ps2;
-	struct hibernate_image img1, img2;
-	int err;
-	uint32_t crc1, crc2;
-
-	ps1 = build_image(buf1, sizeof(buf1), 1, HIB_PAGE_SIZE * 5);
-	ps2 = build_image(buf2, sizeof(buf2), 1, HIB_PAGE_SIZE * 5);
-
-	/* Alter hc_copy_list_bound in buf2. */
-	uint64_t cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
-	le64enc_p(buf2 + cb_off + HIBERNATE_CB_OFF_COPY_LIST_BOUND, 0x999);
-
-	err = hibernate_image_decode(buf1, ps1, &img1);
-	ATF_REQUIRE_EQ(0, err);
-	err = hibernate_image_decode(buf2, ps2, &img2);
-	ATF_REQUIRE_EQ(0, err);
-
-	/* Oracle CRC over [0, ps) with CRC field zeroed. */
-	{
-		uint64_t z1s = img1.hi_crc_zero_offset;
-		uint64_t z1e = z1s + img1.hi_crc_zero_length;
-		static const uint8_t zbytes[8] = { 0 };
-		uint32_t c;
-
-		c = UINT32_C(0xffffffff);
-		c = test_crc32c_update(c, buf1, (size_t)z1s);
-		c = test_crc32c_update(c, zbytes, (size_t)(z1e - z1s));
-		c = test_crc32c_update(c, buf1 + z1e, (size_t)(ps1 - z1e));
-		crc1 = c ^ UINT32_C(0xffffffff);
-	}
-	{
-		uint64_t z2s = img2.hi_crc_zero_offset;
-		uint64_t z2e = z2s + img2.hi_crc_zero_length;
-		static const uint8_t zbytes[8] = { 0 };
-		uint32_t c;
-
-		c = UINT32_C(0xffffffff);
-		c = test_crc32c_update(c, buf2, (size_t)z2s);
-		c = test_crc32c_update(c, zbytes, (size_t)(z2e - z2s));
-		c = test_crc32c_update(c, buf2 + z2e, (size_t)(ps2 - z2e));
-		crc2 = c ^ UINT32_C(0xffffffff);
-	}
-
-	ATF_CHECK_MSG(crc1 != crc2,
-	    "CRCs should differ when hc_copy_list_bound differs: "
-	    "crc1=0x%08x crc2=0x%08x",
-	    crc1, crc2);
+	buf[ps + 17] ^= 1;
+	ATF_CHECK(crc != test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1503,10 +1497,14 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, malformed_metadata_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_start_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_after_image);
+	ATF_TP_ADD_TC(tp, malformed_checked_overflow);
+	ATF_TP_ADD_TC(tp, malformed_payload_gap);
+	ATF_TP_ADD_TC(tp, malformed_destination_totals);
+	ATF_TP_ADD_TC(tp, arithmetic_boundaries);
+	ATF_TP_ADD_TC(tp, attempt_initializer);
 	ATF_TP_ADD_TC(tp, crc_vector_empty);
 	ATF_TP_ADD_TC(tp, crc_vector_123456789);
 	ATF_TP_ADD_TC(tp, crc_whole_image_recompute);
-	ATF_TP_ADD_TC(tp, crc_copy_list_bound_changes);
 	ATF_TP_ADD_TC(tp, iterator_ordering);
 	ATF_TP_ADD_TC(tp, iterator_adjacency);
 	ATF_TP_ADD_TC(tp, iterator_coverage);

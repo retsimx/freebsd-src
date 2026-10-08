@@ -42,7 +42,7 @@
  *   PCB version=1 encoded_size=1024
  *   PCB cr0=0x... cr3=0x... cr4=0x...
  *   PCB rip=0x... rsp=0x...
- *   PCB xcr0=0x3 xsave_length=512 xsave_format=1
+ *   PCB xcr0=0x3 xsave_length=576 xsave_format=1
  *   layout: phnum=3 load_segments=1 cb_offset=0x1000 pcb_offset=0x2000
  *   layout: payload_start=0x3000 image_length=0x100000000
  *   intervals:
