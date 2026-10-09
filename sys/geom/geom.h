@@ -359,6 +359,9 @@ extern struct sx topology_lock;
 struct g_kerneldump {
 	off_t		offset;
 	off_t		length;
+	char provider_name[SPECNAMELEN];
+	uint64_t provider_media_size;
+	bool provider_valid;
 	struct dumperinfo di;
 };
 
