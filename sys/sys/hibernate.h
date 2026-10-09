@@ -9,6 +9,7 @@
 
 #include <sys/cdefs.h>
 #include <sys/types.h>
+#include <sys/param.h>
 #include <sys/_stdint.h>
 
 struct dumperinfo;
@@ -45,6 +46,7 @@ struct dumperinfo;
  * ABI 1 marker values.  Zero magic means clear/absent; the magic value is
  * opaque to K-3 and owned by K-4 classification.
  */
+#define HIBERNATE_MARKER_MAGIC		 UINT64_C(0x48494245524e4154)
 #define HIBERNATE_MARKER_VERSION	 1
 #define HIBERNATE_MARKER_STATE_PENDING	 1
 #define HIBERNATE_MARKER_STATE_CONSUMING 2
@@ -317,29 +319,68 @@ struct hibernate_image_iterator {
 	int hii_error;
 };
 
+struct hibernate_provider_id {
+	char name[SPECNAMELEN];
+	uint64_t media_size;
+};
+
 enum hibernate_marker_class {
 	HMC_ABSENT,
 	HMC_PENDING,
-	HMC_CONSUMING,
+	HMC_STALE_CONSUMING,
 	HMC_CONSUMED,
-	HMC_INVALID,
+	HMC_MALFORMED,
 	HMC_IO_ERROR
 };
 
 struct hibernate_marker_result {
-	enum hibernate_marker_class hmr_class;
-	int hmr_error;
-	struct hibernate_marker hmr_marker;
+	enum hibernate_marker_class class;
+	struct hibernate_marker marker;
+	int error;
 };
 
 struct hibernate_attempt {
 	struct hibernate_marker_result ha_marker_result;
 	struct dumperinfo *ha_dumper; /* Borrowed; NULL means unbound. */
-	off_t ha_marker_offset;	      /* Validated absolute marker offset P. */
+	off_t ha_marker_offset;	      /* Backend marker I/O offset. */
+	uint64_t ha_provider_offset;  /* Provider-relative marker offset P. */
+	uint64_t ha_provider_size;    /* Full logical provider size. */
 };
 
 #define HIBERNATE_ATTEMPT_INIT \
-	{ .ha_marker_result = { .hmr_class = HMC_ABSENT, .hmr_error = 0 } }
+	{ .ha_marker_result = { .class = HMC_ABSENT, .error = 0 } }
+
+int hibernate_probe(struct hibernate_attempt *ha);
+bool hibernate_provider_conflicts(const struct hibernate_provider_id *id);
+int hibernate_extent_hold(const struct hibernate_provider_id *id,
+    uint64_t offset, uint64_t length);
+void hibernate_extent_release(const struct hibernate_provider_id *id);
+void hibernate_marker_decode_complete(const uint8_t *buf,
+    struct hibernate_marker *marker, uint32_t *reserved);
+enum hibernate_marker_class hibernate_marker_classify(uint64_t marker_offset,
+    uint64_t media_size, const struct hibernate_marker *marker,
+    uint32_t reserved);
+
+/*
+ * Internal K-4 interfaces shared with the single-purpose GEOM owner.
+ * These are kernel-only lifecycle operations, not persistent ABI.
+ */
+#ifdef _KERNEL
+struct hibernate_config {
+	char hc_name[SPECNAMELEN];
+	unsigned int hc_wait_ms;
+	bool hc_enabled;
+};
+
+int hibernate_config_get(struct hibernate_config *config);
+int hibernate_dumper_lookup(const struct hibernate_provider_id *id,
+    struct dumperinfo **dip);
+int hibernate_owner_publish(const struct hibernate_provider_id *id);
+void hibernate_owner_deactivate(const struct hibernate_provider_id *id);
+void hibernate_probe_begin(void);
+void hibernate_probe_complete(void);
+bool hibernate_probe_active(void);
+#endif
 
 int hibernate_image_decode(const void *, size_t, struct hibernate_image *);
 int hibernate_image_interval_next(struct hibernate_image_iterator *,
