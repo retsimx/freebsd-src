@@ -78,6 +78,7 @@
 #include <sys/eventhandler.h>
 #include <sys/exterrvar.h>
 #include <sys/fcntl.h>
+#include <sys/hibernate.h>
 #include <sys/limits.h>
 #include <sys/lock.h>
 #include <sys/kernel.h>
@@ -2646,6 +2647,8 @@ int
 sys_swapon(struct thread *td, struct swapon_args *uap)
 {
 	struct vattr attr;
+	struct hibernate_provider_id id;
+	struct g_provider *pp;
 	struct vnode *vp;
 	struct nameidata nd;
 	int error;
@@ -2675,7 +2678,20 @@ sys_swapon(struct thread *td, struct swapon_args *uap)
 	vp = nd.ni_vp;
 
 	if (vn_isdisk_error(vp, &error)) {
-		error = swapongeom(vp);
+		memset(&id, 0, sizeof(id));
+		g_topology_lock();
+		pp = g_dev_getprovider(vp->v_rdev);
+		if (pp == NULL || pp->mediasize <= 0 ||
+		    strlcpy(id.name, pp->name, sizeof(id.name)) >=
+			sizeof(id.name)) {
+			error = ENODEV;
+		} else {
+			id.media_size = (uint64_t)pp->mediasize;
+			error = hibernate_provider_conflicts(&id) ? EBUSY : 0;
+		}
+		g_topology_unlock();
+		if (error == 0)
+			error = swapongeom(vp);
 	} else if (vp->v_type == VREG &&
 	    (vp->v_mount->mnt_vfc->vfc_flags & VFCF_NETWORK) != 0 &&
 	    (error = VOP_GETATTR(vp, &attr, td->td_ucred)) == 0) {
