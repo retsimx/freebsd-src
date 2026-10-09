@@ -43,6 +43,12 @@
 #include <sys/endian.h>
 #include <sys/errno.h>
 #include <sys/hibernate.h>
+#include <sys/kernel.h>
+#include <sys/kerneldump.h>
+#include <sys/lock.h>
+#include <sys/mutex.h>
+
+#include <machine/atomic.h>
 #endif /* _HIBERNATE_USERLAND_BUILD */
 
 /* ELF magic bytes. */
@@ -362,6 +368,371 @@ hibernate_marker_flush(struct hibernate_attempt *ha)
 		return (EOPNOTSUPP);
 	return (di->dumper_flush(di));
 }
+
+void
+hibernate_marker_decode_complete(const uint8_t *buf,
+    struct hibernate_marker *marker, uint32_t *reserved)
+{
+	memset(marker, 0, sizeof(*marker));
+	marker->hm_magic = le64dec(buf + HIBERNATE_MARKER_OFF_MAGIC);
+	marker->hm_version = le32dec(buf + HIBERNATE_MARKER_OFF_VERSION);
+	marker->hm_state = le32dec(buf + HIBERNATE_MARKER_OFF_STATE);
+	marker->hm_image_offset = le64dec(
+	    buf + HIBERNATE_MARKER_OFF_IMAGE_OFFSET);
+	marker->hm_image_length = le64dec(
+	    buf + HIBERNATE_MARKER_OFF_IMAGE_LENGTH);
+	marker->hm_crc32c = le32dec(buf + HIBERNATE_MARKER_OFF_CRC32C);
+	*reserved = le32dec(buf + HIBERNATE_MARKER_OFF_RESERVED_024);
+}
+
+enum hibernate_marker_class
+hibernate_marker_classify(uint64_t marker_offset, uint64_t media_size,
+    const struct hibernate_marker *marker, uint32_t reserved)
+{
+	uint64_t expected, image_end, media_end;
+
+	if (marker->hm_magic == 0)
+		return (HMC_ABSENT);
+	if (marker->hm_magic != HIBERNATE_MARKER_MAGIC ||
+	    marker->hm_version != HIBERNATE_MARKER_VERSION || reserved != 0)
+		return (HMC_MALFORMED);
+	if (media_size == 0 ||
+	    __builtin_add_overflow(marker_offset, media_size, &media_end) ||
+	    __builtin_add_overflow(marker_offset, HIBERNATE_METADATA_SIZE,
+		&expected) ||
+	    marker->hm_image_offset != expected ||
+	    marker->hm_image_length == 0 ||
+	    __builtin_add_overflow(marker->hm_image_offset,
+		marker->hm_image_length, &image_end) ||
+	    image_end > media_end)
+		return (HMC_MALFORMED);
+
+	switch (marker->hm_state) {
+	case HIBERNATE_MARKER_STATE_PENDING:
+		return (HMC_PENDING);
+	case HIBERNATE_MARKER_STATE_CONSUMING:
+		return (HMC_STALE_CONSUMING);
+	case HIBERNATE_MARKER_STATE_CONSUMED:
+		return (HMC_CONSUMED);
+	default:
+		return (HMC_MALFORMED);
+	}
+}
+
+#ifndef _HIBERNATE_USERLAND_BUILD
+
+struct hibernate_provider_owner {
+	struct hibernate_provider_id id;
+	struct mtx lock;
+	uint64_t extent_offset;
+	uint64_t extent_length;
+	volatile u_int published;
+	volatile u_int active;
+	bool extent_held;
+};
+
+static struct hibernate_provider_owner hibernate_owner;
+MTX_SYSINIT(hibernate_owner, &hibernate_owner.lock, "hibernate owner", MTX_DEF);
+
+static struct hibernate_config hibernate_config;
+static volatile u_int hibernate_config_state;
+static volatile u_int hibernate_probe_pending;
+
+static bool
+hibernate_provider_id_valid(const struct hibernate_provider_id *id)
+{
+	size_t length;
+
+	if (id == NULL || id->media_size == 0)
+		return (false);
+	length = strnlen(id->name, sizeof(id->name));
+	return (length != 0 && length < sizeof(id->name));
+}
+
+static bool
+hibernate_provider_id_equal(const struct hibernate_provider_id *a,
+    const struct hibernate_provider_id *b)
+{
+	return (a->media_size == b->media_size &&
+	    memcmp(a->name, b->name, sizeof(a->name)) == 0);
+}
+
+int
+hibernate_config_get(struct hibernate_config *config)
+{
+	char *dev, *resume, *wait;
+	unsigned long value;
+	bool resume_enabled;
+	char *end;
+	size_t length;
+	int error;
+
+	if (config == NULL)
+		return (EINVAL);
+	if (atomic_load_acq_int(&hibernate_config_state) == 0) {
+		memset(&hibernate_config, 0, sizeof(hibernate_config));
+		hibernate_config.hc_wait_ms = 15000;
+		error = 0;
+		resume_enabled = true;
+
+		resume = kern_getenv("kern.hibernate.resume");
+		if (resume != NULL) {
+			if (strcmp(resume, "0") == 0)
+				resume_enabled = false;
+			else if (strcmp(resume, "1") != 0)
+				error = EINVAL;
+			freeenv(resume);
+		}
+
+		dev = kern_getenv("kern.hibernate.dev");
+		if (dev != NULL) {
+			length = strnlen(dev, SPECNAMELEN);
+			if (length == 0) {
+				hibernate_config.hc_enabled = false;
+			} else if (length == SPECNAMELEN ||
+			    strncmp(dev, "/dev/", 5) == 0 || dev[0] == ' ' ||
+			    dev[length - 1] == ' ') {
+				error = length == SPECNAMELEN ? ENAMETOOLONG :
+								EINVAL;
+			} else {
+				memcpy(hibernate_config.hc_name, dev,
+				    length + 1);
+				hibernate_config.hc_enabled = resume_enabled;
+			}
+			freeenv(dev);
+		}
+
+		wait = kern_getenv("kern.hibernate.wait_ms");
+		if (wait != NULL) {
+			end = NULL;
+			value = strtoul(wait, &end, 10);
+			if (end == wait || *end != '\0' || value == 0 ||
+			    value > UINT_MAX)
+				error = EINVAL;
+			else
+				hibernate_config.hc_wait_ms = (unsigned int)
+				    value;
+			freeenv(wait);
+		}
+		if (error != 0) {
+			hibernate_config.hc_enabled = true;
+			hibernate_config.hc_wait_ms = 0;
+		}
+		atomic_store_rel_int(&hibernate_config_state,
+		    error == 0 ? 1 : (u_int)error + 1);
+	}
+	error = atomic_load_acq_int(&hibernate_config_state);
+	*config = hibernate_config;
+	return (error == 1 ? 0 : error - 1);
+}
+
+int
+hibernate_owner_publish(const struct hibernate_provider_id *id)
+{
+	if (!hibernate_provider_id_valid(id))
+		return (EINVAL);
+	mtx_lock(&hibernate_owner.lock);
+	if (hibernate_owner.published != 0) {
+		mtx_unlock(&hibernate_owner.lock);
+		return (hibernate_provider_id_equal(&hibernate_owner.id, id) ?
+			EALREADY :
+			EBUSY);
+	}
+	hibernate_owner.id = *id;
+	atomic_store_rel_int(&hibernate_owner.published, 1);
+	atomic_store_rel_int(&hibernate_owner.active, 1);
+	mtx_unlock(&hibernate_owner.lock);
+	return (0);
+}
+
+void
+hibernate_owner_deactivate(const struct hibernate_provider_id *id)
+{
+	if (!hibernate_provider_id_valid(id) ||
+	    atomic_load_acq_int(&hibernate_owner.published) == 0)
+		return;
+	mtx_lock(&hibernate_owner.lock);
+	if (hibernate_provider_id_equal(&hibernate_owner.id, id))
+		atomic_store_rel_int(&hibernate_owner.active, 0);
+	mtx_unlock(&hibernate_owner.lock);
+}
+
+void
+hibernate_probe_begin(void)
+{
+	atomic_store_rel_int(&hibernate_probe_pending, 1);
+}
+
+void
+hibernate_probe_complete(void)
+{
+	atomic_store_rel_int(&hibernate_probe_pending, 0);
+}
+
+bool
+hibernate_probe_active(void)
+{
+	return (atomic_load_acq_int(&hibernate_probe_pending) != 0 ||
+	    (atomic_load_acq_int(&hibernate_owner.published) != 0 &&
+		atomic_load_acq_int(&hibernate_owner.active) != 0));
+}
+
+bool
+hibernate_provider_conflicts(const struct hibernate_provider_id *id)
+{
+	if (!hibernate_provider_id_valid(id) ||
+	    atomic_load_acq_int(&hibernate_owner.published) == 0 ||
+	    atomic_load_acq_int(&hibernate_owner.active) == 0)
+		return (false);
+	return (hibernate_provider_id_equal(&hibernate_owner.id, id));
+}
+
+int
+hibernate_extent_hold(const struct hibernate_provider_id *id, uint64_t offset,
+    uint64_t length)
+{
+	uint64_t end;
+	int error;
+
+	if (!hibernate_provider_conflicts(id))
+		return (ENOENT);
+	if (length == 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(offset, length, &end))
+		return (EOVERFLOW);
+	if (end > id->media_size)
+		return (EINVAL);
+
+	error = 0;
+	mtx_lock(&hibernate_owner.lock);
+	if (!hibernate_provider_id_equal(&hibernate_owner.id, id))
+		error = ENOENT;
+	else if (hibernate_owner.extent_held)
+		error = EBUSY;
+	else {
+		hibernate_owner.extent_offset = offset;
+		hibernate_owner.extent_length = length;
+		hibernate_owner.extent_held = true;
+	}
+	mtx_unlock(&hibernate_owner.lock);
+	return (error);
+}
+
+void
+hibernate_extent_release(const struct hibernate_provider_id *id)
+{
+	bool match;
+
+	if (!hibernate_provider_id_valid(id))
+		return;
+	mtx_lock(&hibernate_owner.lock);
+	match = hibernate_provider_id_equal(&hibernate_owner.id, id) &&
+	    hibernate_owner.extent_held;
+	KASSERT(match, ("hibernate extent release mismatch"));
+	if (match) {
+		hibernate_owner.extent_held = false;
+		hibernate_owner.extent_offset = 0;
+		hibernate_owner.extent_length = 0;
+		wakeup(&hibernate_owner);
+	}
+	mtx_unlock(&hibernate_owner.lock);
+}
+
+int
+hibernate_dumper_lookup(const struct hibernate_provider_id *id,
+    struct dumperinfo **dip)
+{
+	struct dumperinfo *di;
+	int error;
+
+	if (!hibernate_provider_id_valid(id) || dip == NULL)
+		return (EINVAL);
+	*dip = NULL;
+	error = ENXIO;
+	mtx_lock(&dumpconf_list_lk);
+	TAILQ_FOREACH(di, &dumper_configs, di_next) {
+		if (!di->provider_valid ||
+		    di->provider_media_size != id->media_size ||
+		    strncmp(di->provider_name, id->name,
+			sizeof(di->provider_name)) != 0)
+			continue;
+		if (dumper_hold(di)) {
+			*dip = di;
+			error = 0;
+		}
+		break;
+	}
+	mtx_unlock(&dumpconf_list_lk);
+	return (error);
+}
+
+struct hibernate_raw_marker {
+	uint8_t sector[DEV_BSIZE];
+	size_t transferred;
+	int error;
+};
+
+static void
+hibernate_marker_read_raw(struct hibernate_attempt *ha,
+    struct hibernate_raw_marker *raw)
+{
+	struct dumperinfo *di;
+	off_t offset;
+	int error;
+
+	memset(raw, 0, sizeof(*raw));
+	error = hibernate_marker_binding(ha, true, false, &di, &offset);
+	if (error != 0) {
+		raw->error = error;
+		return;
+	}
+	error = di->dumper_read(di->priv, raw->sector, offset,
+	    sizeof(raw->sector));
+	if (error != 0) {
+		raw->error = error;
+		return;
+	}
+	raw->transferred = sizeof(raw->sector);
+	if (raw->transferred != sizeof(raw->sector))
+		raw->error = EIO;
+}
+
+int
+hibernate_probe(struct hibernate_attempt *ha)
+{
+	struct hibernate_marker_result result;
+	struct hibernate_raw_marker raw;
+	uint32_t reserved;
+	int error;
+
+	memset(&result, 0, sizeof(result));
+	result.class = HMC_ABSENT;
+	if (ha == NULL)
+		return (EINVAL);
+
+	if (ha->ha_dumper == NULL) {
+		result.class = HMC_IO_ERROR;
+		result.error = ENXIO;
+		ha->ha_marker_result = result;
+		return (ENXIO);
+	}
+	hibernate_marker_read_raw(ha, &raw);
+	if (raw.error != 0 || raw.transferred != sizeof(raw.sector)) {
+		error = raw.error != 0 ? raw.error : EIO;
+		result.class = HMC_IO_ERROR;
+		result.error = error;
+		ha->ha_marker_result = result;
+		return (error);
+	}
+
+	hibernate_marker_decode_complete(raw.sector, &result.marker, &reserved);
+	result.class = hibernate_marker_classify(ha->ha_provider_offset,
+	    ha->ha_provider_size, &result.marker, reserved);
+	result.error = 0;
+	ha->ha_marker_result = result;
+	return (0);
+}
+#endif /* !_HIBERNATE_USERLAND_BUILD */
 
 /*
  * decode_cb: decode and validate the CB from buf at cb_offset.
