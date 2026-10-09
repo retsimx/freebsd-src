@@ -54,6 +54,7 @@
 #include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/filedesc.h>
+#include <sys/hibernate.h>
 #include <sys/reboot.h>
 #include <sys/sbuf.h>
 #include <sys/stat.h>
@@ -1025,7 +1026,8 @@ vfs_mountroot_wait_if_neccessary(const char *fs, const char *dev)
 	 */
 	if (strcmp(fs, "zfs") == 0 || strstr(fs, "nfs") != NULL ||
 	    strcmp(fs, "p9fs") == 0 ||
-	    dev[0] == '\0' || root_mount_always_wait != 0) {
+	    dev[0] == '\0' || root_mount_always_wait != 0 ||
+	    hibernate_probe_active()) {
 		vfs_mountroot_wait();
 		return (0);
 	}
