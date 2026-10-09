@@ -1167,8 +1167,8 @@ ATF_TC_BODY(attempt_initializer, tc)
 {
 	struct hibernate_attempt attempt = HIBERNATE_ATTEMPT_INIT;
 
-	ATF_CHECK_EQ(HMC_ABSENT, attempt.ha_marker_result.hmr_class);
-	ATF_CHECK_EQ(0, attempt.ha_marker_result.hmr_error);
+	ATF_CHECK_EQ(HMC_ABSENT, attempt.ha_marker_result.class);
+	ATF_CHECK_EQ(0, attempt.ha_marker_result.error);
 }
 
 /* ------------------------------------------------------------------ */
