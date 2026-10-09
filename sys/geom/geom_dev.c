@@ -161,10 +161,21 @@ g_dev_setdumpdev(struct cdev *dev, struct diocskerneldump_arg *kda)
 	memset(&kd, 0, len);
 	kd.offset = 0;
 	kd.length = OFF_MAX;
+	if (strlcpy(kd.provider_name, cp->provider->name,
+		sizeof(kd.provider_name)) < sizeof(kd.provider_name)) {
+		kd.provider_media_size = cp->provider->mediasize;
+		kd.provider_valid = true;
+	}
 	error = g_io_getattr("GEOM::kerneldump", cp, &len, &kd);
 	if (error != 0)
 		return (error);
 
+	if (kd.provider_valid) {
+		memcpy(kd.di.provider_name, kd.provider_name,
+		    sizeof(kd.di.provider_name));
+		kd.di.provider_media_size = kd.provider_media_size;
+		kd.di.provider_valid = true;
+	}
 	error = dumper_insert(&kd.di, devtoname(dev), kda);
 	if (error == 0)
 		dev->si_flags |= SI_DUMPDEV;

@@ -54,6 +54,7 @@
 #include <sys/disk.h>
 #include <sys/eventhandler.h>
 #include <sys/filedesc.h>
+#include <sys/hibernate.h>
 #include <sys/jail.h>
 #include <sys/kdb.h>
 #include <sys/kernel.h>
@@ -66,6 +67,7 @@
 #include <sys/priv.h>
 #include <sys/proc.h>
 #include <sys/reboot.h>
+#include <sys/refcount.h>
 #include <sys/resourcevar.h>
 #include <sys/rwlock.h>
 #include <sys/sbuf.h>
@@ -408,8 +410,16 @@ doadump(boolean_t textdump)
 #endif
 	if (coredump) {
 		struct dumperinfo *di;
+		struct hibernate_provider_id id;
 
 		TAILQ_FOREACH(di, &dumper_configs, di_next) {
+			if (di->provider_valid) {
+				memcpy(id.name, di->provider_name,
+				    sizeof(id.name));
+				id.media_size = di->provider_media_size;
+				if (hibernate_provider_conflicts(&id))
+					continue;
+			}
 			error = dumpsys(di);
 			if (error == 0) {
 				dumped_core = true;
@@ -1219,22 +1229,40 @@ kerneldumpcomp_destroy(struct dumperinfo *di)
 	free(kdcomp, M_DUMPER);
 }
 
-/*
- * Free a dumper. Must not be present on global list.
- */
-void
-dumper_destroy(struct dumperinfo *di)
+static void
+dumper_free(struct dumperinfo *di)
 {
-
-	if (di == NULL)
-		return;
-
 	zfree(di->blockbuf, M_DUMPER);
 	kerneldumpcomp_destroy(di);
 #ifdef EKCD
 	zfree(di->kdcrypto, M_EKCD);
 #endif
 	zfree(di, M_DUMPER);
+}
+
+/*
+ * Drop the list reference to a dumper.  A hibernate pin keeps its callbacks
+ * and private data alive after it has been unlinked.
+ */
+void
+dumper_destroy(struct dumperinfo *di)
+{
+	if (di != NULL)
+		dumper_drop(di);
+}
+
+bool
+dumper_hold(struct dumperinfo *di)
+{
+	return (di != NULL && refcount_acquire_if_not_zero(&di->refs));
+}
+
+void
+dumper_drop(struct dumperinfo *di)
+{
+	MPASS(di != NULL);
+	if (refcount_release(&di->refs))
+		dumper_free(di);
 }
 
 /*
@@ -1265,6 +1293,11 @@ dumper_create(const struct dumperinfo *di_template, const char *devname,
 	newdi = malloc(sizeof(*newdi) + strlen(devname) + 1, M_DUMPER,
 	    M_WAITOK | M_ZERO);
 	memcpy(newdi, di_template, sizeof(*newdi));
+	if (newdi->provider_valid &&
+	    strnlen(newdi->provider_name, sizeof(newdi->provider_name)) ==
+		sizeof(newdi->provider_name))
+		newdi->provider_valid = false;
+	refcount_init(&newdi->refs, 1);
 	newdi->blockbuf = NULL;
 	newdi->kdcrypto = NULL;
 	newdi->kdcomp = NULL;
@@ -1339,6 +1372,17 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 
 	/* Add the new configuration to the queue */
 	mtx_lock(&dumpconf_list_lk);
+	if (newdi->provider_valid) {
+		struct hibernate_provider_id id;
+
+		memcpy(id.name, newdi->provider_name, sizeof(id.name));
+		id.media_size = newdi->provider_media_size;
+		if (hibernate_provider_conflicts(&id)) {
+			mtx_unlock(&dumpconf_list_lk);
+			dumper_destroy(newdi);
+			return (EBUSY);
+		}
+	}
 	inserted = false;
 	TAILQ_FOREACH(listdi, &dumper_configs, di_next) {
 		if (index == 0) {
@@ -1359,6 +1403,14 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 void
 dumper_ddb_insert(struct dumperinfo *newdi)
 {
+	struct hibernate_provider_id id;
+
+	if (newdi->provider_valid) {
+		memcpy(id.name, newdi->provider_name, sizeof(id.name));
+		id.media_size = newdi->provider_media_size;
+		if (hibernate_provider_conflicts(&id))
+			return;
+	}
 	TAILQ_INSERT_HEAD(&dumper_configs, newdi, di_next);
 }
 

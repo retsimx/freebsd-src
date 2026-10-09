@@ -361,6 +361,14 @@ struct dumperinfo {
 	off_t	mediaoffset;	/* Initial offset in bytes. */
 	off_t	mediasize;	/* Space available in bytes. */
 
+	/* Fixed logical GEOM provider identity. */
+	char provider_name[SPECNAMELEN];
+	uint64_t provider_media_size;
+	bool provider_valid;
+
+	/* Lifetime is independent of dumper_configs membership. */
+	volatile u_int refs;
+
 	/* MI kernel dump state. */
 	void	*blockbuf;	/* Buffer for padding shorter dump blocks */
 	off_t	dumpoff;	/* Offset of ongoing kernel dump. */
@@ -397,6 +405,8 @@ struct diocskerneldump_arg;
 int dumper_create(const struct dumperinfo *di_template, const char *devname,
     const struct diocskerneldump_arg *kda, struct dumperinfo **dip);
 void dumper_destroy(struct dumperinfo *di);
+bool dumper_hold(struct dumperinfo *di);
+void dumper_drop(struct dumperinfo *di);
 int dumper_insert(const struct dumperinfo *di_template, const char *devname,
     const struct diocskerneldump_arg *kda);
 int dumper_remove(const char *devname, const struct diocskerneldump_arg *kda);
