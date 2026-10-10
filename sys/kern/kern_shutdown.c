@@ -386,6 +386,18 @@ print_uptime(void)
 	printf("%lds\n", (long)ts.tv_sec);
 }
 
+static bool
+dumper_conflicts(const struct dumperinfo *di)
+{
+	struct hibernate_provider_id id;
+
+	if (!di->provider_valid)
+		return (false);
+	memcpy(id.name, di->provider_name, sizeof(id.name));
+	id.media_size = di->provider_media_size;
+	return (hibernate_provider_conflicts(&id));
+}
+
 int
 doadump(boolean_t textdump)
 {
@@ -404,22 +416,23 @@ doadump(boolean_t textdump)
 	coredump = TRUE;
 #ifdef DDB
 	if (textdump && textdump_pending) {
+		struct dumperinfo *tdi;
+
 		coredump = FALSE;
-		textdump_dumpsys(TAILQ_FIRST(&dumper_configs));
+		TAILQ_FOREACH(tdi, &dumper_configs, di_next) {
+			if (!dumper_conflicts(tdi))
+				break;
+		}
+		if (tdi != NULL)
+			textdump_dumpsys(tdi);
 	}
 #endif
 	if (coredump) {
 		struct dumperinfo *di;
-		struct hibernate_provider_id id;
 
 		TAILQ_FOREACH(di, &dumper_configs, di_next) {
-			if (di->provider_valid) {
-				memcpy(id.name, di->provider_name,
-				    sizeof(id.name));
-				id.media_size = di->provider_media_size;
-				if (hibernate_provider_conflicts(&id))
-					continue;
-			}
+			if (dumper_conflicts(di))
+				continue;
 			error = dumpsys(di);
 			if (error == 0) {
 				dumped_core = true;
@@ -1241,8 +1254,9 @@ dumper_free(struct dumperinfo *di)
 }
 
 /*
- * Drop the list reference to a dumper.  A hibernate pin keeps its callbacks
- * and private data alive after it has been unlinked.
+ * Drop the list reference to a dumper.  A hibernate pin keeps the copied
+ * dumperinfo and its callbacks and buffers alive after list removal.  The
+ * owner's GEOM access keeps the backing provider and opaque di->priv alive.
  */
 void
 dumper_destroy(struct dumperinfo *di)
@@ -1403,14 +1417,8 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 void
 dumper_ddb_insert(struct dumperinfo *newdi)
 {
-	struct hibernate_provider_id id;
-
-	if (newdi->provider_valid) {
-		memcpy(id.name, newdi->provider_name, sizeof(id.name));
-		id.media_size = newdi->provider_media_size;
-		if (hibernate_provider_conflicts(&id))
-			return;
-	}
+	if (dumper_conflicts(newdi))
+		return;
 	TAILQ_INSERT_HEAD(&dumper_configs, newdi, di_next);
 }
 

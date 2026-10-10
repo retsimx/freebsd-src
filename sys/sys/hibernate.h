@@ -360,6 +360,9 @@ void hibernate_marker_decode_complete(const uint8_t *buf,
 enum hibernate_marker_class hibernate_marker_classify(uint64_t marker_offset,
     uint64_t media_size, const struct hibernate_marker *marker,
     uint32_t reserved);
+int hibernate_marker_result_from_transfer(int error, size_t transferred,
+    const uint8_t *sector, uint64_t provider_offset, uint64_t provider_size,
+    struct hibernate_marker_result *out);
 
 /*
  * Internal K-4 interfaces shared with the single-purpose GEOM owner.
