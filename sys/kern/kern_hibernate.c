@@ -419,6 +419,30 @@ hibernate_marker_classify(uint64_t marker_offset, uint64_t media_size,
 	}
 }
 
+/*
+ * Map a raw transfer outcome to a complete typed result.  This is shared so
+ * the probe and userland tests use one authoritative path.
+ */
+int
+hibernate_marker_result_from_transfer(int error, size_t transferred,
+    const uint8_t *sector, uint64_t provider_offset, uint64_t provider_size,
+    struct hibernate_marker_result *out)
+{
+	uint32_t reserved;
+
+	memset(out, 0, sizeof(*out));
+	if (error != 0 || transferred != DEV_BSIZE) {
+		out->class = HMC_IO_ERROR;
+		out->error = error != 0 ? error : EIO;
+		return (out->error);
+	}
+
+	hibernate_marker_decode_complete(sector, &out->marker, &reserved);
+	out->class = hibernate_marker_classify(provider_offset, provider_size,
+	    &out->marker, reserved);
+	return (0);
+}
+
 #ifndef _HIBERNATE_USERLAND_BUILD
 
 struct hibernate_provider_owner {
@@ -539,8 +563,8 @@ hibernate_owner_publish(const struct hibernate_provider_id *id)
 			EBUSY);
 	}
 	hibernate_owner.id = *id;
-	atomic_store_rel_int(&hibernate_owner.published, 1);
 	atomic_store_rel_int(&hibernate_owner.active, 1);
+	atomic_store_rel_int(&hibernate_owner.published, 1);
 	mtx_unlock(&hibernate_owner.lock);
 	return (0);
 }
@@ -700,37 +724,23 @@ hibernate_marker_read_raw(struct hibernate_attempt *ha,
 int
 hibernate_probe(struct hibernate_attempt *ha)
 {
-	struct hibernate_marker_result result;
 	struct hibernate_raw_marker raw;
-	uint32_t reserved;
 	int error;
 
-	memset(&result, 0, sizeof(result));
-	result.class = HMC_ABSENT;
 	if (ha == NULL)
 		return (EINVAL);
 
 	if (ha->ha_dumper == NULL) {
-		result.class = HMC_IO_ERROR;
-		result.error = ENXIO;
-		ha->ha_marker_result = result;
-		return (ENXIO);
-	}
-	hibernate_marker_read_raw(ha, &raw);
-	if (raw.error != 0 || raw.transferred != sizeof(raw.sector)) {
-		error = raw.error != 0 ? raw.error : EIO;
-		result.class = HMC_IO_ERROR;
-		result.error = error;
-		ha->ha_marker_result = result;
+		error = hibernate_marker_result_from_transfer(ENXIO, 0, NULL,
+		    ha->ha_provider_offset, ha->ha_provider_size,
+		    &ha->ha_marker_result);
 		return (error);
 	}
-
-	hibernate_marker_decode_complete(raw.sector, &result.marker, &reserved);
-	result.class = hibernate_marker_classify(ha->ha_provider_offset,
-	    ha->ha_provider_size, &result.marker, reserved);
-	result.error = 0;
-	ha->ha_marker_result = result;
-	return (0);
+	hibernate_marker_read_raw(ha, &raw);
+	error = hibernate_marker_result_from_transfer(raw.error,
+	    raw.transferred, raw.sector, ha->ha_provider_offset,
+	    ha->ha_provider_size, &ha->ha_marker_result);
+	return (error);
 }
 #endif /* !_HIBERNATE_USERLAND_BUILD */
 
