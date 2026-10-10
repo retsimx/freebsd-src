@@ -26,9 +26,10 @@ grep -q '#define HIBERNATE_MARKER_STATE_CONSUMING[[:space:]]*2' "$header"
 grep -q '#define HIBERNATE_MARKER_STATE_CONSUMED[[:space:]]*3' "$header"
 grep -q '\.class = HMC_ABSENT, \.error = 0' "$header"
 
-assignments=$(sed -n '/^hibernate_probe(/,/^}/p' "$kern" |
-    grep -c 'ha->ha_marker_result = result')
-[ "$assignments" -eq 3 ]
+grep -q 'hibernate_marker_result_from_transfer(' "$kern"
+grep -q 'hibernate_marker_result_from_transfer(raw.error,' "$kern"
+grep -q '&ha->ha_marker_result' "$kern"
+grep -q 'hibernate_marker_result_from_transfer(int error' "$header"
 grep -q 'hibernate_provider_conflicts(&id)' "$shutdown"
 grep -q 'hibernate_provider_conflicts(&id)' "$swap"
 grep -q 'hibernate_probe_active()' "$mountroot"
@@ -40,4 +41,4 @@ grep -q 'atomic_cmpset_int(&g_hibernate_complete, 0, 1)' "$geom"
 
 printf '%s\n' "PASS: K-4 source contracts"
 printf '%s\n' "six classes; old names absent; ABI constants unchanged"
-printf '%s\n' "probe publication, root hold, swap/dumper guards, and extent paths present"
+printf '%s\n' "probe transfer seam, root hold, swap/dumper guards, extent paths"

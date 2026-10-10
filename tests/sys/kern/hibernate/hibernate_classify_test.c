@@ -93,21 +93,30 @@ ATF_TC_BODY(six_classes, tc)
 	encode_marker(sector, &marker, 0);
 	check_class(sector, HMC_MALFORMED);
 
-	/*
-	 * I/O errors are intentionally assigned by the probe caller, not by
-	 * the pure structural classifier.  Verify complete sentinel replacement
-	 * using the result representation required for that sixth class.
-	 */
 	{
 		struct hibernate_marker_result result;
+		struct hibernate_marker zero_marker;
+		const int transfer_error = EBUSY;
+
+		memset(&zero_marker, 0, sizeof(zero_marker));
+		memset(&result, 0xa5, sizeof(result));
+		ATF_CHECK_EQ(transfer_error,
+		    hibernate_marker_result_from_transfer(transfer_error,
+			DEV_BSIZE, sector, TEST_MARKER_OFFSET, TEST_MEDIA_SIZE,
+			&result));
+		ATF_CHECK_EQ(HMC_IO_ERROR, result.class);
+		ATF_CHECK_EQ(transfer_error, result.error);
+		ATF_CHECK_EQ(0,
+		    memcmp(&zero_marker, &result.marker, sizeof(zero_marker)));
 
 		memset(&result, 0xa5, sizeof(result));
-		memset(&result, 0, sizeof(result));
-		result.class = HMC_IO_ERROR;
-		result.error = EIO;
+		ATF_CHECK_EQ(EIO,
+		    hibernate_marker_result_from_transfer(0, DEV_BSIZE - 1,
+			sector, TEST_MARKER_OFFSET, TEST_MEDIA_SIZE, &result));
 		ATF_CHECK_EQ(HMC_IO_ERROR, result.class);
 		ATF_CHECK_EQ(EIO, result.error);
-		ATF_CHECK_EQ(0, result.marker.hm_magic);
+		ATF_CHECK_EQ(0,
+		    memcmp(&zero_marker, &result.marker, sizeof(zero_marker)));
 	}
 }
 
