@@ -2150,6 +2150,37 @@ hib_page_in_arena(const struct hibernate_attempt *ha, vm_paddr_t pa)
 }
 
 /*
+ * hib_page_is_destination: attempt-explicit destination membership test.
+ *
+ * Unlike the public hibernate_page_is_destination(), which reads the
+ * ambient global attempt, this reads the validated destination-interval
+ * view from the passed attempt, so reserve_count() classifies against the
+ * same attempt it validated.  Returns false when no view is published.
+ */
+static bool
+hib_page_is_destination(const struct hibernate_attempt *ha, vm_page_t m)
+{
+	vm_paddr_t pa, start, end;
+	uint64_t i;
+
+	if (ha == NULL || !ha->ha_dst_valid ||
+	    ha->ha_dst_intervals == NULL || ha->ha_dst_count == 0)
+		return (false);
+
+	pa = VM_PAGE_TO_PHYS(m);
+	for (i = 0; i < ha->ha_dst_count; i++) {
+		start = ha->ha_dst_intervals[i * 2];
+		end   = ha->ha_dst_intervals[i * 2 + 1];
+		if (pa >= start && pa < end)
+			return (true);
+		/* Intervals are sorted; stop early if past pa. */
+		if (start > pa)
+			break;
+	}
+	return (false);
+}
+
+/*
  * hib_validate_reservation: common argument validation for both entry points.
  * Returns 0 on success, EINVAL on bad arguments.
  */
@@ -2172,6 +2203,15 @@ hib_validate_reservation(const struct hibernate_attempt *ha,
 		return (EINVAL);
 	if (res->vr_capacity > 0 && res->vr_pages == NULL)
 		return (EINVAL);
+	/*
+	 * AC16: reject an unrepresentable reservation representation before
+	 * any traversal.  The caller sizes the record array as vr_capacity
+	 * records; that byte size must be representable in size_t.  A
+	 * capacity that cannot be represented is EOVERFLOW, not EINVAL.
+	 */
+	if (res->vr_capacity >
+	    SIZE_MAX / sizeof(struct vm_phys_reservation_page))
+		return (EOVERFLOW);
 	return (0);
 }
 
@@ -2224,6 +2264,20 @@ vm_phys_hibernate_release(struct vm_phys_reservation *res)
 
 	if (res == NULL)
 		return;
+
+	/*
+	 * Validate the record shape before indexing the array, so a malformed
+	 * caller-described reservation cannot cause a NULL or out-of-bounds
+	 * access.  Under INVARIANTS this trips the assertion; in production it
+	 * refuses rather than dereferencing an unproven array.
+	 */
+	if (res->vr_count != 0 &&
+	    (res->vr_pages == NULL || res->vr_count > res->vr_capacity)) {
+		KASSERT(0, ("%s: malformed reservation (count %lu, capacity "
+		    "%lu, pages %p)", __func__, res->vr_count,
+		    res->vr_capacity, res->vr_pages));
+		return;
+	}
 
 	i = res->vr_count;
 	while (i-- > 0) {
@@ -2358,7 +2412,7 @@ hib_process_block_count(struct hibernate_attempt *ha,
 
 		if (res->vr_count == want ||
 		    hib_page_in_arena(ha, pa) ||
-		    hibernate_page_is_destination(m)) {
+		    hib_page_is_destination(ha, m)) {
 			/* Ineligible or excess: accumulate return run. */
 			if (m_ret_head == NULL)
 				m_ret_head = m;
