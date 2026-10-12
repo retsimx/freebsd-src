@@ -470,8 +470,13 @@ struct vm_phys_reservation;
  * barrier around the SAVE attempt.  On failure, releases all acquired
  * stages in strict reverse order and returns a non-zero errno.
  *
- * On success, *stages_out contains the full stage mask and the caller
- * proceeds to step 8 (image write) using only preallocated resources.
+ * On success, *stages_out contains the stage mask for the stages this
+ * function acquires.  The caller then releases the bound dump SIM
+ * immediately before the step-8 image write (clearing HIB_STAGE_CAM),
+ * because a frozen SIM cannot dispatch its own write CCB.  The callout
+ * freeze, the BSP preemption/interrupt state, and the physical-page
+ * reservation remain held through the write; those, plus stages 1-3, are
+ * released by hibernate_barrier_unwind() on the reverse path.
  *
  * ha must be the active attempt; res must be a zeroed reservation
  * record with vr_pages pointing to the preallocated array.

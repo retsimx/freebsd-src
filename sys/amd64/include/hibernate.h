@@ -65,6 +65,13 @@ struct pcb;
 
 #define	HIBERNATE_SCRATCH_STACK_SIZE	(32 * 1024)
 
+/*
+ * dumpsys_hibernate_savectx_preinit: one-time machine-dependent setup
+ * (the low-page contigmalloc and identity mapping) that must run BEFORE
+ * the K-5 FREE-page reservation drains vm_phys.  dumpsys_hibernate_savectx()
+ * panics if preinit was not called, so every caller must preinit first;
+ * acpi_EnterSleepState() does so before the stability barrier.
+ */
 int dumpsys_hibernate_savectx_preinit(void);
 int dumpsys_hibernate_savectx(struct hibernate_save_pcb *hpcb, void *stack_top,
     int (*dump_fn)(void *, void *), void *dump_arg) __returns_twice;
