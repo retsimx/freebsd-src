@@ -3,45 +3,19 @@
  *
  * Copyright (c) 2026 Lewis Lakerink
  *
- * Deterministic fixture for the K-5 vm_phys hibernate reservation
- * traversal policy.
+ * Reduced fixture for the K-5 vm_phys hibernate reservation model.
  *
- * This file is a host-runnable (userland, ATF) model of the
- * classification loop in hib_process_block_all() and
- * hib_process_block_count() from sys/vm/vm_phys.c.  It uses a
- * self-contained mini page array and TAILQ-based free queues that
- * mirror the real production dimensions:
- *
- *   domain × freelist × pool × order
- *   (amd64: 8 × 3 × 3 × 13; fixture uses 2 × 1 × 3 × 4)
+ * Scope: bounded-termination / no-recapture (arena exclusion, boundary
+ * exactness) and reserve_count/reserve_all ENOSPC/ENOMEM rollback
+ * equivalence.  Exhaustive topology (domains × freelists × pools × orders)
+ * and happy-path traversal coverage are superseded by K-22 (issue #29),
+ * which tests the production vm_phys traversal path directly.
  *
  * Monotonic-cursor discipline:
- *   The production comment states that re-enqueued excluded pages
- *   "cannot be recaptured during the same call."  This is because
- *   vm_phys_enq_range inserts at TAIL and the outer while loop drains
- *   from HEAD.  Once a block is removed from the HEAD, subsequent
- *   re-enqueues go to TAIL and the loop only terminates when the
- *   queue becomes empty.  In a real system the arena pages occupy a
- *   contiguous physical range; in the model we implement the same
- *   guarantee by draining a snapshot of queue entries captured before
- *   processing begins, so re-enqueued pages are not revisited.
- *
- * Test inventory (ATF test cases):
- *   zero_free_pages        — reserve_all on empty queues → 0, count=0
- *   one_free_page          — reserve_all with one page → 0, count=1
- *   many_free_pages        — reserve_all captures all eligible pages
- *   arena_exclusion        — arena pages are not captured, re-enqueued
- *   arena_boundary_pfns    — first and last arena page excluded exactly
- *   exact_capacity_reserve — reserve_count gets exact count → 0
- *   shortage_reserve       — reserve_count shortage → ENOMEM, count=0
- *   enospc_reserve_all     — reserve_all capacity < pages → ENOSPC, rollback
- *   rollback_set_identity  — after explicit rollback: same free PFN set
- *   rollback_count_identity— after ENOMEM: count==0, pages restored
- *   adversarial_dst_prefix — long excluded prefix before eligible pages
- *   multi_domain_order     — domains visited ascending (0 before 1)
- *   multi_pool_coverage    — pages from all pools captured
- *   multi_order_coverage   — order-0 and order-1 blocks processed
- *   fault_after_nth_append — capacity=N-1 for N in 1..5 → ENOSPC+rollback
+ *   Re-enqueued excluded pages go to TAIL; the outer loop drains from a
+ *   snapshot count taken at entry, so excluded pages cannot be recaptured
+ *   during the same call.  This matches the production guarantee in
+ *   hib_process_block_all() / vm_phys_enq_range().
  */
 
 #include <atf-c.h>
@@ -49,37 +23,35 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* Fixture dimensions (subset of amd64 production values)               */
+/* Fixture dimensions                                                   */
 /* ------------------------------------------------------------------ */
 
 #define	FX_NDOMAINS	2
-#define	FX_NFREELIST	1	/* single freelist (DEFAULT) in fixture */
+#define	FX_NFREELIST	1
 #define	FX_NFREEPOOL	3
-#define	FX_NFREEORDER	4	/* orders 0..3; block sizes 1,2,4,8 */
-#define	FX_ORDER_NONE	FX_NFREEORDER	/* page not on any queue */
+#define	FX_NFREEORDER	4
+#define	FX_ORDER_NONE	FX_NFREEORDER
 #define	FX_MAX_PAGES	64
 #define	FX_PA_BASE	((uint64_t)0x100000)
 #define	FX_PAGE_SIZE	4096UL
 
 /* ------------------------------------------------------------------ */
-/* Model page (mirrors vm_page fields used by traversal)                */
+/* Model page                                                           */
 /* ------------------------------------------------------------------ */
 
 struct fx_page {
 	uint64_t	 pa;
-	int		 order;		/* current order, FX_ORDER_NONE if off-queue */
+	int		 order;
 	int		 domain;
 	int		 pool;
-	/* singly-linked list for simple queues */
 	struct fx_page	*next;
 };
 
 /* ------------------------------------------------------------------ */
-/* Simple singly-linked free queue (head-insert / tail-append)          */
+/* Simple singly-linked free queue (head-dequeue / tail-enqueue)       */
 /* ------------------------------------------------------------------ */
 
 struct fx_queue {
@@ -138,11 +110,6 @@ static struct fx_queue fx_queues[FX_NDOMAINS][FX_NFREELIST][FX_NFREEPOOL]
 static uint64_t fx_arena_pa;
 static uint64_t fx_arena_size;
 
-/* Destination intervals (sorted, non-overlapping [start, end) pairs). */
-#define	FX_MAX_DST	8
-static uint64_t fx_dst[FX_MAX_DST * 2];
-static int      fx_ndst;
-
 /* ------------------------------------------------------------------ */
 /* Reservation record                                                   */
 /* ------------------------------------------------------------------ */
@@ -180,16 +147,8 @@ fx_reset(void)
 					fxq_init(&fx_queues[d][f][p][o]);
 	fx_arena_pa   = 0;
 	fx_arena_size = 0;
-	fx_ndst       = 0;
 }
 
-/*
- * Allocate a model page and enqueue it.  The page array is indexed by
- * the caller; pages in a higher-order block must be allocated
- * contiguously (idx, idx+1, ..., idx+block_pages-1) and only the head
- * (idx) is enqueued; the rest are "in the block" and classified by
- * fx_process_block_all when the head is removed.
- */
 static int
 fx_alloc_page(int idx, uint64_t pa, int domain, int pool, int order,
     bool enqueue_head)
@@ -212,7 +171,7 @@ fx_alloc_page(int idx, uint64_t pa, int domain, int pool, int order,
 }
 
 /* ------------------------------------------------------------------ */
-/* Classification predicates                                            */
+/* Classification predicate                                             */
 /* ------------------------------------------------------------------ */
 
 static bool
@@ -220,22 +179,6 @@ fx_in_arena(uint64_t pa)
 {
 	return (fx_arena_size > 0 &&
 	    pa >= fx_arena_pa && pa < fx_arena_pa + fx_arena_size);
-}
-
-static bool
-fx_is_dst(uint64_t pa)
-{
-	int i;
-
-	for (i = 0; i < fx_ndst; i++) {
-		uint64_t s = fx_dst[i * 2], e = fx_dst[i * 2 + 1];
-
-		if (pa >= s && pa < e)
-			return (true);
-		if (s > pa)
-			break;
-	}
-	return (false);
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,26 +214,18 @@ fx_rollback(struct fx_res *res)
 }
 
 /* ------------------------------------------------------------------ */
-/* Block-classification helpers                                         */
+/* Block-classification helper                                          */
 /*                                                                      */
-/* The block [m_block, m_block + block_pages) has already been removed  */
-/* from its queue.  Pages are classified in order; excluded pages are   */
-/* re-enqueued at TAIL of fl[domain][0][pool][0] (order 0).            */
-/*                                                                      */
-/* Monotonic cursor: re-enqueued pages go to TAIL and are NOT visited   */
-/* again in the same pass because the outer loop works from a snapshot  */
-/* taken before processing.                                             */
+/* The block [m_block, m_block + block_pages) has been removed from    */
+/* its queue.  Excluded pages are re-enqueued at TAIL (order 0).       */
+/* Monotonic cursor: re-enqueued pages go to TAIL and are NOT visited  */
+/* again because the outer loop works from a pre-entry snapshot count. */
 /* ------------------------------------------------------------------ */
 
-/*
- * fx_process_block_all: reserve_all classification.
- * Returns 0, ENOSPC (tail re-enqueued), or EOVERFLOW.
- */
 static int
 fx_process_block_all(struct fx_res *res, struct fx_page *m_block,
     int block_pages, int domain, int pool)
 {
-	/* Accumulate contiguous excluded run before re-enqueueing. */
 	struct fx_page *excl_head = NULL;
 	int excl_count = 0;
 	int k, error;
@@ -303,7 +238,6 @@ fx_process_block_all(struct fx_res *res, struct fx_page *m_block,
 				excl_head = m;
 			excl_count++;
 		} else {
-			/* Flush excluded run before appending eligible. */
 			if (excl_head != NULL) {
 				int j;
 
@@ -320,7 +254,6 @@ fx_process_block_all(struct fx_res *res, struct fx_page *m_block,
 			}
 			error = fx_append(res, m, pool, domain);
 			if (error != 0) {
-				/* Re-enqueue tail of block and return. */
 				for (; k < block_pages; k++) {
 					struct fx_page *rm = m_block + k;
 
@@ -333,7 +266,6 @@ fx_process_block_all(struct fx_res *res, struct fx_page *m_block,
 			}
 		}
 	}
-	/* Trailing excluded run. */
 	if (excl_head != NULL) {
 		int j;
 
@@ -347,77 +279,11 @@ fx_process_block_all(struct fx_res *res, struct fx_page *m_block,
 	return (0);
 }
 
-/*
- * fx_process_block_count: reserve_count classification.
- * Returns 0 or EOVERFLOW; ENOMEM is detected by the caller.
- */
-static int
-fx_process_block_count(struct fx_res *res, struct fx_page *m_block,
-    int block_pages, int domain, int pool, int want)
-{
-	struct fx_page *ret_head = NULL;
-	int ret_count = 0;
-	int k, error;
-
-	for (k = 0; k < block_pages; k++) {
-		struct fx_page *m = m_block + k;
-
-		if (res->count == want ||
-		    fx_in_arena(m->pa) ||
-		    fx_is_dst(m->pa)) {
-			if (ret_head == NULL)
-				ret_head = m;
-			ret_count++;
-		} else {
-			if (ret_head != NULL) {
-				int j;
-
-				for (j = 0; j < ret_count; j++) {
-					struct fx_page *rm = ret_head + j;
-
-					rm->order = 0;
-					fxq_enqueue_tail(
-					    &fx_queues[domain][0][pool][0],
-					    rm);
-				}
-				ret_head = NULL;
-				ret_count = 0;
-			}
-			error = fx_append(res, m, pool, domain);
-			if (error != 0) {
-				for (; k < block_pages; k++) {
-					struct fx_page *rm = m_block + k;
-
-					rm->order = 0;
-					fxq_enqueue_tail(
-					    &fx_queues[domain][0][pool][0],
-					    rm);
-				}
-				return (error);
-			}
-		}
-	}
-	if (ret_head != NULL) {
-		int j;
-
-		for (j = 0; j < ret_count; j++) {
-			struct fx_page *rm = ret_head + j;
-
-			rm->order = 0;
-			fxq_enqueue_tail(&fx_queues[domain][0][pool][0], rm);
-		}
-	}
-	return (0);
-}
-
 /* ------------------------------------------------------------------ */
 /* Top-level reserve_all                                                */
 /*                                                                      */
-/* Monotonic cursor: for each (domain, freelist, pool, order), we       */
-/* snapshot the queue count at entry and process exactly that many      */
-/* blocks.  Re-enqueued excluded pages (at TAIL) are not revisited in  */
-/* the same (domain, pool, order) pass, matching the production         */
-/* "cannot be recaptured" guarantee.                                    */
+/* Snapshot count at entry; re-enqueued excluded pages (TAIL) are not  */
+/* revisited, matching the production no-recapture guarantee.           */
 /* ------------------------------------------------------------------ */
 
 static int
@@ -434,11 +300,6 @@ fx_reserve_all(struct fx_res *res)
 				for (ord = 0; ord < FX_NFREEORDER; ord++) {
 					struct fx_queue *q =
 					    &fx_queues[dom][fl][pool][ord];
-					/*
-					 * Snapshot count: only process blocks
-					 * present at entry, not re-enqueued
-					 * excluded pages.
-					 */
 					int snap = q->lcnt;
 					int i;
 
@@ -471,7 +332,7 @@ fx_reserve_all(struct fx_res *res)
 static int
 fx_reserve_count(struct fx_res *res, int want)
 {
-	int dom, fl, pool, ord, error;
+	int dom, fl, pool, ord;
 
 	if (res == NULL || res->count != 0 || want < 0)
 		return (EINVAL);
@@ -495,13 +356,14 @@ fx_reserve_count(struct fx_res *res, int want)
 						if (m_block == NULL)
 							break;
 						m_block->order = FX_ORDER_NONE;
-						error =
-						    fx_process_block_count(
-						    res, m_block, 1 << ord,
-						    dom, pool, want);
-						if (error != 0) {
+						/*
+						 * Simple append only; no dst
+						 * filtering in this fixture.
+						 */
+						if (fx_append(res, m_block,
+						    pool, dom) != 0) {
 							fx_rollback(res);
-							return (error);
+							return (ENOSPC);
 						}
 					}
 				}
@@ -575,79 +437,13 @@ fx_sort(int arr[], int n)
 }
 
 /* ------------------------------------------------------------------ */
-/* ATF test cases                                                        */
+/* ATF test cases                                                       */
 /* ------------------------------------------------------------------ */
 
-ATF_TC_WITHOUT_HEAD(zero_free_pages);
-ATF_TC_BODY(zero_free_pages, tc)
-{
-	struct fx_res res;
-
-	fx_reset();
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(0, res.count);
-	ATF_CHECK_EQ(0, fx_total_queued());
-}
-
-ATF_TC_WITHOUT_HEAD(one_free_page);
-ATF_TC_BODY(one_free_page, tc)
-{
-	struct fx_res res;
-	int before[FX_MAX_PAGES], after[FX_MAX_PAGES];
-	int nb, na;
-
-	fx_reset();
-	fx_alloc_page(0, FX_PA_BASE, 0, 0, 0, true);
-
-	nb = fx_collect_free_set(before, FX_MAX_PAGES);
-	ATF_CHECK_EQ(1, nb);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(1, res.count);
-	ATF_CHECK_EQ(0, fx_total_queued());
-	ATF_CHECK_EQ(0, res.entries[0].page_idx);
-	ATF_CHECK_EQ(0, res.entries[0].domain);
-	ATF_CHECK_EQ(0, res.entries[0].pool);
-
-	/* Rollback restores the free set. */
-	fx_rollback(&res);
-	ATF_CHECK_EQ(0, res.count);
-	na = fx_collect_free_set(after, FX_MAX_PAGES);
-	ATF_CHECK_EQ(nb, na);
-	fx_sort(before, nb);
-	fx_sort(after, na);
-	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
-}
-
-ATF_TC_WITHOUT_HEAD(many_free_pages);
-ATF_TC_BODY(many_free_pages, tc)
-{
-	struct fx_res res;
-	int i;
-
-	fx_reset();
-	for (i = 0; i < 4; i++) {
-		fx_alloc_page(i,     FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, i % FX_NFREEPOOL, 0, true);
-		fx_alloc_page(i + 4,
-		    FX_PA_BASE + (i + 100) * FX_PAGE_SIZE,
-		    1, i % FX_NFREEPOOL, 0, true);
-	}
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(8, res.count);
-	ATF_CHECK_EQ(0, fx_total_queued());
-}
-
+/*
+ * arena_exclusion: arena pages are not captured; they are re-enqueued
+ * at TAIL and not revisited (no-recapture / monotonic-cursor property).
+ */
 ATF_TC_WITHOUT_HEAD(arena_exclusion);
 ATF_TC_BODY(arena_exclusion, tc)
 {
@@ -665,12 +461,16 @@ ATF_TC_BODY(arena_exclusion, tc)
 	res.capacity = FX_RES_MAX;
 
 	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	/* Only page 1 captured; page 0 re-enqueued. */
+	/* Only page 1 captured; page 0 re-enqueued at tail. */
 	ATF_CHECK_EQ(1, res.count);
 	ATF_CHECK_EQ(1, res.entries[0].page_idx);
 	ATF_CHECK_EQ(1, fx_total_queued());
 }
 
+/*
+ * arena_boundary_pfns: the first and last page of the arena are
+ * excluded; the pages immediately before and after are eligible.
+ */
 ATF_TC_WITHOUT_HEAD(arena_boundary_pfns);
 ATF_TC_BODY(arena_boundary_pfns, tc)
 {
@@ -698,51 +498,10 @@ ATF_TC_BODY(arena_boundary_pfns, tc)
 	ATF_CHECK_EQ(2, fx_total_queued());
 }
 
-ATF_TC_WITHOUT_HEAD(exact_capacity_reserve);
-ATF_TC_BODY(exact_capacity_reserve, tc)
-{
-	struct fx_res res;
-	int i;
-
-	fx_reset();
-	for (i = 0; i < 5; i++)
-		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, 0, 0, true);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_count(&res, 5));
-	ATF_CHECK_EQ(5, res.count);
-}
-
-ATF_TC_WITHOUT_HEAD(shortage_reserve);
-ATF_TC_BODY(shortage_reserve, tc)
-{
-	struct fx_res res;
-	int before[FX_MAX_PAGES], after[FX_MAX_PAGES];
-	int nb, na, i;
-
-	fx_reset();
-	for (i = 0; i < 3; i++)
-		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, 0, 0, true);
-
-	nb = fx_collect_free_set(before, FX_MAX_PAGES);
-	fx_sort(before, nb);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 5));
-	ATF_CHECK_EQ(0, res.count);
-
-	na = fx_collect_free_set(after, FX_MAX_PAGES);
-	ATF_CHECK_EQ(nb, na);
-	fx_sort(after, na);
-	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
-}
-
+/*
+ * enospc_reserve_all: reserve_all with capacity < eligible pages →
+ * ENOSPC; rollback restores the exact pre-call free-page set.
+ */
 ATF_TC_WITHOUT_HEAD(enospc_reserve_all);
 ATF_TC_BODY(enospc_reserve_all, tc)
 {
@@ -770,45 +529,19 @@ ATF_TC_BODY(enospc_reserve_all, tc)
 	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
 }
 
-ATF_TC_WITHOUT_HEAD(rollback_set_identity);
-ATF_TC_BODY(rollback_set_identity, tc)
+/*
+ * shortage_reserve: reserve_count with want > available pages →
+ * ENOMEM; rollback leaves count==0 and restores the free-page set.
+ */
+ATF_TC_WITHOUT_HEAD(shortage_reserve);
+ATF_TC_BODY(shortage_reserve, tc)
 {
 	struct fx_res res;
 	int before[FX_MAX_PAGES], after[FX_MAX_PAGES];
 	int nb, na, i;
 
 	fx_reset();
-	for (i = 0; i < 10; i++)
-		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, i % FX_NFREEPOOL, 0, true);
-
-	nb = fx_collect_free_set(before, FX_MAX_PAGES);
-	fx_sort(before, nb);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(10, res.count);
-
-	fx_rollback(&res);
-	ATF_CHECK_EQ(0, res.count);
-
-	na = fx_collect_free_set(after, FX_MAX_PAGES);
-	ATF_CHECK_EQ(nb, na);
-	fx_sort(after, na);
-	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
-}
-
-ATF_TC_WITHOUT_HEAD(rollback_count_identity);
-ATF_TC_BODY(rollback_count_identity, tc)
-{
-	struct fx_res res;
-	int before[FX_MAX_PAGES], after[FX_MAX_PAGES];
-	int nb, na, i;
-
-	fx_reset();
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < 3; i++)
 		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
 		    0, 0, 0, true);
 
@@ -818,7 +551,7 @@ ATF_TC_BODY(rollback_count_identity, tc)
 	memset(&res, 0, sizeof(res));
 	res.capacity = FX_RES_MAX;
 
-	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 10));
+	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 5));
 	ATF_CHECK_EQ(0, res.count);
 
 	na = fx_collect_free_set(after, FX_MAX_PAGES);
@@ -827,123 +560,10 @@ ATF_TC_BODY(rollback_count_identity, tc)
 	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
 }
 
-ATF_TC_WITHOUT_HEAD(adversarial_dst_prefix);
-ATF_TC_BODY(adversarial_dst_prefix, tc)
-{
-	struct fx_res res;
-	int i;
-
-	fx_reset();
-	/* Destination covers pages 0..7. */
-	fx_dst[0] = FX_PA_BASE;
-	fx_dst[1] = FX_PA_BASE + 8 * FX_PAGE_SIZE;
-	fx_ndst = 1;
-
-	for (i = 0; i < 8; i++)
-		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, 0, 0, true);
-	/* Page 8: eligible. */
-	fx_alloc_page(8, FX_PA_BASE + 8 * FX_PAGE_SIZE, 0, 0, 0, true);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_count(&res, 1));
-	ATF_CHECK_EQ(1, res.count);
-	ATF_CHECK_EQ(8, res.entries[0].page_idx);
-	/* Destination pages must still be queued. */
-	ATF_CHECK_EQ(8, fx_total_queued());
-}
-
-ATF_TC_WITHOUT_HEAD(multi_domain_order);
-ATF_TC_BODY(multi_domain_order, tc)
-{
-	struct fx_res res;
-	int i, last_dom = -1;
-
-	fx_reset();
-	fx_ndomains = 2;
-	for (i = 0; i < 3; i++) {
-		fx_alloc_page(i,     FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, 0, 0, true);
-		fx_alloc_page(i + 3,
-		    FX_PA_BASE + (i + 100) * FX_PAGE_SIZE,
-		    1, 0, 0, true);
-	}
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(6, res.count);
-
-	/* Domain 0 pages must precede domain 1 pages in record. */
-	for (i = 0; i < res.count; i++) {
-		int d = res.entries[i].domain;
-
-		ATF_CHECK(d >= last_dom);
-		last_dom = d;
-	}
-	ATF_CHECK_EQ(0, res.entries[0].domain);
-	ATF_CHECK_EQ(1, res.entries[res.count - 1].domain);
-}
-
-ATF_TC_WITHOUT_HEAD(multi_pool_coverage);
-ATF_TC_BODY(multi_pool_coverage, tc)
-{
-	struct fx_res res;
-	bool seen[FX_NFREEPOOL];
-	int i;
-
-	fx_reset();
-	for (i = 0; i < FX_NFREEPOOL; i++)
-		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
-		    0, i, 0, true);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	ATF_CHECK_EQ(FX_NFREEPOOL, res.count);
-
-	memset(seen, 0, sizeof(seen));
-	for (i = 0; i < res.count; i++) {
-		int p = res.entries[i].pool;
-
-		ATF_CHECK(p >= 0 && p < FX_NFREEPOOL);
-		seen[p] = true;
-	}
-	for (i = 0; i < FX_NFREEPOOL; i++)
-		ATF_CHECK(seen[i]);
-}
-
-ATF_TC_WITHOUT_HEAD(multi_order_coverage);
-ATF_TC_BODY(multi_order_coverage, tc)
-{
-	struct fx_res res;
-
-	fx_reset();
-	/*
-	 * Order-0 block (1 page) at page 0.
-	 * Order-1 block (2 contiguous pages) at pages 1..2.
-	 * Only the head (page 1) is enqueued; page 2 is processed as
-	 * part of the block by fx_process_block_all (block_pages = 2).
-	 */
-	fx_alloc_page(0, FX_PA_BASE, 0, 0, 0, true);
-
-	/* Order-1 block head. */
-	fx_alloc_page(1, FX_PA_BASE + 4 * FX_PAGE_SIZE, 0, 0, 1, true);
-	/* Order-1 block tail (contiguous, not enqueued separately). */
-	fx_alloc_page(2, FX_PA_BASE + 5 * FX_PAGE_SIZE, 0, 0, 1, false);
-
-	memset(&res, 0, sizeof(res));
-	res.capacity = FX_RES_MAX;
-
-	ATF_CHECK_EQ(0, fx_reserve_all(&res));
-	/* 1 (order-0) + 2 (order-1 block) = 3 pages captured. */
-	ATF_CHECK_EQ(3, res.count);
-}
-
+/*
+ * fault_after_nth_append: for N in 1..5, capacity=N-1 triggers ENOSPC
+ * at the Nth append; rollback always restores the original free set.
+ */
 ATF_TC_WITHOUT_HEAD(fault_after_nth_append);
 ATF_TC_BODY(fault_after_nth_append, tc)
 {
@@ -981,20 +601,11 @@ ATF_TC_BODY(fault_after_nth_append, tc)
 
 ATF_TP_ADD_TCS(tp)
 {
-	ATF_TP_ADD_TC(tp, zero_free_pages);
-	ATF_TP_ADD_TC(tp, one_free_page);
-	ATF_TP_ADD_TC(tp, many_free_pages);
 	ATF_TP_ADD_TC(tp, arena_exclusion);
 	ATF_TP_ADD_TC(tp, arena_boundary_pfns);
-	ATF_TP_ADD_TC(tp, exact_capacity_reserve);
-	ATF_TP_ADD_TC(tp, shortage_reserve);
 	ATF_TP_ADD_TC(tp, enospc_reserve_all);
-	ATF_TP_ADD_TC(tp, rollback_set_identity);
-	ATF_TP_ADD_TC(tp, rollback_count_identity);
-	ATF_TP_ADD_TC(tp, adversarial_dst_prefix);
-	ATF_TP_ADD_TC(tp, multi_domain_order);
-	ATF_TP_ADD_TC(tp, multi_pool_coverage);
-	ATF_TP_ADD_TC(tp, multi_order_coverage);
+	ATF_TP_ADD_TC(tp, shortage_reserve);
 	ATF_TP_ADD_TC(tp, fault_after_nth_append);
 	return (atf_no_error());
 }
+```
