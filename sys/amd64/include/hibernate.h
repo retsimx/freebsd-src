@@ -65,6 +65,7 @@ struct pcb;
 
 #define	HIBERNATE_SCRATCH_STACK_SIZE	(32 * 1024)
 
+int dumpsys_hibernate_savectx_preinit(void);
 int dumpsys_hibernate_savectx(struct hibernate_save_pcb *hpcb, void *stack_top,
     int (*dump_fn)(void *, void *), void *dump_arg) __returns_twice;
 int hibernate_savectx(struct hibernate_save_pcb *hpcb, struct pcb *pcb,

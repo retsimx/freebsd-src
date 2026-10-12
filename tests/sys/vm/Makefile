@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BSD-2-Clause
 PACKAGE=	tests
 
 TESTSDIR=	${TESTSBASE}/sys/vm
@@ -5,7 +6,8 @@ TESTSDIR=	${TESTSBASE}/sys/vm
 ATF_TESTS_C+=	mlock_test \
 		mmap_test \
 		page_fault_signal \
-		shared_shadow_inval_test
+		shared_shadow_inval_test \
+		vm_phys_hib_fixture_test
 
 BINDIR=		${TESTSDIR}
 ATF_TESTS_SH+=	mmap_map_32bit_test

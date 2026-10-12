@@ -87,6 +87,53 @@ int vm_phys_avail_largest(void);
 vm_paddr_t vm_phys_avail_size(int i);
 bool vm_phys_is_dumpable(vm_paddr_t pa);
 
+/*
+ * K-5: hibernate page-reservation interface.
+ *
+ * vm_phys_hibernate_reserve_all() captures the complete eligible SAVE-side
+ * FREE page set into res.  vm_phys_hibernate_reserve_count() captures
+ * exactly count eligible RESTORE-side destination-disjoint pages.
+ * vm_phys_hibernate_release() returns all captured pages to the allocator
+ * in reverse acquisition order.
+ *
+ * FREE is defined solely as buddy-block membership in vm_phys_free_queues
+ * under the applicable per-domain free lock.  No page-queue or flag test
+ * is used.
+ *
+ * Return codes for reserve_all / reserve_count:
+ *   0        Complete set (reserve_all) or exact count (reserve_count).
+ *   EINVAL   Null or invalid argument, nonzero vr_count on entry, or
+ *            invalid destination/arena view for reserve_count.
+ *   EOVERFLOW Count, block-size, or representation overflow.
+ *   ENOSPC   (reserve_all only) vr_capacity cannot hold the complete set;
+ *            full rollback performed.
+ *   ENOMEM   (reserve_count only) Eligible-page shortage; full rollback
+ *            performed.
+ *
+ * Neither entry point returns partial success.
+ */
+
+/* Forward declaration; avoids importing all hibernate definitions. */
+struct hibernate_attempt;
+
+struct vm_phys_reservation_page {
+	vm_page_t	vrp_page;
+	int		vrp_pool;
+	int		vrp_domain;
+};
+
+struct vm_phys_reservation {
+	struct vm_phys_reservation_page	*vr_pages;
+	u_long				 vr_capacity;
+	u_long				 vr_count;
+};
+
+int vm_phys_hibernate_reserve_all(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res);
+int vm_phys_hibernate_reserve_count(struct hibernate_attempt *ha, size_t count,
+    struct vm_phys_reservation *res);
+void vm_phys_hibernate_release(struct vm_phys_reservation *res);
+
 static inline int
 vm_phys_domain(vm_paddr_t pa __numa_used)
 {
