@@ -4328,46 +4328,17 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	}
 
 	/*
-	 * P1: pre-compute and allocate the destination-interval array and
-	 * reservation record array before acquiring the coordinator lock.
-	 * malloc(M_WAITOK) must not be called while the coordinator sleep
-	 * mutex is held (WITNESS: non-sleepable lock held across sleeping
-	 * allocation).
-	 *
-	 * The segment count is stable at this point: vm_phys_nsegs is set
-	 * at boot and never changes.  The reservation capacity is physmem,
-	 * which is also boot-time constant.
+	 * P1: pre-compute and allocate the reservation record array before
+	 * acquiring the coordinator lock.  malloc(M_WAITOK) must not be called
+	 * while the coordinator sleep mutex is held (WITNESS: non-sleepable
+	 * lock held across sleeping allocation).  The reservation capacity is
+	 * physmem, which is boot-time constant.
 	 */
-	{
-		int _nseg = vm_phys_nsegs;
-		size_t _dst_bytes;
-
-		if (_nseg <= 0) {
-			device_printf(sc->acpi_dev,
-			    "hibernate: no physical segments; refusing\n");
-			free(hpcb, M_TEMP);
-			dumpsys_hibernate_free_hcb(hcb);
-			goto backout;
-		}
-		if (__builtin_mul_overflow((size_t)_nseg,
-		    (size_t)2 * sizeof(vm_paddr_t), &_dst_bytes)) {
-			device_printf(sc->acpi_dev,
-			    "hibernate: destination interval array "
-			    "size overflow; refusing\n");
-			free(hpcb, M_TEMP);
-			dumpsys_hibernate_free_hcb(hcb);
-			goto backout;
-		}
-		ha.ha_dst_intervals = malloc(_dst_bytes, M_TEMP, M_WAITOK);
-	}
-
 	hib_res_cap = physmem;
 	if (__builtin_mul_overflow((size_t)hib_res_cap,
 	    sizeof(struct vm_phys_reservation_page), &hib_res_bytes)) {
 		device_printf(sc->acpi_dev,
 		    "hibernate: reservation array size overflow (EOVERFLOW)\n");
-		free(ha.ha_dst_intervals, M_TEMP);
-		ha.ha_dst_intervals = NULL;
 		free(hpcb, M_TEMP);
 		dumpsys_hibernate_free_hcb(hcb);
 		goto backout;
@@ -4387,8 +4358,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		device_printf(sc->acpi_dev,
 		    "hibernate: coordinator acquire failed: %d\n", error);
 		free(hib_res_pages, M_TEMP);
-		free(ha.ha_dst_intervals, M_TEMP);
-		ha.ha_dst_intervals = NULL;
 		free(hpcb, M_TEMP);
 		dumpsys_hibernate_free_hcb(hcb);
 		goto backout;
@@ -4407,8 +4376,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    error);
 		/* H1: every coordinator acquire must have exactly one release. */
 		free(hib_res_pages, M_TEMP);
-		free(ha.ha_dst_intervals, M_TEMP);
-		ha.ha_dst_intervals = NULL;
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		hibernate_coordinator_release();
 		free(hpcb, M_TEMP);
@@ -4438,61 +4405,25 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	ha.ha_arena_size  = hcb->hc_contig_spare_size;
 
 	/*
-	 * N2/N5: populate the destination-interval array preallocated in P1
-	 * from vm_phys_segs.  No allocation here — the coordinator sleep mutex
-	 * is held and malloc(M_WAITOK) must not be called.
+	 * K-5 deliberately does NOT publish a destination-interval view.
+	 *
+	 * The destination set is the exact SAVEABLE complement (ingested RAM
+	 * that is non-FREE and non-arena), which K-6 materializes when it emits
+	 * the PT_LOAD programs.  Publishing all of vm_phys_segs here -- which
+	 * includes the FREE pages just classified -- would set
+	 * hibernate_page_is_destination() true for essentially all RAM and
+	 * advertise a view stronger than was established, contradicting the
+	 * ha_dst_valid contract.
+	 *
+	 * ha_dst_valid therefore stays false and hibernate_page_is_destination()
+	 * returns false for attempt state without a published view.  K-5's SAVE
+	 * path never consults the view (reservation excludes only the arena);
+	 * the capacity check derives the destination-union cardinality directly
+	 * from the SAVEABLE complement.  K-6/K-8 publish the exact view.
 	 */
-	{
-		int nseg;
-
-		nseg = vm_phys_nsegs;
-		if (nseg <= 0) {
-			device_printf(sc->acpi_dev,
-			    "hibernate: no physical segments; refusing\n");
-			free(hib_res_pages, M_TEMP);
-			free(ha.ha_dst_intervals, M_TEMP);
-			ha.ha_dst_intervals = NULL;
-			hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
-			hibernate_coordinator_release();
-			free(hpcb, M_TEMP);
-			dumpsys_hibernate_free_hcb(hcb);
-			goto backout;
-		}
-		for (int _s = 0; _s < nseg; _s++) {
-			ha.ha_dst_intervals[_s * 2]     = vm_phys_segs[_s].start;
-			ha.ha_dst_intervals[_s * 2 + 1] = vm_phys_segs[_s].end;
-		}
-		/*
-		 * M2: validate the published destination contract locally.
-		 * Each interval must have start < end and both must be
-		 * PAGE_SIZE-aligned (vm_phys_segs invariant, but verify
-		 * before advertising ha_dst_valid = true).
-		 */
-		for (int _s = 0; _s < nseg; _s++) {
-			vm_paddr_t _start = ha.ha_dst_intervals[_s * 2];
-			vm_paddr_t _end   = ha.ha_dst_intervals[_s * 2 + 1];
-			if (_start >= _end ||
-			    (_start & (PAGE_SIZE - 1)) != 0 ||
-			    (_end   & (PAGE_SIZE - 1)) != 0) {
-				device_printf(sc->acpi_dev,
-				    "hibernate: seg[%d] [%#jx,%#jx) "
-				    "invalid; refusing\n",
-				    _s, (uintmax_t)_start,
-				    (uintmax_t)_end);
-				free(hib_res_pages, M_TEMP);
-				free(ha.ha_dst_intervals, M_TEMP);
-				ha.ha_dst_intervals = NULL;
-				hibernate_barrier_unwind(&ha, &hib_res,
-				    &hib_stages);
-				hibernate_coordinator_release();
-				free(hpcb, M_TEMP);
-				dumpsys_hibernate_free_hcb(hcb);
-				goto backout;
-			}
-		}
-		ha.ha_dst_count = (uint64_t)nseg;
-		ha.ha_dst_valid = true;
-	}
+	ha.ha_dst_count = 0;
+	ha.ha_dst_valid = false;
+	ha.ha_dst_intervals = NULL;
 
 	/*
 	 * H2: Resolve the dump-path CAM SIM from the FIRST dumper in
@@ -4558,9 +4489,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 			    "hibernate: cannot acquire peripheral reference "
 			    "for active dump-path CAM SIM (H2); refusing\n");
 			free(hib_res_pages, M_TEMP);
-			free(ha.ha_dst_intervals, M_TEMP);
-			ha.ha_dst_intervals = NULL;
-			ha.ha_dst_valid = false;
 			hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 			hibernate_coordinator_release();
 			/* hib_cam_periph is NULL here; no release needed. */
@@ -4649,14 +4577,11 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * are done by acpi_s4_resume_bsp().
 		 *
 		 *   3. acpi_s4_resume_bsp() -- AP resume + interrupt restore
-		 *   2. free reservation array and destination intervals
+		 *   2. free the reservation array
 		 *   1. hibernate_coordinator_release() -- release lock LAST
 		 */
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		free(hib_res_pages, M_TEMP);
-		free(ha.ha_dst_intervals, M_TEMP);
-		ha.ha_dst_intervals = NULL;
-		ha.ha_dst_valid = false;
 	    acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state,
 		hpcb, hcb, saved_td_locks, saved_td_pinned,
 		saved_td_sleeplocks);
@@ -4683,14 +4608,11 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * (reservation, CAM, callouts).  Stage 4 (preempt/intr) was not
 	 * acquired.  Complete the stage 3-1 unwind here:
 	 *   3. resume_other_cpus() -- restart APs suspended in stage 3
-	 *   2. free reservation array and destination intervals
+	 *   2. free the reservation array
 	 *   1. hibernate_coordinator_release() -- release lock LAST
 	 */
 	resume_other_cpus(&susp_cpus);
 	free(hib_res_pages, M_TEMP);
-	free(ha.ha_dst_intervals, M_TEMP);
-	ha.ha_dst_intervals = NULL;
-	ha.ha_dst_valid = false;
 	hibernate_coordinator_release();
 	/* H2: release periph reference held since CAM lookup. */
 	if (hib_cam_periph != NULL) {

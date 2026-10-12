@@ -2160,6 +2160,14 @@ hib_validate_reservation(const struct hibernate_attempt *ha,
 
 	if (ha == NULL || res == NULL)
 		return (EINVAL);
+	/*
+	 * Reject a malformed transition-arena tuple once, here, rather than
+	 * letting hib_page_in_arena() treat a wrapped start + size as covering
+	 * every page at or above start.
+	 */
+	if (ha->ha_arena_size != 0 &&
+	    ha->ha_arena_start + ha->ha_arena_size < ha->ha_arena_start)
+		return (EINVAL);
 	if (res->vr_count != 0)
 		return (EINVAL);
 	if (res->vr_capacity > 0 && res->vr_pages == NULL)

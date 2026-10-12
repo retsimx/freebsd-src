@@ -509,6 +509,9 @@ hibernate_restore_footprint_compute(uint64_t destination_union_pages,
 {
 	uint64_t total, pg, bytes, margin, margin_ceil;
 
+	if (derived_pages_out == NULL)
+		return (EINVAL);
+
 	total = 0;
 
 	/* 1. Wired kernel pages (caller-supplied; kernel passes vm_wire_count()). */
