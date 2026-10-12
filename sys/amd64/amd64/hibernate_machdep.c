@@ -89,6 +89,37 @@ hibernate_setup_identity_map(void)
 }
 
 /*
+ * low_page: one contiguous physical page < 4 GiB for the resume trampoline
+ * and low stack.  Allocated once by dumpsys_hibernate_savectx_preinit()
+ * before the K-5 page reservation drains vm_phys; reused on every save.
+ */
+static void *low_page = NULL;
+
+/*
+ * dumpsys_hibernate_savectx_preinit: force the one-time MD allocations that
+ * dumpsys_hibernate_savectx() needs before the K-5 stability barrier drains
+ * all FREE pages from vm_phys.
+ *
+ * Must be called before hibernate_barrier_prepare() (step 7).  Safe to call
+ * more than once; both the low_page allocation and the identity map setup are
+ * idempotent after the first call.
+ *
+ * Returns 0 on success, ENOMEM if the low trampoline page cannot be allocated.
+ */
+int
+dumpsys_hibernate_savectx_preinit(void)
+{
+	if (low_page == NULL) {
+		low_page = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK, 0,
+		    0xfffffffful, PAGE_SIZE, 0ul);
+		if (low_page == NULL)
+			return (ENOMEM);
+	}
+	hibernate_setup_identity_map();
+	return (0);
+}
+
+/*
  * Save the current context in the hibernate PCB.
  *
  * Returns twice, the second time with EJUSTRETURN (on restore).
@@ -97,26 +128,18 @@ int
 dumpsys_hibernate_savectx(struct hibernate_save_pcb *hpcb, void *stack_top,
     int (*dump_fn)(void *, void *), void *dump_arg)
 {
-	static void *low_page = NULL;
 	struct pcb *pcb;
 	uint64_t low_entry_pa, low_stack_pa;
 	size_t cr3_offset;
 	int error;
 
 	/*
-	 * 1. Allocate 1 contiguous physical page < 4 GiB for trampoline & stack.
+	 * 1 & 2. low_page and the identity map are preallocated by
+	 * dumpsys_hibernate_savectx_preinit() before the K-5 stability
+	 * barrier drains vm_phys.  Both must be non-NULL here.
 	 */
-	if (low_page == NULL) {
-		low_page = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK, 0,
-		    0xfffffffful, PAGE_SIZE, 0ul);
-		if (low_page == NULL)
-			panic("hibernate: cannot allocate low trampoline page");
-	}
-
-	/*
-	 * 2. Setup transient 1:1 mapping of low 4 GiB in kernel_pmap.
-	 */
-	hibernate_setup_identity_map();
+	if (low_page == NULL)
+		panic("hibernate: low trampoline page not preallocated");
 
 	/*
 	 * 3. Copy trampoline code to offset 0 and record kernel CR3.

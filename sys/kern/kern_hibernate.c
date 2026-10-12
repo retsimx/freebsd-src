@@ -37,6 +37,8 @@
 #else
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/_maxphys.h>
+#include <sys/callout.h>
 #include <sys/conf.h>
 #include <sys/elf64.h>
 #include <sys/elf_common.h>
@@ -47,8 +49,24 @@
 #include <sys/kerneldump.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
+#include <sys/proc.h>
+#include <sys/sched.h>
+#include <sys/sysctl.h>
+#include <sys/vmmeter.h>
 
 #include <machine/atomic.h>
+#include <machine/hibernate.h>
+
+#include <cam/cam.h>
+#include <cam/cam_ccb.h>
+#include <cam/cam_sim.h>
+#include <cam/cam_xpt.h>
+#include <cam/cam_xpt_sim.h>
+#include <cam/cam_queue.h>
+
+#include <vm/vm.h>
+#include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 #endif /* _HIBERNATE_USERLAND_BUILD */
 
 /* ELF magic bytes. */
@@ -86,8 +104,7 @@
 #define EHDR_SIZE	  64
 #define PHDR_SIZE	  56
 
-/* Page alignment for CB, PCB, and payload. */
-#define HIB_PAGE_SIZE 4096
+/* HIB_PAGE_SIZE (4096) is defined in sys/sys/hibernate.h. */
 
 /*
  * align_up_checked: compute align_up(v, align) into *out.
@@ -443,6 +460,130 @@ hibernate_marker_result_from_transfer(int error, size_t transferred,
 	return (0);
 }
 
+/*
+ * hibernate_restore_footprint_compute: pure arithmetic core of footprint
+ * derivation.  Takes destination_union_pages and an explicit wired_pages
+ * argument (instead of calling vm_wire_count() directly) so that
+ * host-runnable tests can exercise the production formula without kernel
+ * dependencies (N7: exercise production derivation, not a copy).
+ *
+ * This function is compiled in both kernel and userland modes
+ * (_HIBERNATE_USERLAND_BUILD) and contains no kernel-only calls.
+ *
+ * Components (all rounded up to whole pages):
+ *   1. wired_pages (caller-supplied; kernel passes vm_wire_count()).
+ *   2. Metadata prefix storage: HIB_METADATA_MAX_BYTES.
+ *   3. Source-vector: destination_union_pages * 8 bytes.
+ *   4. One maximum BIO/backend transfer buffer: HIB_MAXPHYS_BYTES.
+ *   5. Arena-external MD workspace: HIB_SCRATCH_STACK_BYTES.
+ *   6. Reservation-record bytes: destination_union_pages * record_size + 1 page.
+ *   7. 25% fragmentation margin (checked ceiling division).
+ *
+ * Returns 0 with *derived_pages_out set on success, EOVERFLOW on
+ * arithmetic overflow, or ENOMEM if the result exceeds HIB_FOOTPRINT_MAX.
+ */
+/*
+ * hib_compute_pages_roundup: inline page-size roundup for use in the
+ * userland-buildable compute function (avoids dependency on hib_pages_roundup
+ * which is defined inside the #ifndef _HIBERNATE_USERLAND_BUILD block).
+ * Returns EOVERFLOW when the rounded result would overflow uint64_t.
+ */
+static inline int
+hib_compute_pages_roundup(uint64_t bytes, uint64_t *pages_out)
+{
+	uint64_t rounded;
+
+	if (bytes == 0) {
+		*pages_out = 0;
+		return (0);
+	}
+	if (__builtin_add_overflow(bytes, HIB_PAGE_SIZE - 1, &rounded))
+		return (EOVERFLOW);
+	*pages_out = rounded / HIB_PAGE_SIZE;
+	return (0);
+}
+
+int
+hibernate_restore_footprint_compute(uint64_t destination_union_pages,
+    uint64_t wired_pages, uint64_t *derived_pages_out)
+{
+	uint64_t total, pg, bytes, margin, margin_ceil;
+
+	total = 0;
+
+	/* 1. Wired kernel pages (caller-supplied; kernel passes vm_wire_count()). */
+	if (__builtin_add_overflow(total, wired_pages, &total))
+		return (EOVERFLOW);
+
+	/* 2. Metadata prefix (at most HIB_METADATA_MAX_BYTES). */
+	if (hib_compute_pages_roundup(HIB_METADATA_MAX_BYTES, &pg) != 0)
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(total, pg, &total))
+		return (EOVERFLOW);
+
+	/* 3. Source-vector: destination_union_pages * 8 bytes, checked. */
+	if (__builtin_mul_overflow(destination_union_pages, (uint64_t)8,
+	    &bytes))
+		return (EOVERFLOW);
+	if (hib_compute_pages_roundup(bytes, &pg) != 0)
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(total, pg, &total))
+		return (EOVERFLOW);
+
+	/*
+	 * 4. One maximum BIO/backend transfer buffer.
+	 * Use HIB_MAXPHYS_BYTES (defined in hibernate.h) to avoid
+	 * depending on MAXPHYS (kernel-only via sys/_maxphys.h).
+	 */
+	if (hib_compute_pages_roundup(HIB_MAXPHYS_BYTES, &pg) != 0)
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(total, pg, &total))
+		return (EOVERFLOW);
+
+	/*
+	 * 5. Arena-external MD workspace.
+	 * Use HIB_SCRATCH_STACK_BYTES (defined in hibernate.h) to avoid
+	 * depending on HIBERNATE_SCRATCH_STACK_SIZE (machine-dependent).
+	 */
+	if (hib_compute_pages_roundup(HIB_SCRATCH_STACK_BYTES, &pg) != 0)
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(total, pg, &total))
+		return (EOVERFLOW);
+
+	/*
+	 * 6. Reservation-record bytes + allocation/alignment overhead.
+	 * Record size: HIB_RESERVATION_RECORD_BYTES (16 bytes on amd64 LP64).
+	 */
+	if (__builtin_mul_overflow(destination_union_pages,
+	    (uint64_t)HIB_RESERVATION_RECORD_BYTES, &bytes))
+		return (EOVERFLOW);
+	/* Add one page for alignment/allocation overhead. */
+	if (__builtin_add_overflow(bytes, HIB_PAGE_SIZE, &bytes))
+		return (EOVERFLOW);
+	if (hib_compute_pages_roundup(bytes, &pg) != 0)
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(total, pg, &total))
+		return (EOVERFLOW);
+
+	/*
+	 * 7. 25% fragmentation margin: ceil(total * 25 / 100).
+	 * Computed as checked ceiling division: (total * 25 + 99) / 100.
+	 */
+	if (__builtin_mul_overflow(total, HIB_FRAG_PCT, &margin))
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(margin, HIB_FRAG_DIV - 1, &margin_ceil))
+		return (EOVERFLOW);
+	margin_ceil /= HIB_FRAG_DIV;
+	if (__builtin_add_overflow(total, margin_ceil, &total))
+		return (EOVERFLOW);
+
+	if (total > HIB_FOOTPRINT_MAX)
+		return (ENOMEM);
+
+	*derived_pages_out = total;
+	return (0);
+}
+
 #ifndef _HIBERNATE_USERLAND_BUILD
 
 struct hibernate_provider_owner {
@@ -742,6 +883,728 @@ hibernate_probe(struct hibernate_attempt *ha)
 	    ha->ha_provider_size, &ha->ha_marker_result);
 	return (error);
 }
+
+/*
+ * K-5 capacity check and restore-footprint derivation.
+ *
+ * hibernate_capacity_check() performs sequential checked subtraction of
+ * arena, destination-union, and restore-footprint budget from physmem.
+ * It returns 0 when eligible >= required (including equality), ENOMEM on
+ * a valid shortfall, EOVERFLOW on arithmetic overflow, and EINVAL on
+ * null pointers, zero required cardinalities, or impossible set sizes.
+ * The result struct is zeroed before any validation so no failing return
+ * leaks partial output.
+ *
+ * hibernate_page_is_destination() tests whether the physical address of
+ * page m falls within the validated destination-interval view stored in
+ * the current hibernate attempt.  It reads only attempt-owned, pre-
+ * validated state; it does not reparse ELF headers or inspect page queues.
+ *
+ * hibernate_restore_footprint_derive() computes the checked minimum
+ * restore-kernel footprint in pages from system constants.  It is called
+ * once at the start of a save attempt before any freeze.
+ *
+ * kern.hibernate.restore_footprint_pages is a boot-time configured floor.
+ * The effective budget is max(configured_floor, derived_minimum).
+ * The default is 262144 pages (1 GiB at 4 KiB/page).
+ * The maximum is 16777216 pages (64 GiB at 4 KiB/page).
+ */
+
+/* HIB_FOOTPRINT_*, HIB_METADATA_MAX_BYTES, HIB_FRAG_*, HIB_MAXPHYS_BYTES,
+ * HIB_SCRATCH_STACK_BYTES, HIB_RESERVATION_RECORD_BYTES, HIB_PAGE_SIZE
+ * are defined in sys/sys/hibernate.h for dual-build (kernel + userland). */
+
+static SYSCTL_NODE(_kern, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE,
+    0, "Hibernate parameters");
+
+/*
+ * Configured restore-footprint floor.  Read once at boot; protected by
+ * CTLFLAG_RDTUN so it cannot be changed at runtime.
+ */
+static u_long hibernate_restore_footprint_pages = HIB_FOOTPRINT_DEFAULT;
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_pages,
+    CTLFLAG_RDTUN, &hibernate_restore_footprint_pages, 0,
+    "Restore-kernel footprint floor in pages (default 262144, max 16777216)");
+
+/*
+ * Derived footprint in pages, set by hibernate_restore_footprint_derive().
+ * Exposed read-only for diagnostics.
+ */
+static u_long hibernate_restore_footprint_derived;
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_derived,
+    CTLFLAG_RD, &hibernate_restore_footprint_derived, 0,
+    "Derived minimum restore-kernel footprint in pages (computed at boot)");
+
+/*
+ * Effective footprint budget (max of configured floor and derived minimum).
+ */
+static u_long hibernate_restore_footprint_effective;
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_effective,
+    CTLFLAG_RD, &hibernate_restore_footprint_effective, 0,
+    "Effective restore-kernel footprint budget in pages");
+
+/*
+ * hib_pages_roundup: round byte count up to whole pages.
+ * Returns EOVERFLOW when the result would overflow uint64_t.
+ */
+static int
+hib_pages_roundup(uint64_t bytes, uint64_t *pages_out)
+{
+	uint64_t pg, rounded;
+
+	if (bytes == 0) {
+		*pages_out = 0;
+		return (0);
+	}
+	/* Round up: (bytes + PAGE_SIZE - 1) / PAGE_SIZE */
+	if (__builtin_add_overflow(bytes, (uint64_t)PAGE_SIZE - 1, &rounded))
+		return (EOVERFLOW);
+	pg = rounded / PAGE_SIZE;
+	*pages_out = pg;
+	return (0);
+}
+
+/*
+ * hibernate_capacity_check: sequential checked subtraction capacity test.
+ *
+ * Inputs (all in pages):
+ *   b->physmem_pages                  Total physical pages.
+ *   b->arena_pages                    Transition-arena pages (disjoint).
+ *   b->destination_union_pages        Union of all PT_LOAD destination pages.
+ *   b->restore_kernel_footprint_budget Conservative restore footprint.
+ *
+ * Outputs (filled only on success):
+ *   r->eligible_source_pages   Residual after arena + dst + footprint.
+ *   r->required_source_pages   destination_union_pages (one copy needed).
+ *   r->shortfall_pages         max(required - eligible, 0).
+ *
+ * Return codes:
+ *   0         Sufficient (eligible >= required), including equality.
+ *   EINVAL    Null pointer, zero required cardinality, or impossible sizes.
+ *   EOVERFLOW Checked arithmetic failure.
+ *   ENOMEM    Valid cardinalities but insufficient eligible sources.
+ */
+int
+hibernate_capacity_check(const struct hibernate_capacity_budget *b,
+    struct hibernate_capacity_result *r)
+{
+	uint64_t eligible;
+
+	/*
+	 * Zero the result struct unconditionally so no failing return
+	 * leaks partial output.
+	 */
+	if (r != NULL)
+		memset(r, 0, sizeof(*r));
+
+	if (b == NULL || r == NULL)
+		return (EINVAL);
+
+	/* Required cardinalities must be non-zero. */
+	if (b->physmem_pages == 0 || b->destination_union_pages == 0)
+		return (EINVAL);
+
+	/*
+	 * Each individual set size must not exceed physmem; if any single
+	 * deduction already exceeds physmem the sets cannot be pairwise
+	 * disjoint.
+	 */
+	if (b->arena_pages > b->physmem_pages ||
+	    b->destination_union_pages > b->physmem_pages)
+		return (EINVAL);
+
+	/*
+	 * The restore footprint is a valid capacity requirement, not a PFN set
+	 * whose standalone size must fit physmem for the input to be meaningful.
+	 * A representable configured footprint larger than available physical
+	 * memory is therefore an ordinary capacity shortage.  Populate the result
+	 * consistently and return ENOMEM rather than classifying it as EINVAL.
+	 */
+	if (b->restore_kernel_footprint_budget > b->physmem_pages) {
+		r->eligible_source_pages = 0;
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages;
+		return (ENOMEM);
+	}
+
+	/*
+	 * Sequential checked subtraction.  Each step proves the deduction
+	 * does not exceed the current residual; arena overflow is EINVAL
+	 * (mathematically impossible disjoint set), destination and
+	 * footprint overflow are ENOMEM (valid shortfall).
+	 */
+	eligible = b->physmem_pages;
+
+	/* Deduct arena. */
+	if (b->arena_pages > eligible)
+		return (EINVAL);
+	eligible -= b->arena_pages;
+
+	/* Deduct destination union. */
+	if (b->destination_union_pages > eligible) {
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages - eligible;
+		return (ENOMEM);
+	}
+	eligible -= b->destination_union_pages;
+
+	/* Deduct restore-kernel footprint. */
+	if (b->restore_kernel_footprint_budget > eligible) {
+		/*
+		 * The footprint itself consumes remaining space; no sources
+		 * remain.  Eligible is now 0 after footprint deduction would
+		 * underflow, so shortfall is required - 0 = required.
+		 */
+		r->eligible_source_pages = 0;
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages;
+		return (ENOMEM);
+	}
+	eligible -= b->restore_kernel_footprint_budget;
+
+	r->eligible_source_pages = eligible;
+	r->required_source_pages = b->destination_union_pages;
+
+	if (eligible < b->destination_union_pages) {
+		r->shortfall_pages = b->destination_union_pages - eligible;
+		return (ENOMEM);
+	}
+
+	r->shortfall_pages = 0;
+	return (0);
+}
+
+/*
+ * hibernate_page_is_destination: test whether page m's physical address
+ * falls within the validated destination-interval view of the current
+ * hibernate attempt.
+ *
+ * The attempt pointer is obtained from the global hibernate_current_attempt,
+ * set only while a save attempt is active.  If no attempt is active or the
+ * destination view has not been published, the function returns false.
+ *
+ * ha_dst_intervals holds ha_dst_count sorted, strictly increasing
+ * [start, end) physical-address pairs.  Membership is tested with a
+ * linear scan; the interval count is bounded by PT_LOAD count.
+ *
+ * This function does not reparse ELF headers and does not inspect page
+ * queues or page flags.
+ */
+
+/*
+ * Hibernate coordinator mutex: serialises concurrent save attempts.
+ * Acquired before setting HIB_STAGE_COORDINATOR; released during unwind.
+ * MTX_DEF is sufficient — the lock is held only in thread context before
+ * APs are stopped, never under a spin lock or with interrupts disabled.
+ */
+static struct mtx hibernate_coordinator_mtx;
+MTX_SYSINIT(hibernate_coordinator, &hibernate_coordinator_mtx,
+    "hibernate coordinator", MTX_DEF);
+
+/* Pointer to the active hibernate attempt, set/cleared by the coordinator. */
+static struct hibernate_attempt *hibernate_current_attempt;
+
+/*
+ * Footprint derivation/configuration status, set by hibernate_footprint_sysinit.
+ * 0 = valid (hibernate_restore_footprint_effective is usable).
+ * EOVERFLOW = arithmetic overflow during derivation.
+ * ENOMEM    = derived minimum exceeded HIB_FOOTPRINT_MAX.
+ * EINVAL    = configured floor was invalid (already corrected to default,
+ *             but save attempts must still re-validate).
+ */
+static int hibernate_footprint_status;
+
+bool
+hibernate_page_is_destination(vm_page_t m)
+{
+	const struct hibernate_attempt *ha;
+	vm_paddr_t pa;
+	uint64_t i;
+
+	ha = atomic_load_ptr(&hibernate_current_attempt);
+	if (ha == NULL || !ha->ha_dst_valid ||
+	    ha->ha_dst_intervals == NULL || ha->ha_dst_count == 0)
+		return (false);
+
+	pa = VM_PAGE_TO_PHYS(m);
+
+	/*
+	 * Linear scan over validated [start, end) pairs.
+	 * Intervals are sorted and non-overlapping; we could binary-search
+	 * but the count is small and linear scan is simpler and correct.
+	 */
+	for (i = 0; i < ha->ha_dst_count; i++) {
+		vm_paddr_t start, end;
+
+		start = ha->ha_dst_intervals[i * 2];
+		end   = ha->ha_dst_intervals[i * 2 + 1];
+		if (pa >= start && pa < end)
+			return (true);
+		/* Intervals are sorted; stop early if past pa. */
+		if (start > pa)
+			break;
+	}
+	return (false);
+}
+
+/*
+ * hibernate_restore_footprint_derive: compute the checked minimum restore-
+ * kernel footprint in pages from system constants.  Called once before any
+ * hibernate freeze.
+ *
+ * Components (all rounded up to whole pages):
+ *   1. Page-rounded fresh-kernel wired pages (vm_wire_count()).
+ *   2. Metadata prefix storage (at most HIB_METADATA_MAX_BYTES).
+ *   3. Source-vector bytes: destination_union_pages * 8, checked.
+ *   4. One maximum BIO/backend transfer buffer (MAXPHYS bytes).
+ *   5. Arena-external MD workspace (HIBERNATE_SCRATCH_STACK_SIZE bytes).
+ *   6. Reservation-record bytes + allocation/alignment overhead.
+ *   7. 25% fragmentation margin (checked ceiling division).
+ *
+ * Returns 0 on success and writes *derived_pages_out.
+ * Returns EOVERFLOW on any arithmetic overflow.
+ * Returns ENOMEM when the derived minimum exceeds HIB_FOOTPRINT_MAX.
+ *
+ * destination_union_pages is the number of destination pages the caller
+ * has computed; it is used only for the source-vector size estimate.
+ * Callers that do not yet know the exact count should pass a conservative
+ * upper bound (e.g. physmem).
+ */
+int
+hibernate_restore_footprint_derive(uint64_t destination_union_pages,
+    uint64_t *derived_pages_out)
+{
+	/*
+	 * N7: delegate to hibernate_restore_footprint_compute() so the
+	 * pure arithmetic is testable from userland without vm_wire_count().
+	 * The kernel wrapper supplies the live wired-page count.
+	 */
+	return (hibernate_restore_footprint_compute(destination_union_pages,
+	    (uint64_t)vm_wire_count(), derived_pages_out));
+}
+
+/*
+ * hibernate_footprint_sysinit: validate the configured floor and derive
+ * the minimum footprint at boot, before any freeze.
+ *
+ * Reads hibernate_restore_footprint_pages (the RDTUN sysctl/tunable),
+ * validates it, derives the minimum, and computes the effective budget.
+ * Results are stored in the read-only diagnostic sysctls.
+ *
+ * Errors are recorded in hibernate_footprint_status and must be consumed
+ * by the save path before the freeze via hibernate_footprint_check().
+ */
+static void
+hibernate_footprint_sysinit(void *unused __unused)
+{
+	uint64_t derived, effective;
+	u_long configured;
+	int error;
+
+	/*
+	 * Fetch the tunable value (CTLFLAG_RDTUN copies it into the static
+	 * at early boot; we read it directly).
+	 */
+	configured = hibernate_restore_footprint_pages;
+
+	if (configured == 0 || configured > HIB_FOOTPRINT_MAX) {
+		printf("hibernate: restore_footprint_pages %lu invalid "
+		    "(range 1..%lu); using default %lu\n",
+		    configured, HIB_FOOTPRINT_MAX, HIB_FOOTPRINT_DEFAULT);
+		/*
+		 * Record EINVAL so the save path can refuse; reset to the
+		 * default so the effective value remains useful for diagnostics.
+		 */
+		hibernate_footprint_status = EINVAL;
+		configured = HIB_FOOTPRINT_DEFAULT;
+		hibernate_restore_footprint_pages = configured;
+		/* Fall through to derive with the default so effective is set. */
+	}
+
+	/*
+	 * Derive using physmem as a conservative upper bound for the
+	 * destination_union_pages argument (worst case: all pages are
+	 * destinations).
+	 */
+	error = hibernate_restore_footprint_derive((uint64_t)physmem,
+	    &derived);
+	if (error == EOVERFLOW) {
+		printf("hibernate: footprint derivation overflow; "
+		    "save attempts will be refused\n");
+		hibernate_footprint_status = EOVERFLOW;
+		hibernate_restore_footprint_derived = 0;
+		hibernate_restore_footprint_effective =
+		    (u_long)HIB_FOOTPRINT_MAX;
+		return;
+	}
+	if (error == ENOMEM) {
+		printf("hibernate: derived footprint exceeds maximum "
+		    "(%lu pages); save attempts will be refused\n",
+		    HIB_FOOTPRINT_MAX);
+		hibernate_footprint_status = ENOMEM;
+		hibernate_restore_footprint_derived = (u_long)HIB_FOOTPRINT_MAX;
+		hibernate_restore_footprint_effective =
+		    (u_long)HIB_FOOTPRINT_MAX;
+		return;
+	}
+
+	hibernate_restore_footprint_derived = (u_long)derived;
+
+	effective = (derived > (uint64_t)configured) ? derived :
+	    (uint64_t)configured;
+	if (effective > HIB_FOOTPRINT_MAX)
+		effective = HIB_FOOTPRINT_MAX;
+	hibernate_restore_footprint_effective = (u_long)effective;
+	/*
+	 * If hibernate_footprint_status was set to EINVAL above (invalid
+	 * configured floor), leave it set so the save path refuses.
+	 * Otherwise the derivation succeeded: status remains 0.
+	 */
+}
+SYSINIT(hibernate_footprint, SI_SUB_KMEM, SI_ORDER_ANY,
+    hibernate_footprint_sysinit, NULL);
+
+/*
+ * hibernate_barrier_publish_attempt / hibernate_barrier_retract_attempt:
+ * expose or withdraw the active hibernate attempt for
+ * hibernate_page_is_destination().
+ *
+ * hibernate_current_attempt is declared static above; these two functions
+ * are the only write paths.  Reads use atomic_load_ptr() so no lock is
+ * required on the read side.
+ */
+void
+hibernate_barrier_publish_attempt(struct hibernate_attempt *ha)
+{
+	KASSERT(ha != NULL, ("%s: null attempt", __func__));
+	atomic_store_ptr(&hibernate_current_attempt, ha);
+}
+
+void
+hibernate_barrier_retract_attempt(void)
+{
+	atomic_store_ptr(&hibernate_current_attempt, NULL);
+}
+
+/*
+ * hibernate_footprint_check: enforce the footprint status recorded at boot.
+ *
+ * Returns 0 when the footprint configuration and derivation are valid.
+ * Returns EINVAL when the configured floor was invalid.
+ * Returns EOVERFLOW when derivation overflowed.
+ * Returns ENOMEM when the derived minimum exceeds HIB_FOOTPRINT_MAX.
+ *
+ * Must be called before the freeze (before AP stop) so refusal is clean.
+ */
+int
+hibernate_footprint_check(void)
+{
+	return (hibernate_footprint_status);
+}
+
+/*
+ * hibernate_footprint_effective: return the effective restore-kernel
+ * footprint budget in pages.  Valid only when hibernate_footprint_check()
+ * returns 0.
+ */
+u_long
+hibernate_footprint_effective(void)
+{
+	return (hibernate_restore_footprint_effective);
+}
+
+/*
+ * hibernate_coordinator_acquire: acquire the hibernate coordinator lock,
+ * blocking concurrent save attempts.  Must be called before setting
+ * HIB_STAGE_COORDINATOR and before any resource preallocation.
+ *
+ * Returns 0 on success.  Currently always succeeds; the lock is a mutex
+ * that serialises attempts without a try-acquire timeout.
+ */
+int
+hibernate_coordinator_acquire(void)
+{
+	mtx_lock(&hibernate_coordinator_mtx);
+	return (0);
+}
+
+/*
+ * hibernate_coordinator_release: release the hibernate coordinator lock.
+ * Called during unwind after all other acquired stages have been released.
+ */
+void
+hibernate_coordinator_release(void)
+{
+	mtx_unlock(&hibernate_coordinator_mtx);
+}
+
+/*
+ * hibernate_barrier_unwind: release acquired barrier stages in strict
+ * reverse order.  Idempotent for bits that are not set.
+ *
+ * Full reverse order (descending bit value):
+ *   HIB_STAGE_RESERVED    (7) — vm_phys_hibernate_release
+ *   HIB_STAGE_CAM         (6) — xpt_release_simq (via ha->ha_cam_sim)
+ *   HIB_STAGE_CALLOUTS    (5) — callout_hibernate_exit
+ *   HIB_STAGE_BSP_INTRS   (4) — clear bit; caller calls intr_restore()
+ *   HIB_STAGE_BSP_PREEMPT (3) — clear bit; caller calls sched_unpin()
+ *   HIB_STAGE_APS_STOPPED (2) — clear bit; caller calls resume_other_cpus()
+ *   HIB_STAGE_RESOURCES   (1) — clear bit; caller frees preallocated buffers
+ *   HIB_STAGE_COORDINATOR (0) — release hibernate_coordinator_mtx
+ *
+ * Stages 1, 2, 3, and 4 involve caller-owned objects or CPU state; the bit
+ * is cleared here so the caller's unwind loop is driven by a single stages
+ * variable, but the actual resource free, AP resume, interrupt restore, and
+ * preemption restore remain caller-side in strict reverse order:
+ *   intr_restore() before sched_unpin() (reverse of sched_pin/intr_disable).
+ * After returning, the caller must:
+ *   - call intr_restore() if HIB_STAGE_BSP_INTRS was set before the call;
+ *   - call sched_unpin() if HIB_STAGE_BSP_PREEMPT was set before the call,
+ *     AFTER intr_restore() to avoid mi_switch in a critical section;
+ *   - call resume_other_cpus() if HIB_STAGE_APS_STOPPED was set;
+ *   - free preallocated buffers if HIB_STAGE_RESOURCES was set.
+ */
+void
+hibernate_barrier_unwind(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, unsigned int *stages)
+{
+	unsigned int s;
+
+	s = *stages;
+
+	/* Stage 7: release page reservation. */
+	if (s & HIB_STAGE_RESERVED) {
+		hibernate_barrier_retract_attempt();
+		vm_phys_hibernate_release(res);
+		s &= ~HIB_STAGE_RESERVED;
+	}
+
+	/*
+	 * Stage 6: thaw CAM admission.  xpt_release_simq() is the symmetric
+	 * pair to xpt_freeze_simq().  Pass run_queue=0 because interrupts
+	 * may still be disabled at this depth.
+	 */
+	if (s & HIB_STAGE_CAM) {
+		if (ha->ha_cam_sim != NULL)
+			xpt_release_simq(ha->ha_cam_sim, /*run_queue*/0);
+		s &= ~HIB_STAGE_CAM;
+	}
+
+	/* Stage 5: release callout freeze. */
+	if (s & HIB_STAGE_CALLOUTS) {
+		callout_hibernate_exit();
+		s &= ~HIB_STAGE_CALLOUTS;
+	}
+
+	/*
+	 * Stage 4a: clear interrupt-state bit.  The caller restores the
+	 * interrupt state via intr_restore() after AP resume (if needed),
+	 * since re-enabling interrupts before APs are running can deadlock
+	 * on SMP systems.
+	 */
+	if (s & HIB_STAGE_BSP_INTRS)
+		s &= ~HIB_STAGE_BSP_INTRS;
+
+	/*
+	 * Stage 4b: clear BSP preemption bit.  The caller calls sched_unpin()
+	 * AFTER intr_restore() to preserve the strict reverse order of
+	 * barrier_prepare (sched_pin then intr_disable → reverse: intr_restore
+	 * then sched_unpin).  Calling sched_unpin() here with interrupts still
+	 * disabled would allow a timer interrupt to fire and call mi_switch()
+	 * in a critical section immediately after intr_restore().
+	 */
+	if (s & HIB_STAGE_BSP_PREEMPT)
+		s &= ~HIB_STAGE_BSP_PREEMPT;
+
+	/*
+	 * Stage 3: clear AP-stopped bit.  The caller performs the actual
+	 * resume_other_cpus() because it holds the cpuset.
+	 */
+	if (s & HIB_STAGE_APS_STOPPED)
+		s &= ~HIB_STAGE_APS_STOPPED;
+
+	/*
+	 * Stage 2: clear resources bit.  The caller frees preallocated
+	 * buffers (hib_res_pages, hpcb, hcb) after this function returns.
+	 */
+	if (s & HIB_STAGE_RESOURCES)
+		s &= ~HIB_STAGE_RESOURCES;
+
+	/*
+	 * Stage 1: clear the coordinator bit.  The caller MUST call
+	 * hibernate_coordinator_release() after completing all physical
+	 * cleanup (AP resume, interrupt restore, resource free) so that
+	 * the coordinator lock is released LAST in strict reverse order.
+	 * Releasing the coordinator here would allow a new save attempt
+	 * to proceed while this attempt's APs are still stopped or its
+	 * reservation array is still live.
+	 */
+	if (s & HIB_STAGE_COORDINATOR)
+		s &= ~HIB_STAGE_COORDINATOR;
+
+	*stages = s;
+}
+
+/*
+ * hibernate_barrier_prepare: acquire barrier stages 4–7 of the K-5
+ * eight-stage SAVE stability barrier.
+ *
+ * Stages 1 (coordinator lock), 2 (resource preallocation), and 3 (AP
+ * stop) are caller-owned and must already be set in *stages before this
+ * function is called.  Step 3 (suspend_other_cpus) is static in acpi.c
+ * and is invoked by the ACPI caller directly.
+ *
+ * Steps performed here:
+ *   4. BSP preemption disable (sched_pin), then interrupt disable.
+ *   5. Callout freeze (callout_hibernate_enter).
+ *   6. CAM admission freeze (xpt_freeze_simq) + finite drain
+ *      (xpt_sim_poll, bounded by HIB_CAM_POLL_MAX iterations).
+ *   7. vm_phys_hibernate_reserve_all — from this point no allocation
+ *      may occur.
+ *
+ * On success returns 0, *stages has all eight bits set, and *intr_statep
+ * holds the register_t from intr_disable() for the caller to restore.
+ *
+ * On failure returns errno; all stages set by this call are released via
+ * hibernate_barrier_unwind() before returning, and the caller must still
+ * restore interrupt state if HIB_STAGE_BSP_INTRS was set.
+ *
+ * K-5 performs no marker I/O.
+ */
+int
+hibernate_barrier_prepare(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, unsigned int *stages,
+    register_t *intr_statep)
+{
+	register_t intr_state;
+	int error;
+
+	KASSERT(ha != NULL, ("%s: null attempt", __func__));
+	KASSERT(res != NULL, ("%s: null reservation", __func__));
+	KASSERT(stages != NULL, ("%s: null stages", __func__));
+	KASSERT(intr_statep != NULL, ("%s: null intr_statep", __func__));
+	KASSERT((*stages & HIB_STAGE_COORDINATOR) != 0,
+	    ("%s: coordinator stage not set", __func__));
+	KASSERT((*stages & HIB_STAGE_RESOURCES) != 0,
+	    ("%s: resources stage not set", __func__));
+	KASSERT((*stages & HIB_STAGE_APS_STOPPED) != 0,
+	    ("%s: APs not stopped", __func__));
+
+	/*
+	 * Step 4 is acquired by the ACPI worker immediately before this call.
+	 * The worker owns the saved interrupt state and performs the physical
+	 * intr_restore()/sched_unpin() after logical barrier unwind.
+	 */
+	KASSERT((*stages & HIB_STAGE_BSP_PREEMPT) != 0,
+	    ("%s: BSP preemption stage not set", __func__));
+	KASSERT((*stages & HIB_STAGE_BSP_INTRS) != 0,
+	    ("%s: BSP interrupt stage not set", __func__));
+	(void)intr_state;
+
+	/*
+	 * Step 5: freeze callouts.
+	 * callout_hibernate_enter() sets hibernate_writing so that
+	 * callout_process() diverts handlers through callout_hibernate_block()
+	 * rather than executing them.
+	 */
+	callout_hibernate_enter();
+	*stages |= HIB_STAGE_CALLOUTS;
+
+	/*
+	 * Step 6: freeze CAM admission and drain in-flight work.
+	 *
+	 * CAM audit result (approved decision 3 -- audit-first):
+	 * Existing seam covers all required K-5 semantics:
+	 *   xpt_freeze_simq(): increments devq->send_queue.qfrozen_cnt
+	 *   under devq->send_mtx; prevents new CCBs from dispatching.
+	 *   xpt_sim_poll(): calls sim->sim_poll() to drain in-flight
+	 *   work; during hibernate_writing (set in step 5) it skips
+	 *   the sim mutex, making drain progress finite.
+	 *   xpt_release_simq(): symmetric unfreeze on unwind.
+	 * No new CAM API is needed.  K-5 does not claim xpt_sim_poll()
+	 * alone freezes admission.
+	 *
+	 * N2: ha_cam_sim must be non-NULL.  If no pollable CAM SIM can be
+	 * associated with the dump path, K-5 refuses here rather than
+	 * silently declaring stage 6 complete without freezing admission.
+	 * The caller (acpi.c) must populate ha_cam_sim before calling
+	 * hibernate_barrier_prepare(); if no SIM is available it must
+	 * refuse before reaching this point.
+	 */
+	if (ha->ha_cam_sim == NULL) {
+		/*
+		 * N2: no dump-path CAM SIM associated.  Refuse rather than
+		 * declaring CAM admission frozen without actually freezing it.
+		 * Unwind stages already acquired (callouts, preempt, intrs)
+		 * before returning.
+		 */
+		hibernate_barrier_unwind(ha, res, stages);
+		return (ENXIO);
+	}
+	xpt_freeze_simq(ha->ha_cam_sim, /*count*/1);
+	*stages |= HIB_STAGE_CAM;
+	/*
+	 * H3: drain in-flight CAM work using the real quiescence predicate:
+	 * devq->send_active == 0 (no CCBs outstanding on this SIM).
+	 *
+	 * cam_sim_pollable() is a CAPABILITY flag (SIM supports polling)
+	 * that never becomes false after the SIM is frozen — using it as
+	 * a loop exit condition causes false timeout on every pollable SIM.
+	 *
+	 * Correct approach: after xpt_freeze_simq(), new CCBs cannot be
+	 * dispatched.  xpt_sim_poll() makes forward progress by completing
+	 * in-flight work.  We poll until send_active drops to zero
+	 * (genuine quiescence) or HIB_CAM_POLL_MAX iterations (bounded
+	 * refusal with EBUSY).
+	 *
+	 * send_active is read under devq->send_mtx to avoid torn reads.
+	 */
+#define	HIB_CAM_POLL_MAX	256
+	{
+		struct cam_devq *_devq = ha->ha_cam_sim->devq;
+		int _i;
+		int _active;
+
+		for (_i = 0; _i < HIB_CAM_POLL_MAX; _i++) {
+			mtx_lock(&_devq->send_mtx);
+			_active = _devq->send_active;
+			mtx_unlock(&_devq->send_mtx);
+			if (_active == 0)
+				break;	/* Quiescent: no outstanding CCBs. */
+			xpt_sim_poll(ha->ha_cam_sim);
+		}
+		if (_i == HIB_CAM_POLL_MAX) {
+			/* Re-check after final poll. */
+			mtx_lock(&_devq->send_mtx);
+			_active = _devq->send_active;
+			mtx_unlock(&_devq->send_mtx);
+			if (_active != 0) {
+				/* Drain did not reach quiescence. */
+				hibernate_barrier_unwind(ha, res, stages);
+				return (EBUSY);
+			}
+		}
+	}
+#undef	HIB_CAM_POLL_MAX
+
+	/*
+	 * Step 7: reserve all eligible FREE pages.
+	 * Publish the attempt pointer so hibernate_page_is_destination() is
+	 * live during classification under each domain free lock.
+	 * From this point no allocation may occur.
+	 */
+	hibernate_barrier_publish_attempt(ha);
+	error = vm_phys_hibernate_reserve_all(ha, res);
+	if (error != 0) {
+		hibernate_barrier_retract_attempt();
+		hibernate_barrier_unwind(ha, res, stages);
+		return (error);
+	}
+	*stages |= HIB_STAGE_RESERVED;
+
+	return (0);
+}
+
 #endif /* !_HIBERNATE_USERLAND_BUILD */
 
 /*

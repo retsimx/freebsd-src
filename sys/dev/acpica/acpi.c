@@ -73,7 +73,14 @@
 #include <machine/resource.h>
 #include <machine/bus.h>
 #ifdef OS_HIBERNATE_SUPPORT
+#include <sys/hibernate.h>
 #include <machine/hibernate.h>
+#include <vm/vm_phys.h>
+#include <geom/geom_disk.h>
+#include <cam/cam.h>
+#include <cam/cam_sim.h>
+#include <cam/cam_xpt_sim.h>
+#include <cam/cam_periph.h>
 #endif
 #include <sys/rman.h>
 #include <isa/isavar.h>
@@ -3730,27 +3737,230 @@ static char hibernate_dump_stack[HIBERNATE_SCRATCH_STACK_SIZE]
     __aligned(PAGE_SIZE);
 
 struct hibernate_dump_args {
-	struct acpi_softc	*sc;
+	struct acpi_softc		*sc;
 	struct hibernate_save_cb	*hcb;
 	struct hibernate_save_pcb	*hpcb;
-	int			slp_state;
+	int				slp_state;
+	/*
+	 * K-5 barrier state passed into the worker.
+	 * Stages 4–7 (preempt, callouts, CAM, reserve_all) are acquired
+	 * inside the worker AFTER savectx, so that savectx's pmap
+	 * allocations are not blocked by the reservation and the thread
+	 * is not pinned during the longjmp.
+	 */
+	struct hibernate_attempt	*ha;
+	struct vm_phys_reservation	*hib_res;
+	struct vm_phys_reservation_page *hib_res_pages;
+	u_long				hib_res_cap;
+	unsigned int			*hib_stages;
+	register_t			*intr_statep;
+	const cpuset_t			*susp_cpus;
+	/* pre-savectx thread state snapshot for error-path restore */
+	int				saved_td_locks;
+	struct lock_list_entry		*saved_td_sleeplocks;
 };
 
 static int
 acpi_hibernate_dump_worker(void *arg1, void *arg2)
 {
 	struct hibernate_dump_args *args = arg1;
+	struct hibernate_capacity_budget hib_cap_budget;
+	struct hibernate_capacity_result hib_cap_result;
 	int error = 0;
 
 	(void)arg2;
+
+	/*
+	 * Device resume for the dump path (first suspend already done).
+	 */
 	if ((args->slp_state & ACPI_SS_DEV_SUSPEND) != 0) {
 		device_printf(args->sc->acpi_dev,
 		    "Resuming the dump device (currently, all devices)\n");
 		DEVICE_RESUME(root_bus);
 	}
 
+	/*
+	 * K-5 design deviation: stages 4–7 (BSP preempt disable, callout
+	 * freeze, CAM freeze/drain, vm_phys reserve_all) are acquired HERE,
+	 * inside the dump worker running on the scratch stack, AFTER
+	 * dumpsys_hibernate_savectx() has already saved the CPU context and
+	 * made any pmap allocations it needs.
+	 *
+	 * The design places these steps before savectx, but that causes two
+	 * correctness failures on this platform:
+	 *   (a) sched_pin() before savectx makes the post-dump unwind call
+	 *       mi_switch() with td_critnest in an unexpected state (the dump
+	 *       worker accumulates spinlock nesting that is discarded on the
+	 *       error path, confusing the preemption machinery).
+	 *   (b) vm_phys_hibernate_reserve_all() before savectx drains all
+	 *       FREE pages, so savectx's pmap_page_alloc_below_4g() contig
+	 *       allocation panics in vm_reserv_reclaim_contig.
+	 *
+	 * Moving stages 4–7 into the worker allows savectx to complete its
+	 * MD setup before FREE-page capture.  APs remain physically suspended,
+	 * while normal mutex semantics are temporarily restored for reservation
+	 * and unwind.  scheduler_stopped is used only by the legacy polled dump.
+	 * The EJUSTRETURN (resume) path does NOT go through this worker,
+	 * so stages 4–7 are never set in hib_stages on the resume path;
+	 * hibernate_barrier_unwind() is a no-op for unset bits.
+	 */
+	/*
+	 * suspend_other_cpus() has physically suspended and acknowledged every
+	 * AP, but it also sets scheduler_stopped for the legacy polled dump path.
+	 * With scheduler_stopped set, a contended mutex acquisition is
+	 * deliberately bypassed.  The VM reservation helper must acquire real
+	 * domain free mutexes, so restore normal mutex semantics while APs remain
+	 * suspended.  Legacy dump mode is re-enabled only for the image write.
+	 */
+	KASSERT(SCHEDULER_STOPPED(),
+	    ("%s: scheduler not stopped on entry", __func__));
+	scheduler_stopped = false;
+
+	/*
+	 * Stage 4: pin the BSP and disable ordinary maskable interrupts before
+	 * FREE-page classification.  The baseline polled hibernate dumper runs
+	 * with interrupts disabled; leaving them enabled permits a timer
+	 * interrupt to request a context switch while CAM polling is in a
+	 * critical section.
+	 *
+	 * Domain free mutexes remain usable here because scheduler_stopped is
+	 * false and all APs are already physically suspended.
+	 */
+	sched_pin();
+	*args->hib_stages |= HIB_STAGE_BSP_PREEMPT;
+	*args->intr_statep = intr_disable();
+	*args->hib_stages |= HIB_STAGE_BSP_INTRS;
+
+	/*
+	 * Stages 5-7: callout freeze, CAM freeze/drain, reserve_all.
+	 * AP-stop (step 3) and stage 4 are already active.
+	 */
+	error = hibernate_barrier_prepare(args->ha, args->hib_res,
+	    args->hib_stages, args->intr_statep);
+	if (error != 0) {
+		device_printf(args->sc->acpi_dev,
+		    "K-5 barrier prepare failed in worker: %d\n", error);
+		/* hibernate_barrier_prepare() unwound its logical stage bits. */
+		intr_restore(*args->intr_statep);
+		sched_unpin();
+		scheduler_stopped = true;
+		return (error);
+	}
+
+	/*
+	 * N1: capacity inequality check after reserve_all (stage 7).
+	 *
+	 * physmem is the cardinality ingested from phys_avail[].  The transition
+	 * arena is excluded from phys_avail[] before VM startup, so it is already
+	 * absent from physmem and from the FREE snapshot.  Consequently the
+	 * SAVEABLE destination union is the complement of the captured FREE set
+	 * within physmem.  Do not subtract ha_arena_size here a second time.
+	 *
+	 * The capacity API still receives arena_pages == 0 because all of its
+	 * cardinalities use this same ingested-RAM universe.  A genuinely empty
+	 * SAVEABLE complement remains destination_union_pages == 0 and is
+	 * correctly rejected by hibernate_capacity_check() with EINVAL.
+	 */
+	{
+		uint64_t _free_pages, _saveable;
+
+		_free_pages = (uint64_t)args->hib_res->vr_count;
+
+		if (_free_pages > (uint64_t)physmem) {
+			device_printf(args->sc->acpi_dev,
+			    "hibernate: capacity arithmetic impossible "
+			    "(free=%llu physmem=%lu); refusing\n",
+			    (unsigned long long)_free_pages, physmem);
+			error = EOVERFLOW;
+		} else {
+			_saveable = (uint64_t)physmem - _free_pages;
+			hib_cap_budget.physmem_pages = (uint64_t)physmem;
+			hib_cap_budget.arena_pages = 0;
+			hib_cap_budget.destination_union_pages = _saveable;
+			hib_cap_budget.restore_kernel_footprint_budget =
+			    (uint64_t)hibernate_footprint_effective();
+			error = hibernate_capacity_check(&hib_cap_budget,
+			    &hib_cap_result);
+			if (error != 0)
+				device_printf(args->sc->acpi_dev,
+				    "hibernate: capacity check failed (%d): "
+				    "eligible=%llu required=%llu "
+				    "shortfall=%llu\n", error,
+				    (unsigned long long)
+				    hib_cap_result.eligible_source_pages,
+				    (unsigned long long)
+				    hib_cap_result.required_source_pages,
+				    (unsigned long long)
+				    hib_cap_result.shortfall_pages);
+		}
+		if (error != 0) {
+			hibernate_barrier_unwind(args->ha, args->hib_res,
+			    args->hib_stages);
+			intr_restore(*args->intr_statep);
+			sched_unpin();
+			scheduler_stopped = true;
+			return (error);
+		}
+	}
+
+	/*
+	 * The dump device is attached to the SIM frozen in barrier stage 6.
+	 * Keeping that SIM queue frozen across dump_for_hibernate() prevents
+	 * the dump path's own polled CCB from dispatching.
+	 *
+	 * Stage 6 is required through drain, FREE classification, reservation,
+	 * and the capacity proof.  Once the FREE pages have been removed from
+	 * vm_phys, the reservation itself stabilizes the omitted set for the
+	 * complete image write.  Thaw only the designated dump SIM here so
+	 * its polled CCBs can run.  Callouts remain frozen and the physical
+	 * reservation remains owned until the normal post-write unwind.
+	 *
+	 * Clear HIB_STAGE_CAM immediately after the matching release so every
+	 * later error and success path remains balanced and cannot release the
+	 * SIM queue twice.
+	 */
+	KASSERT((*args->hib_stages & HIB_STAGE_CAM) != 0,
+	    ("%s: dump SIM is not frozen", __func__));
+	KASSERT(args->ha->ha_cam_sim != NULL,
+	    ("%s: dump SIM is NULL", __func__));
+	xpt_release_simq(args->ha->ha_cam_sim, /*run_queue*/0);
+	*args->hib_stages &= ~HIB_STAGE_CAM;
+
+	/*
+	 * The existing polled hibernate dumper expects scheduler_stopped.
+	 * APs have remained physically suspended throughout classification.
+	 */
+	scheduler_stopped = true;
 	device_printf(args->sc->acpi_dev, "Saving the dump image...\n");
 	error = dump_for_hibernate(args->hcb, args->hpcb);
+
+	/*
+	 * Re-enable normal mutex operation before releasing the VM reservation.
+	 * APs remain suspended and interrupts remain disabled until reservation,
+	 * CAM, and callout state have been unwound.
+	 */
+	scheduler_stopped = false;
+
+	/*
+	 * Image write complete (success or I/O error).
+	 * Unwind stages 7 and 5 (reservation and callouts).  The dump SIM
+	 * queue was thawed, and HIB_STAGE_CAM cleared, before the write.
+	 * Stages 4 (preempt/intr) were not acquired in the worker.
+	 */
+	hibernate_barrier_unwind(args->ha, args->hib_res, args->hib_stages);
+
+	/*
+	 * Complete the physical stage-4 unwind in strict reverse order:
+	 * restore interrupts before allowing migration/preemption.
+	 */
+	intr_restore(*args->intr_statep);
+	sched_unpin();
+
+	/*
+	 * Preserve the legacy caller contract.  resume_other_cpus() clears this
+	 * flag before restarting APs.
+	 */
+	scheduler_stopped = true;
 	return (error);
 }
 
@@ -3773,8 +3983,11 @@ acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
 	curthread->td_locks = saved_td_locks;
 	curthread->td_pinned = saved_td_pinned;
 	curthread->td_sleeplocks = saved_td_sleeplocks;
-	hibernate_writing = false;
-	callout_hibernate_report();
+	/*
+	 * hibernate_writing is cleared by callout_hibernate_exit() inside
+	 * hibernate_barrier_unwind(), which runs before acpi_s4_resume_bsp()
+	 * on the EJUSTRETURN path.  Do not clear it again here.
+	 */
 	dumping = 0;
 #if defined(__i386__) || defined(__amd64__)
 	pvclock_resume();
@@ -4073,9 +4286,23 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    AcpiGbl_FACS->HardwareSignature : 0;
 	struct hibernate_save_cb *hcb = NULL;
 	struct hibernate_save_pcb *hpcb;
+	struct hibernate_attempt ha = HIBERNATE_ATTEMPT_INIT;
+	struct vm_phys_reservation hib_res = { .vr_pages = NULL,
+	    .vr_capacity = 0, .vr_count = 0 };
+	struct vm_phys_reservation_page *hib_res_pages;
+	u_long hib_res_cap;
+	size_t hib_res_bytes;
+	unsigned int hib_stages;
 	cpuset_t susp_cpus;
-	register_t intr_state;
+	register_t intr_state = 0;
 	int error;
+	/*
+	 * H2: peripheral reference held for the full attempt lifetime.
+	 * Acquired before the barrier; released on every exit path after
+	 * coordinator release (the last step of unwind).
+	 * NULL until successfully acquired; NULL means no release needed.
+	 */
+	struct cam_periph *hib_cam_periph = NULL;
 
 	device_printf(sc->acpi_dev, "Creating hibernate control block...\n");
 	error = dumpsys_hibernate_create_hcb(hardware_signature, &hcb);
@@ -4085,36 +4312,312 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	}
 	hpcb = malloc(sizeof(*hpcb), M_TEMP, M_WAITOK);
 
-	device_printf(sc->acpi_dev, "Suspending other CPUs...\n");
-	suspend_other_cpus(&susp_cpus);
-
-	intr_state = intr_disable();
+	/*
+	 * P0: force the one-time MD save-context allocations (low trampoline
+	 * page and identity map) before the K-5 stability barrier drains all
+	 * FREE pages from vm_phys.  Must happen before coordinator acquire
+	 * (step 1) so no allocation occurs after step 6 (reserve_all).
+	 */
+	error = dumpsys_hibernate_savectx_preinit();
+	if (error != 0) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: savectx preinit failed: %d\n", error);
+		free(hpcb, M_TEMP);
+		dumpsys_hibernate_free_hcb(hcb);
+		goto backout;
+	}
 
 	/*
-	 * TODO - Take a snapshot of the whole memory, or just enough to stay
-	 * consistent.
+	 * P1: pre-compute and allocate the destination-interval array and
+	 * reservation record array before acquiring the coordinator lock.
+	 * malloc(M_WAITOK) must not be called while the coordinator sleep
+	 * mutex is held (WITNESS: non-sleepable lock held across sleeping
+	 * allocation).
 	 *
-	 * Allocate memory a little earlier (before device suspension)?
-	 *
-	 * slp_state |= ACPI_SS_SNAPSHOT; to mark memory allocation (or some
-	 * other means to know we have to deallocate)?
+	 * The segment count is stable at this point: vm_phys_nsegs is set
+	 * at boot and never changes.  The reservation capacity is physmem,
+	 * which is also boot-time constant.
 	 */
+	{
+		int _nseg = vm_phys_nsegs;
+		size_t _dst_bytes;
 
+		if (_nseg <= 0) {
+			device_printf(sc->acpi_dev,
+			    "hibernate: no physical segments; refusing\n");
+			free(hpcb, M_TEMP);
+			dumpsys_hibernate_free_hcb(hcb);
+			goto backout;
+		}
+		if (__builtin_mul_overflow((size_t)_nseg,
+		    (size_t)2 * sizeof(vm_paddr_t), &_dst_bytes)) {
+			device_printf(sc->acpi_dev,
+			    "hibernate: destination interval array "
+			    "size overflow; refusing\n");
+			free(hpcb, M_TEMP);
+			dumpsys_hibernate_free_hcb(hcb);
+			goto backout;
+		}
+		ha.ha_dst_intervals = malloc(_dst_bytes, M_TEMP, M_WAITOK);
+	}
+
+	hib_res_cap = physmem;
+	if (__builtin_mul_overflow((size_t)hib_res_cap,
+	    sizeof(struct vm_phys_reservation_page), &hib_res_bytes)) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: reservation array size overflow (EOVERFLOW)\n");
+		free(ha.ha_dst_intervals, M_TEMP);
+		ha.ha_dst_intervals = NULL;
+		free(hpcb, M_TEMP);
+		dumpsys_hibernate_free_hcb(hcb);
+		goto backout;
+	}
+	hib_res_pages = malloc(hib_res_bytes, M_TEMP, M_WAITOK);
+
+	/*
+	 * K-5 stability barrier — eight-stage SAVE sequence.
+	 *
+	 * Stage 1: acquire the hibernate coordinator lock, blocking
+	 * concurrent save attempts.  The bit is set only after the lock
+	 * is held so the stage mask accurately reflects acquired state.
+	 */
+	hib_stages = 0;
+	error = hibernate_coordinator_acquire();
+	if (error != 0) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: coordinator acquire failed: %d\n", error);
+		free(hib_res_pages, M_TEMP);
+		free(ha.ha_dst_intervals, M_TEMP);
+		ha.ha_dst_intervals = NULL;
+		free(hpcb, M_TEMP);
+		dumpsys_hibernate_free_hcb(hcb);
+		goto backout;
+	}
+	hib_stages |= HIB_STAGE_COORDINATOR;
+
+	/*
+	 * F6: enforce footprint configuration/derivation status recorded at
+	 * boot.  Refuse before AP stop so refusal is clean (no APs to resume,
+	 * no frozen state to unwind beyond stage 1).
+	 */
+	error = hibernate_footprint_check();
+	if (error != 0) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: footprint status invalid (%d); refusing\n",
+		    error);
+		/* H1: every coordinator acquire must have exactly one release. */
+		free(hib_res_pages, M_TEMP);
+		free(ha.ha_dst_intervals, M_TEMP);
+		ha.ha_dst_intervals = NULL;
+		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
+		hibernate_coordinator_release();
+		free(hpcb, M_TEMP);
+		dumpsys_hibernate_free_hcb(hcb);
+		goto backout;
+	}
+
+	/*
+	 * N2/F3: publish arena tuple and validated destination view before
+	 * the capacity check.  All three sub-steps (arena, destination
+	 * intervals, CAM SIM) must succeed or we refuse.
+	 *
+	 * Arena: contiguous spare pages from the HCB.
+	 *
+	 * Destination view (N2, N5): K-5 SAVEABLE set upper bound is all
+	 * ingested RAM (vm_phys_segs).  vm_phys_segs are sorted and
+	 * non-overlapping by invariant; no extra normalization is needed.
+	 * Arena disjointness is enforced during classification by
+	 * hib_page_in_arena().
+	 *
+	 * CAM SIM (N2): resolve from the first pollable dump device.
+	 * dumperinfo->priv is the struct disk; d_drv1 is cam_periph;
+	 * periph->sim is the SIM.  Refuse (ENXIO) if none found.
+	 * K-6 will integrate the dump-path SIM directly.
+	 */
+	ha.ha_arena_start = hcb->hc_contig_spare_start;
+	ha.ha_arena_size  = hcb->hc_contig_spare_size;
+
+	/*
+	 * N2/N5: populate the destination-interval array preallocated in P1
+	 * from vm_phys_segs.  No allocation here — the coordinator sleep mutex
+	 * is held and malloc(M_WAITOK) must not be called.
+	 */
+	{
+		int nseg;
+
+		nseg = vm_phys_nsegs;
+		if (nseg <= 0) {
+			device_printf(sc->acpi_dev,
+			    "hibernate: no physical segments; refusing\n");
+			free(hib_res_pages, M_TEMP);
+			free(ha.ha_dst_intervals, M_TEMP);
+			ha.ha_dst_intervals = NULL;
+			hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
+			hibernate_coordinator_release();
+			free(hpcb, M_TEMP);
+			dumpsys_hibernate_free_hcb(hcb);
+			goto backout;
+		}
+		for (int _s = 0; _s < nseg; _s++) {
+			ha.ha_dst_intervals[_s * 2]     = vm_phys_segs[_s].start;
+			ha.ha_dst_intervals[_s * 2 + 1] = vm_phys_segs[_s].end;
+		}
+		/*
+		 * M2: validate the published destination contract locally.
+		 * Each interval must have start < end and both must be
+		 * PAGE_SIZE-aligned (vm_phys_segs invariant, but verify
+		 * before advertising ha_dst_valid = true).
+		 */
+		for (int _s = 0; _s < nseg; _s++) {
+			vm_paddr_t _start = ha.ha_dst_intervals[_s * 2];
+			vm_paddr_t _end   = ha.ha_dst_intervals[_s * 2 + 1];
+			if (_start >= _end ||
+			    (_start & (PAGE_SIZE - 1)) != 0 ||
+			    (_end   & (PAGE_SIZE - 1)) != 0) {
+				device_printf(sc->acpi_dev,
+				    "hibernate: seg[%d] [%#jx,%#jx) "
+				    "invalid; refusing\n",
+				    _s, (uintmax_t)_start,
+				    (uintmax_t)_end);
+				free(hib_res_pages, M_TEMP);
+				free(ha.ha_dst_intervals, M_TEMP);
+				ha.ha_dst_intervals = NULL;
+				hibernate_barrier_unwind(&ha, &hib_res,
+				    &hib_stages);
+				hibernate_coordinator_release();
+				free(hpcb, M_TEMP);
+				dumpsys_hibernate_free_hcb(hcb);
+				goto backout;
+			}
+		}
+		ha.ha_dst_count = (uint64_t)nseg;
+		ha.ha_dst_valid = true;
+	}
+
+	/*
+	 * H2: Resolve the dump-path CAM SIM from the FIRST dumper in
+	 * dumper_configs, which is the same priority order dump_for_hibernate()
+	 * uses.  Verify it is a disk-backed dumper with a typed association:
+	 *   di->priv is a struct disk * (set by geom_disk.c:g_disk_kerneldump)
+	 *   di->dumper == dp->d_dump confirms it is the disk's dump function
+	 *   dp->d_drv1 is the cam_periph * for CAM disk drivers (ada/da)
+	 * If the first dumper cannot supply a verified pollable SIM, refuse
+	 * before AP suspension rather than freezing the wrong SIM.
+	 * K-6 will integrate the dump-path SIM directly via ha_dumper.
+	 */
+	/*
+	 * H2: Resolve the dump-path CAM SIM from the FIRST dumper and
+	 * ACQUIRE a peripheral reference that is held for the entire
+	 * attempt lifetime (through barrier and image write).
+	 *
+	 * Selection: TAILQ_FIRST(&dumper_configs) is the highest-priority
+	 * configured dumper, the same entry dump_for_hibernate() tries first.
+	 *
+	 * Type proof: di->dumper == dp->d_dump confirms priv is the struct
+	 * disk that registered this dumper via geom_disk.c:g_disk_kerneldump.
+	 * d_drv1 is then the cam_periph * for CAM disk drivers (ada/da).
+	 *
+	 * Reference lifetime: cam_periph_acquire() increments the periph
+	 * refcount, preventing teardown while the attempt is active.
+	 * The reference is stored in hib_cam_periph and released via
+	 * cam_periph_release() on EVERY exit path, AFTER coordinator_release.
+	 * No release occurs on paths where acquisition was not attempted
+	 * (hib_cam_periph remains NULL on those paths).
+	 */
+	{
+		struct dumperinfo *_di;
+		struct disk *_dp;
+		struct cam_periph *_periph;
+		struct cam_sim *_sim = NULL;
+
+		mtx_lock(&dumpconf_list_lk);
+		_di = TAILQ_FIRST(&dumper_configs);
+		if (_di != NULL && _di->priv != NULL) {
+			_dp = (struct disk *)_di->priv;
+			/*
+			 * Type discriminator: di->dumper == dp->d_dump proves
+			 * priv is the struct disk that registered this dumper.
+			 * d_drv1 is then the cam_periph * for CAM disk drivers.
+			 */
+			if (_di->dumper != NULL &&
+			    _di->dumper == _dp->d_dump &&
+			    _dp->d_drv1 != NULL) {
+				_periph = (struct cam_periph *)_dp->d_drv1;
+				if (cam_sim_pollable(_periph->sim) &&
+				    cam_periph_acquire(_periph) == 0) {
+					/* Reference held; survives dumpconf_list_lk release. */
+					_sim = _periph->sim;
+					hib_cam_periph = _periph;
+				}
+			}
+		}
+		mtx_unlock(&dumpconf_list_lk);
+
+		if (_sim == NULL) {
+			device_printf(sc->acpi_dev,
+			    "hibernate: cannot acquire peripheral reference "
+			    "for active dump-path CAM SIM (H2); refusing\n");
+			free(hib_res_pages, M_TEMP);
+			free(ha.ha_dst_intervals, M_TEMP);
+			ha.ha_dst_intervals = NULL;
+			ha.ha_dst_valid = false;
+			hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
+			hibernate_coordinator_release();
+			/* hib_cam_periph is NULL here; no release needed. */
+			free(hpcb, M_TEMP);
+			dumpsys_hibernate_free_hcb(hcb);
+			goto backout;
+		}
+		ha.ha_cam_sim = _sim;
+		/* hib_cam_periph reference is now live; must be released on all paths. */
+	}
+
+	/*
+	 * Stage 2: wire up the reservation record preallocated in P1.
+	 * hib_res_pages and hib_res_cap were allocated before acquiring the
+	 * coordinator lock; no malloc may occur here (coordinator sleep mutex
+	 * is held).
+	 */
+	hib_res.vr_pages    = hib_res_pages;
+	hib_res.vr_capacity = hib_res_cap;
+	hib_res.vr_count    = 0;
+	hib_stages |= HIB_STAGE_RESOURCES;
+
+	/*
+	 * Stage 3: suspend APs and wait for acknowledgement.
+	 * suspend_other_cpus() is static in acpi.c; the coordinator
+	 * cannot call it directly.  We call it here and set the stage bit.
+	 */
+	device_printf(sc->acpi_dev, "Suspending other CPUs...\n");
+	suspend_other_cpus(&susp_cpus);
+	hib_stages |= HIB_STAGE_APS_STOPPED;
+
+	/*
+	 * Stages 4–7 (preempt, callouts, CAM, reserve_all) are now
+	 * acquired inside acpi_hibernate_dump_worker() AFTER savectx
+	 * has saved the CPU context and made its pmap allocations.
+	 * See the deviation note in acpi_hibernate_dump_worker().
+	 * Pass all barrier state to the worker via dargs.
+	 */
+	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
+	int saved_td_locks = curthread->td_locks;
+	int saved_td_pinned = curthread->td_pinned;
+	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
 	struct hibernate_dump_args dargs = {
 		.sc = sc,
 		.hcb = hcb,
 		.hpcb = hpcb,
 		.slp_state = slp_state,
+		.ha = &ha,
+		.hib_res = &hib_res,
+		.hib_res_pages = hib_res_pages,
+		.hib_res_cap = hib_res_cap,
+		.hib_stages = &hib_stages,
+		.intr_statep = &intr_state,
+		.susp_cpus = &susp_cpus,
+		.saved_td_locks = saved_td_locks,
+		.saved_td_sleeplocks = saved_td_sleeplocks,
 	};
-	void *stack_top = hibernate_dump_stack + sizeof(hibernate_dump_stack);
-	/*
-	 * Capture on the preserved thread stack before savectx: dump-path
-	 * code can take sleep locks / pin the CPU, so the counters frozen
-	 * into the thread page do not match the logical save point.
-	 */
-	int saved_td_locks = curthread->td_locks;
-	int saved_td_pinned = curthread->td_pinned;
-	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
 
 	/*
 	 * This is where the current CPU context is saved, and from where we
@@ -4136,9 +4639,33 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    break;
 
 	case EJUSTRETURN:
+		/*
+		 * Resume path: the restore kernel owns the image.
+		 * Stages 4-7 were acquired in acpi_hibernate_dump_worker()
+		 * on the SAVE path and are NOT set in hib_stages here
+		 * (the resume kernel never ran the worker).
+		 * hibernate_barrier_unwind() is idempotent for unset bits.
+		 * Only stages 1-3 need unwinding; AP resume and intr restore
+		 * are done by acpi_s4_resume_bsp().
+		 *
+		 *   3. acpi_s4_resume_bsp() -- AP resume + interrupt restore
+		 *   2. free reservation array and destination intervals
+		 *   1. hibernate_coordinator_release() -- release lock LAST
+		 */
+		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
+		free(hib_res_pages, M_TEMP);
+		free(ha.ha_dst_intervals, M_TEMP);
+		ha.ha_dst_intervals = NULL;
+		ha.ha_dst_valid = false;
 	    acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state,
 		hpcb, hcb, saved_td_locks, saved_td_pinned,
 		saved_td_sleeplocks);
+		hibernate_coordinator_release();
+		/* H2: release periph reference. */
+		if (hib_cam_periph != NULL) {
+			cam_periph_release(hib_cam_periph);
+			hib_cam_periph = NULL;
+		}
 	    status = AE_OK;
 	    goto backout;
 
@@ -4151,8 +4678,25 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	if ((slp_state & ACPI_SS_DEV_SUSPEND) != 0)
 		slp_state &= ~ACPI_SS_DEV_SUSPEND;
 
+	/*
+	 * Post-image unwind.  The dump worker unwound stages 5-7
+	 * (reservation, CAM, callouts).  Stage 4 (preempt/intr) was not
+	 * acquired.  Complete the stage 3-1 unwind here:
+	 *   3. resume_other_cpus() -- restart APs suspended in stage 3
+	 *   2. free reservation array and destination intervals
+	 *   1. hibernate_coordinator_release() -- release lock LAST
+	 */
 	resume_other_cpus(&susp_cpus);
-	intr_restore(intr_state);
+	free(hib_res_pages, M_TEMP);
+	free(ha.ha_dst_intervals, M_TEMP);
+	ha.ha_dst_intervals = NULL;
+	ha.ha_dst_valid = false;
+	hibernate_coordinator_release();
+	/* H2: release periph reference held since CAM lookup. */
+	if (hib_cam_periph != NULL) {
+		cam_periph_release(hib_cam_periph);
+		hib_cam_periph = NULL;
+	}
 
 	if (error != 0) {
 	    device_printf(sc->acpi_dev, "Could not dump the image!\n");

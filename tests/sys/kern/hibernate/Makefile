@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
-# ATF test for the ABI 1 hibernate image codec.
+# ATF tests for the ABI 1 hibernate image codec and K-5 capacity
+# arithmetic.
 #
 # Compiles kern/kern_hibernate.c directly from the source tree so that
-# the test exercises the identical authoritative decoder used by the
-# kernel and the offline tool.  A narrow portability seam
+# the tests exercise the identical authoritative code used by the kernel
+# and the offline tool.  A narrow portability seam
 # (hibernate_compat.h, included via CFLAGS -include) substitutes
 # <sys/systm.h> with userland equivalents when
 # _HIBERNATE_USERLAND_BUILD is defined; no layout or validation policy
@@ -15,9 +16,13 @@
 PACKAGE=	tests
 TESTSDIR=	${TESTSBASE}/sys/kern/hibernate
 
+ATF_TESTS_C+=	hibernate_capacity_test
 ATF_TESTS_C+=	hibernate_classify_test
 ATF_TESTS_C+=	hibernate_format_test
 ATF_TESTS_C+=	hibernate_marker_test
+
+SRCS.hibernate_capacity_test+=	hibernate_capacity_test.c
+SRCS.hibernate_capacity_test+=	kern_hibernate.c
 
 SRCS.hibernate_classify_test+=	hibernate_classify_test.c
 SRCS.hibernate_classify_test+=	kern_hibernate.c
@@ -45,6 +50,7 @@ CFLAGS.kern_hibernate.c+=	-Wno-missing-prototypes
 
 # sys/sys/hibernate.h uses _Static_assert and HIBERNATE_LAYOUT_ASSERT;
 # those are compile-time-only and are safe in userland with C11.
+CFLAGS.hibernate_capacity_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_classify_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_format_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_marker_test.c+=	-D_HIBERNATE_USERLAND_BUILD

@@ -717,7 +717,11 @@ dump_for_hibernate(const struct hibernate_save_cb *const hcb,
 	 * we need to reproduce these here.
 	 */
 	++dumping;
-	hibernate_writing = true;
+	/*
+	 * hibernate_writing is set and cleared by the K-5 stability barrier
+	 * (callout_hibernate_enter / callout_hibernate_exit) which brackets
+	 * the entire save window including this call.  Do not touch it here.
+	 */
 
 	/* XXX - Validity of 'dumper_configs' under SCHEDULER_STOPPED(). */
 	TAILQ_FOREACH(di, &dumper_configs, di_next) {
@@ -735,9 +739,7 @@ dump_for_hibernate(const struct hibernate_save_cb *const hcb,
 	}
 
 finish:
-	hibernate_writing = false;
 	--dumping;
-	callout_hibernate_report();
 
 	return (error);
 }

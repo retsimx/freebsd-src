@@ -71,6 +71,8 @@
 #include <vm/vm_phys.h>
 #include <vm/vm_pagequeue.h>
 
+#include <sys/hibernate.h>
+
 _Static_assert(sizeof(long) * NBBY >= VM_PHYSSEG_MAX,
     "Too many physsegs.");
 _Static_assert(sizeof(long long) >= sizeof(vm_paddr_t),
@@ -2093,6 +2095,529 @@ vm_phys_early_startup(void)
 		}
 	}
 #endif
+}
+
+/*
+ * K-5 hibernate page-reservation primitives.
+ *
+ * vm_phys_hibernate_reserve_all() captures the complete eligible SAVE-side
+ * FREE page set.  vm_phys_hibernate_reserve_count() captures exactly count
+ * eligible RESTORE-side pages that are neither destinations nor arena pages.
+ * vm_phys_hibernate_release() returns all captured pages to the physical
+ * allocator in reverse acquisition order.
+ *
+ * FREE is defined solely as membership in vm_phys_free_queues while the
+ * corresponding per-domain free lock is held.  No page-queue flag or
+ * replacement-queue membership is consulted.
+ *
+ * Traversal discipline (one monotonic physical-address cursor per domain):
+ *   1. Remove the current queue head with vm_freelist_rem().
+ *   2. Classify constituent pages in increasing physical address order.
+ *   3. Record eligible order-0 pages.
+ *   4. Return excluded or excess pages with vm_phys_enq_range(); these
+ *      are re-enqueued behind the physical cursor and cannot be recaptured
+ *      during the same call.
+ *   5. Advance past the removed block and repeat.
+ *
+ * Domains are visited in ascending numeric order.  Only one domain free lock
+ * is held at a time.  Release acquires only the single recorded domain lock
+ * for each record.
+ */
+
+/*
+ * hib_page_in_arena: return true when physical address pa falls within the
+ * validated transition arena described by ha.
+ */
+static bool
+hib_page_in_arena(const struct hibernate_attempt *ha, vm_paddr_t pa)
+{
+	vm_paddr_t arena_end;
+
+	if (ha->ha_arena_size == 0)
+		return (false);
+	/*
+	 * Use subtraction-based membership to avoid unsigned wrap in the
+	 * arena-end addition.  pa is in [start, start+size) iff
+	 * pa >= start && pa - start < size.
+	 */
+	if (pa < ha->ha_arena_start)
+		return (false);
+	arena_end = ha->ha_arena_start + ha->ha_arena_size;
+	/* Detect wrap: if end wrapped, the entire address space is arena. */
+	if (arena_end < ha->ha_arena_start)
+		return (true);
+	return (pa < arena_end);
+}
+
+/*
+ * hib_validate_reservation: common argument validation for both entry points.
+ * Returns 0 on success, EINVAL on bad arguments.
+ */
+static int
+hib_validate_reservation(const struct hibernate_attempt *ha,
+    const struct vm_phys_reservation *res)
+{
+
+	if (ha == NULL || res == NULL)
+		return (EINVAL);
+	if (res->vr_count != 0)
+		return (EINVAL);
+	if (res->vr_capacity > 0 && res->vr_pages == NULL)
+		return (EINVAL);
+	return (0);
+}
+
+/*
+ * hib_append_page: append one order-0 page to res under the domain lock.
+ *
+ * Returns 0 on success, ENOSPC when capacity is exhausted (reserve_all),
+ * or EOVERFLOW on counter wrap.  On failure the caller must return the
+ * remainder of the current block and unlock the domain before calling
+ * vm_phys_hibernate_release().
+ */
+static int
+hib_append_page(struct vm_phys_reservation *res, vm_page_t m,
+    int pool, int domain)
+{
+	u_long new_count;
+
+	if (res->vr_count >= res->vr_capacity)
+		return (ENOSPC);
+	new_count = res->vr_count + 1;
+	if (new_count == 0)
+		return (EOVERFLOW);
+	res->vr_pages[res->vr_count].vrp_page = m;
+	res->vr_pages[res->vr_count].vrp_pool = pool;
+	res->vr_pages[res->vr_count].vrp_domain = domain;
+	res->vr_count = new_count;
+	return (0);
+}
+
+/*
+ * vm_phys_hibernate_release: return all captured pages to the physical
+ * allocator in reverse acquisition order.
+ *
+ * For each record (from vr_count - 1 down to 0):
+ *   1. Validate recorded domain and pool.
+ *   2. Acquire that domain's free lock.
+ *   3. Assert the page is privately reserved (order == VM_NFREEORDER).
+ *   4. Call vm_phys_free_pages(page, pool, 0).
+ *   5. Release the domain lock.
+ *   6. Decrement vr_count.
+ *
+ * At completion vr_count == 0.  Release is safe on an already-empty record.
+ */
+void
+vm_phys_hibernate_release(struct vm_phys_reservation *res)
+{
+	struct vm_phys_reservation_page *rp;
+	struct vm_phys_seg *seg;
+	u_long i;
+
+	if (res == NULL)
+		return;
+
+	i = res->vr_count;
+	while (i-- > 0) {
+		rp = &res->vr_pages[i];
+
+		KASSERT(rp->vrp_domain >= 0 &&
+		    rp->vrp_domain < vm_ndomains,
+		    ("%s: record %lu has invalid domain %d",
+		    __func__, i, rp->vrp_domain));
+		KASSERT(vm_phys_pool_valid(rp->vrp_pool),
+		    ("%s: record %lu has invalid pool %d",
+		    __func__, i, rp->vrp_pool));
+		KASSERT(rp->vrp_page != NULL,
+		    ("%s: record %lu has NULL page", __func__, i));
+
+		seg = &vm_phys_segs[rp->vrp_page->segind];
+		KASSERT(seg->domain == rp->vrp_domain,
+		    ("%s: record %lu page domain %d != recorded domain %d",
+		    __func__, i, seg->domain, rp->vrp_domain));
+
+		vm_domain_free_lock(VM_DOMAIN(rp->vrp_domain));
+		vm_domain_free_assert_locked(VM_DOMAIN(rp->vrp_domain));
+
+		KASSERT(rp->vrp_page->order == VM_NFREEORDER,
+		    ("%s: record %lu page %p has order %d, want VM_NFREEORDER",
+		    __func__, i, rp->vrp_page, rp->vrp_page->order));
+
+		vm_phys_free_pages(rp->vrp_page, rp->vrp_pool, 0);
+
+		vm_domain_free_unlock(VM_DOMAIN(rp->vrp_domain));
+
+#ifdef INVARIANTS
+		/* Poison record to catch duplicate-release bugs. */
+		rp->vrp_page = NULL;
+		rp->vrp_pool = -1;
+		rp->vrp_domain = -1;
+#endif
+		res->vr_count = i;
+	}
+}
+
+/*
+ * hib_process_block_all: classify one removed buddy block for reserve_all.
+ *
+ * Pages in the transition arena are returned via vm_phys_enq_range().
+ * Eligible pages are appended with hib_append_page().  Contiguous excluded
+ * runs are coalesced before re-enqueue to preserve buddy alignment.
+ *
+ * Returns 0 on success, ENOSPC when vr_capacity is exhausted (caller must
+ * unlock domain and call vm_phys_hibernate_release()), or EOVERFLOW.
+ * On a non-zero return, any remaining pages in the block starting at m[k]
+ * have already been returned to fl.
+ */
+static int
+hib_process_block_all(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, vm_page_t m_block, u_int block_pages,
+    struct vm_freelist *fl, int pind, int domain)
+{
+	vm_page_t m, m_excl_head;
+	vm_paddr_t pa;
+	u_int excl_count, k;
+	int error;
+
+	m_excl_head = NULL;
+	excl_count = 0;
+
+	for (k = 0; k < block_pages; k++) {
+		m = m_block + k;
+		pa = VM_PAGE_TO_PHYS(m);
+
+		if (hib_page_in_arena(ha, pa)) {
+			/* Excluded: accumulate contiguous run. */
+			if (m_excl_head == NULL)
+				m_excl_head = m;
+			excl_count++;
+		} else {
+			/* Eligible: flush any pending excluded run first. */
+			if (m_excl_head != NULL) {
+				vm_phys_enq_range(m_excl_head, excl_count,
+				    fl, pind, 1);
+				m_excl_head = NULL;
+				excl_count = 0;
+			}
+			error = hib_append_page(res, m, pind, domain);
+			if (error != 0) {
+				/*
+				 * Capacity exhausted or overflow.  Return
+				 * the tail of the block (m onward) to fl;
+				 * the caller unlocks and rolls back.
+				 */
+				vm_phys_enq_range(m, block_pages - k,
+				    fl, pind, 1);
+				return (error);
+			}
+		}
+	}
+
+	/* Return any trailing excluded span. */
+	if (m_excl_head != NULL)
+		vm_phys_enq_range(m_excl_head, excl_count, fl, pind, 1);
+
+	return (0);
+}
+
+/*
+ * hib_process_block_count: classify one removed buddy block for
+ * reserve_count.
+ *
+ * Pages that are destinations or arena pages are returned to fl.  Eligible
+ * pages are appended until exactly want pages have been recorded; any
+ * remaining pages in the block are then returned to fl.
+ *
+ * Returns 0 on success or EOVERFLOW.  On a non-zero return the caller must
+ * unlock the domain and call vm_phys_hibernate_release().
+ */
+static int
+hib_process_block_count(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, vm_page_t m_block, u_int block_pages,
+    struct vm_freelist *fl, int pind, int domain, u_long want)
+{
+	vm_page_t m, m_ret_head;
+	vm_paddr_t pa;
+	u_int k, ret_count;
+	int error;
+
+	m_ret_head = NULL;
+	ret_count = 0;
+
+	for (k = 0; k < block_pages; k++) {
+		m = m_block + k;
+		pa = VM_PAGE_TO_PHYS(m);
+
+		if (res->vr_count == want ||
+		    hib_page_in_arena(ha, pa) ||
+		    hibernate_page_is_destination(m)) {
+			/* Ineligible or excess: accumulate return run. */
+			if (m_ret_head == NULL)
+				m_ret_head = m;
+			ret_count++;
+		} else {
+			/* Eligible: flush any pending return run first. */
+			if (m_ret_head != NULL) {
+				vm_phys_enq_range(m_ret_head, ret_count,
+				    fl, pind, 1);
+				m_ret_head = NULL;
+				ret_count = 0;
+			}
+			error = hib_append_page(res, m, pind, domain);
+			if (error != 0) {
+				/* EOVERFLOW: return tail and signal. */
+				vm_phys_enq_range(m, block_pages - k,
+				    fl, pind, 1);
+				return (error);
+			}
+		}
+	}
+
+	/* Return any trailing ineligible/excess run. */
+	if (m_ret_head != NULL)
+		vm_phys_enq_range(m_ret_head, ret_count, fl, pind, 1);
+
+	return (0);
+}
+
+/*
+ * hib_reserve_all_domain: process one domain for reserve_all under its
+ * free lock.  Returns 0 on success, or ENOSPC/EOVERFLOW with the lock
+ * released and the block tail already returned to the freelist.
+ */
+static int
+hib_reserve_all_domain(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, int domain)
+{
+	struct vm_freelist *fl;
+	vm_page_t m_block;
+	u_int block_pages;
+	long lcnt_snap, n;
+	int error, flind, freelist, oind, pind;
+
+	vm_domain_free_assert_locked(VM_DOMAIN(domain));
+
+	for (freelist = 0; freelist < VM_NFREELIST; freelist++) {
+		flind = vm_freelist_to_flind[freelist];
+		if (flind < 0)
+			continue;
+		for (pind = 0; pind < VM_NFREEPOOL; pind++) {
+			fl = vm_phys_free_queues[domain][flind][pind];
+			for (oind = 0; oind < VM_NFREEORDER; oind++) {
+				/*
+				 * Bounded traversal: snapshot the queue
+				 * length before processing.  hib_process_block_all()
+				 * may re-enqueue excluded spans at the TAIL
+				 * of fl[oind] via vm_phys_enq_range(..., 1).
+				 * By limiting iteration to the pre-snapshot
+				 * count we visit each original block exactly
+				 * once and never recapture a re-enqueued
+				 * span.  This proves termination: the loop
+				 * body removes exactly one block per
+				 * iteration (via vm_freelist_rem), so after
+				 * lcnt_snap iterations the original head
+				 * blocks are exhausted.
+				 */
+				lcnt_snap = fl[oind].lcnt;
+				for (n = 0; n < lcnt_snap; n++) {
+					m_block = TAILQ_FIRST(&fl[oind].pl);
+					if (m_block == NULL)
+						break;
+					block_pages = 1u << oind;
+					KASSERT(m_block->order == oind,
+					    ("%s: head order %d != oind %d",
+					    __func__, m_block->order, oind));
+					KASSERT(
+					    vm_phys_segs[
+					    m_block->segind].domain == domain,
+					    ("%s: block domain mismatch",
+					    __func__));
+					vm_freelist_rem(fl, m_block, oind);
+					error = hib_process_block_all(ha, res,
+					    m_block, block_pages, fl,
+					    pind, domain);
+					if (error != 0)
+						return (error);
+				}
+			}
+		}
+	}
+	return (0);
+}
+
+/*
+ * hib_reserve_count_domain: process one domain for reserve_count under its
+ * free lock.  Returns 0 on success, or EOVERFLOW with the lock released and
+ * the block tail already returned to the freelist.  Sets *donep = true when
+ * the exact count has been reached.
+ */
+static int
+hib_reserve_count_domain(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, int domain, u_long want, bool *donep)
+{
+	struct vm_freelist *fl;
+	vm_page_t m_block;
+	u_int block_pages;
+	long lcnt_snap, n;
+	int error, flind, freelist, oind, pind;
+
+	vm_domain_free_assert_locked(VM_DOMAIN(domain));
+	*donep = false;
+
+	for (freelist = 0; freelist < VM_NFREELIST; freelist++) {
+		flind = vm_freelist_to_flind[freelist];
+		if (flind < 0)
+			continue;
+		for (pind = 0; pind < VM_NFREEPOOL; pind++) {
+			fl = vm_phys_free_queues[domain][flind][pind];
+			for (oind = 0; oind < VM_NFREEORDER; oind++) {
+				/*
+				 * Bounded traversal: snapshot the queue
+				 * length before processing.  Excluded or
+				 * excess spans re-enqueued at the TAIL via
+				 * vm_phys_enq_range(..., 1) are not
+				 * reconsidered in this call.  Each iteration
+				 * removes exactly one block, so termination
+				 * is guaranteed after lcnt_snap iterations.
+				 */
+				lcnt_snap = fl[oind].lcnt;
+				for (n = 0; n < lcnt_snap; n++) {
+					if (res->vr_count == want) {
+						*donep = true;
+						return (0);
+					}
+					m_block = TAILQ_FIRST(&fl[oind].pl);
+					if (m_block == NULL)
+						break;
+					block_pages = 1u << oind;
+					KASSERT(m_block->order == oind,
+					    ("%s: head order %d != oind %d",
+					    __func__, m_block->order, oind));
+					KASSERT(
+					    vm_phys_segs[
+					    m_block->segind].domain == domain,
+					    ("%s: block domain mismatch",
+					    __func__));
+					vm_freelist_rem(fl, m_block, oind);
+					error = hib_process_block_count(ha,
+					    res, m_block, block_pages, fl,
+					    pind, domain, want);
+					if (error != 0)
+						return (error);
+				}
+			}
+		}
+	}
+	if (res->vr_count == want)
+		*donep = true;
+	return (0);
+}
+
+/*
+ * vm_phys_hibernate_reserve_all: capture the complete eligible SAVE-side
+ * FREE page set into res.
+ *
+ * A page is eligible when it is a member of vm_phys_free_queues under the
+ * domain free lock and is not in the transition arena.  Every such page is
+ * captured; no arena-excluded page is recorded.
+ *
+ * Returns:
+ *   0       Complete eligible set captured; res->vr_count pages recorded.
+ *   EINVAL  Null or invalid argument, or nonzero vr_count on entry.
+ *   ENOSPC  vr_capacity cannot hold the complete set; full rollback.
+ */
+int
+vm_phys_hibernate_reserve_all(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res)
+{
+	int domain, error;
+
+	error = hib_validate_reservation(ha, res);
+	if (error != 0)
+		return (error);
+
+	for (domain = 0; domain < vm_ndomains; domain++) {
+		vm_domain_free_lock(VM_DOMAIN(domain));
+		vm_domain_free_assert_locked(VM_DOMAIN(domain));
+		error = hib_reserve_all_domain(ha, res, domain);
+		vm_domain_free_unlock(VM_DOMAIN(domain));
+		if (error != 0) {
+			vm_phys_hibernate_release(res);
+			KASSERT(res->vr_count == 0,
+			    ("%s: release left vr_count %lu",
+			    __func__, res->vr_count));
+			return (error);
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * vm_phys_hibernate_reserve_count: capture exactly count eligible
+ * RESTORE-side FREE pages into res.
+ *
+ * A page is eligible when it is FREE (buddy-list membership under the domain
+ * free lock), is not a destination page (hibernate_page_is_destination()),
+ * and is not in the transition arena.
+ *
+ * Returns:
+ *   0       Exactly count pages captured.
+ *   EINVAL  Null or invalid argument, nonzero vr_count, unpublished
+ *           destination view, or count exceeds vr_capacity.
+ *   EOVERFLOW Count or representation overflow.
+ *   ENOMEM  Eligible-page shortage; full rollback, vr_count == 0.
+ */
+int
+vm_phys_hibernate_reserve_count(struct hibernate_attempt *ha, size_t count,
+    struct vm_phys_reservation *res)
+{
+	u_long want;
+	int domain, error;
+	bool done;
+
+	error = hib_validate_reservation(ha, res);
+	if (error != 0)
+		return (error);
+
+	/* Destination view must be published for RESTORE classification. */
+	if (!ha->ha_dst_valid)
+		return (EINVAL);
+
+	/* count == 0: valid; nothing to capture after validating record. */
+	if (count == 0)
+		return (0);
+
+	/* count must fit in u_long (type of vr_count). */
+	if (count > (size_t)(u_long)-1)
+		return (EOVERFLOW);
+	want = (u_long)count;
+
+	/* Preallocated array must accommodate the requested count. */
+	if (want > res->vr_capacity)
+		return (EINVAL);
+
+	for (domain = 0; domain < vm_ndomains; domain++) {
+		vm_domain_free_lock(VM_DOMAIN(domain));
+		vm_domain_free_assert_locked(VM_DOMAIN(domain));
+		error = hib_reserve_count_domain(ha, res, domain, want, &done);
+		vm_domain_free_unlock(VM_DOMAIN(domain));
+		if (error != 0) {
+			vm_phys_hibernate_release(res);
+			KASSERT(res->vr_count == 0,
+			    ("%s: release left vr_count %lu",
+			    __func__, res->vr_count));
+			return (error);
+		}
+		if (done)
+			return (0);
+	}
+
+	/* All domains exhausted before reaching count: full rollback. */
+	vm_phys_hibernate_release(res);
+	KASSERT(res->vr_count == 0,
+	    ("%s: release left vr_count %lu", __func__, res->vr_count));
+	return (ENOMEM);
 }
 
 #ifdef DDB

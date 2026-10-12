@@ -339,16 +339,257 @@ struct hibernate_marker_result {
 	int error;
 };
 
+struct cam_sim;		/* Forward declaration; full type in cam/cam_sim.h. */
+
 struct hibernate_attempt {
 	struct hibernate_marker_result ha_marker_result;
 	struct dumperinfo *ha_dumper; /* Borrowed; NULL means unbound. */
 	off_t ha_marker_offset;	      /* Backend marker I/O offset. */
 	uint64_t ha_provider_offset;  /* Provider-relative marker offset P. */
 	uint64_t ha_provider_size;    /* Full logical provider size. */
+
+	/*
+	 * K-5: validated destination-interval view and arena tuple.
+	 *
+	 * ha_dst_intervals points to a caller-owned array of
+	 * ha_dst_count validated, sorted, strictly increasing
+	 * [start, end) physical-address intervals that form the
+	 * union of all PT_LOAD destinations.  The view is
+	 * source-only attempt state; it does not alter any wire
+	 * layout.  ha_dst_valid is set only after the full
+	 * validated set has been published; readers must check it
+	 * before consulting the intervals or arena fields.
+	 *
+	 * ha_arena_start and ha_arena_size describe the transition
+	 * arena in bytes.  Both are zero when no arena has been
+	 * established.
+	 */
+	vm_paddr_t *ha_dst_intervals;	/* Validated [start,end) pairs. */
+	uint64_t ha_dst_count;		/* Number of intervals (pairs/2). */
+	vm_paddr_t ha_arena_start;	/* Transition arena base address. */
+	uint64_t ha_arena_size;		/* Transition arena size in bytes. */
+	bool ha_dst_valid;		/* Destination view is published. */
+
+	/*
+	 * K-5: CAM sim used for the hibernate dump path.
+	 *
+	 * Set by the ACPI save coordinator before calling
+	 * hibernate_barrier_prepare().  The barrier uses it to apply
+	 * xpt_freeze_simq() admission freeze and bounded xpt_sim_poll()
+	 * drain (step 6), then xpt_release_simq() on unwind.  NULL when
+	 * no pollable CAM sim is associated with the dump path.
+	 */
+	struct cam_sim *ha_cam_sim;	/* Dump-path CAM sim; NULL if none. */
 };
 
-#define HIBERNATE_ATTEMPT_INIT \
-	{ .ha_marker_result = { .class = HMC_ABSENT, .error = 0 } }
+#define	HIBERNATE_ATTEMPT_INIT							\
+	{                                                       \
+		.ha_marker_result = { .class = HMC_ABSENT,      \
+		    .error = 0 },                               \
+		.ha_dst_intervals = NULL,                       \
+		.ha_dst_count = 0,                              \
+		.ha_arena_start = 0,                            \
+		.ha_arena_size = 0,                             \
+		.ha_dst_valid = false,                          \
+		.ha_cam_sim = NULL,                             \
+	}
+
+/*
+ * K-5: capacity budget and result types.
+ *
+ * hibernate_capacity_check() accepts pairwise-disjoint cardinalities
+ * and computes the eligible source page count via sequential checked
+ * subtraction.  All cardinalities are in pages.
+ *
+ * Return codes:
+ *   0        Sufficient capacity, including exact equality.
+ *   EINVAL   Null pointer, zero required cardinality, or impossible
+ *            set sizes.
+ *   EOVERFLOW Checked arithmetic failure.
+ *   ENOMEM   Valid cardinalities but insufficient eligible sources.
+ */
+struct hibernate_capacity_budget {
+	uint64_t physmem_pages;
+	uint64_t arena_pages;
+	uint64_t destination_union_pages;
+	uint64_t restore_kernel_footprint_budget;
+};
+
+struct hibernate_capacity_result {
+	uint64_t eligible_source_pages;
+	uint64_t required_source_pages;
+	uint64_t shortfall_pages;
+};
+
+int hibernate_capacity_check(const struct hibernate_capacity_budget *b,
+    struct hibernate_capacity_result *r);
+
+/*
+ * K-5: destination membership predicate.
+ *
+ * Returns true when the physical address of page m falls within the
+ * validated destination-interval view stored in the current hibernate
+ * attempt.  Reads only attempt-owned, pre-validated state; does not
+ * reparse ELF headers or inspect page queues.
+ */
+bool hibernate_page_is_destination(vm_page_t m);
+
+/*
+ * K-5: eight-stage SAVE stability barrier.
+ *
+ * Each bit records one successfully acquired barrier stage.  The
+ * coordinator sets each bit only after the corresponding step succeeds;
+ * the reverse-unwind helper releases only bits that are set.
+ *
+ * Stage ordering (must be acquired in ascending bit order, released in
+ * descending bit order):
+ *   HIB_STAGE_COORDINATOR    — coordinator lock held, new work blocked
+ *   HIB_STAGE_RESOURCES      — all writer resources preallocated
+ *   HIB_STAGE_APS_STOPPED    — APs suspended and acknowledged
+ *   HIB_STAGE_BSP_PREEMPT    — BSP preemption disabled
+ *   HIB_STAGE_BSP_INTRS      — BSP maskable interrupts disabled
+ *   HIB_STAGE_CALLOUTS       — callout freeze active
+ *   HIB_STAGE_CAM            — CAM admission frozen and drained
+ *   HIB_STAGE_RESERVED       — vm_phys FREE pages reserved
+ */
+#define	HIB_STAGE_COORDINATOR	(1u << 0)
+#define	HIB_STAGE_RESOURCES	(1u << 1)
+#define	HIB_STAGE_APS_STOPPED	(1u << 2)
+#define	HIB_STAGE_BSP_PREEMPT	(1u << 3)
+#define	HIB_STAGE_BSP_INTRS	(1u << 4)
+#define	HIB_STAGE_CALLOUTS	(1u << 5)
+#define	HIB_STAGE_CAM		(1u << 6)
+#define	HIB_STAGE_RESERVED	(1u << 7)
+
+/* Forward declaration; full type in vm/vm_phys.h. */
+struct vm_phys_reservation;
+
+#ifdef _KERNEL
+/*
+ * hibernate_barrier_prepare: acquire stages 1–7 of the K-5 stability
+ * barrier around the SAVE attempt.  On failure, releases all acquired
+ * stages in strict reverse order and returns a non-zero errno.
+ *
+ * On success, *stages_out contains the full stage mask and the caller
+ * proceeds to step 8 (image write) using only preallocated resources.
+ *
+ * ha must be the active attempt; res must be a zeroed reservation
+ * record with vr_pages pointing to the preallocated array.
+ *
+ * No allocation is permitted after this function returns 0.
+ */
+int hibernate_barrier_prepare(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, unsigned int *stages,
+    register_t *intr_statep);
+
+/*
+ * hibernate_barrier_unwind: release stages 7-2 recorded in *stages in
+ * strict reverse order.  Idempotent for bits that are not set.
+ * Always succeeds; clears *stages on return (except HIB_STAGE_COORDINATOR
+ * bit is cleared but the lock is NOT released here).
+ *
+ * After this function returns the caller MUST complete all physical
+ * cleanup (resume APs, restore interrupts, free reservation array) and
+ * then call hibernate_coordinator_release() as the absolute last step
+ * to enforce strict reverse order of the full eight-stage barrier.
+ *
+ * ha must be the same attempt passed to hibernate_barrier_prepare.
+ * res must be the same reservation record.
+ */
+void hibernate_barrier_unwind(struct hibernate_attempt *ha,
+    struct vm_phys_reservation *res, unsigned int *stages);
+
+/*
+ * hibernate_barrier_publish_attempt: make ha visible to
+ * hibernate_page_is_destination() during the frozen window.
+ * Called immediately before hibernate_barrier_prepare() enters
+ * stage HIB_STAGE_RESERVED.
+ */
+void hibernate_barrier_publish_attempt(struct hibernate_attempt *ha);
+
+/*
+ * hibernate_barrier_retract_attempt: withdraw the attempt pointer
+ * published by hibernate_barrier_publish_attempt().  Called during
+ * unwind before resources are freed.
+ */
+void hibernate_barrier_retract_attempt(void);
+
+/*
+ * K-5 footprint arithmetic constants.  Defined here (not in kern_hibernate.c)
+ * so they are available in both kernel and _HIBERNATE_USERLAND_BUILD modes
+ * for hibernate_restore_footprint_compute() and host-runnable tests (N7).
+ *
+ * HIB_FOOTPRINT_DEFAULT: default restore footprint floor (262144 pages = 1 GiB).
+ * HIB_FOOTPRINT_MAX:     maximum restore footprint (16777216 pages = 64 GiB).
+ * HIB_METADATA_MAX_BYTES: maximum metadata-prefix storage (<=64029 B).
+ * HIB_FRAG_PCT:          fragmentation margin numerator (25%).
+ * HIB_FRAG_DIV:          fragmentation margin denominator.
+ * HIB_MAXPHYS_BYTES:     maximum BIO transfer size (MAXPHYS equivalent, 128 KiB).
+ * HIB_SCRATCH_STACK_BYTES: arena-external MD workspace size.
+ * HIB_RESERVATION_RECORD_BYTES: per-page reservation record size (16 bytes on amd64).
+ * HIB_PAGE_SIZE:         page size for footprint arithmetic (4096 bytes).
+ */
+#define	HIB_FOOTPRINT_DEFAULT		262144UL
+#define	HIB_FOOTPRINT_MAX		16777216UL
+#define	HIB_METADATA_MAX_BYTES		64029UL
+#define	HIB_FRAG_PCT			25UL
+#define	HIB_FRAG_DIV			100UL
+#define	HIB_MAXPHYS_BYTES		131072UL	/* 128 KiB */
+#define	HIB_SCRATCH_STACK_BYTES		65536UL		/* 64 KiB */
+#define	HIB_RESERVATION_RECORD_BYTES	16UL		/* amd64 LP64 */
+#define	HIB_PAGE_SIZE			4096UL
+
+/*
+ * hibernate_restore_footprint_compute: pure arithmetic core of footprint
+ * derivation, parameterized by wired_pages so it is testable in userland
+ * without vm_wire_count() (N7).  Compiled in both kernel and userland modes.
+ */
+int hibernate_restore_footprint_compute(uint64_t destination_union_pages,
+    uint64_t wired_pages, uint64_t *derived_pages_out);
+
+/*
+ * hibernate_restore_footprint_derive: compute the minimum restore-kernel
+ * footprint in pages from destination_union_pages using checked arithmetic.
+ * Non-static so host-runnable tests can call production derivation directly
+ * (N7: exercise production footprint derivation rather than duplicating
+ * the formula).
+ * Returns 0 on success with *derived_pages_out set; EOVERFLOW on overflow;
+ * ENOMEM if the result exceeds HIB_FOOTPRINT_MAX.
+ */
+int hibernate_restore_footprint_derive(uint64_t destination_union_pages,
+    uint64_t *derived_pages_out);
+
+/*
+ * hibernate_footprint_check: return the footprint derivation/configuration
+ * status recorded at boot.  Returns 0 when valid, EINVAL/EOVERFLOW/ENOMEM
+ * on error.  Must be called before the freeze to enforce refusal.
+ */
+int hibernate_footprint_check(void);
+
+/*
+ * hibernate_footprint_effective: return the effective restore-kernel
+ * footprint budget in pages.  Valid only when hibernate_footprint_check()
+ * returns 0.
+ */
+u_long hibernate_footprint_effective(void);
+
+/*
+ * hibernate_coordinator_acquire: acquire the coordinator lock, serialising
+ * concurrent save attempts.  Must be called before HIB_STAGE_COORDINATOR
+ * is set.  Returns 0 on success.
+ */
+int hibernate_coordinator_acquire(void);
+
+/*
+ * hibernate_coordinator_release: release the coordinator lock.  Must be
+ * called by the save-path caller as the LAST step of unwind, after
+ * hibernate_barrier_unwind() has returned and all physical cleanup
+ * (AP resume, interrupt restore, reservation array free) is complete.
+ * hibernate_barrier_unwind() clears HIB_STAGE_COORDINATOR but does NOT
+ * release the lock; this function performs the actual release.
+ */
+void hibernate_coordinator_release(void);
+#endif /* _KERNEL */
 
 int hibernate_probe(struct hibernate_attempt *ha);
 bool hibernate_provider_conflicts(const struct hibernate_provider_id *id);

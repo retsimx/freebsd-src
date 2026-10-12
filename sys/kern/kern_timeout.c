@@ -225,6 +225,41 @@ callout_hibernate_block(void *pc)
 	callout_hibernate_last = pc;
 }
 
+/*
+ * callout_hibernate_enter: enter the hibernate callout-freeze state.
+ *
+ * Sets hibernate_writing so that softclock_call_cc() diverts callout
+ * invocations through callout_hibernate_block() rather than executing
+ * them.  The existing hibernate_writing flag is the sole freeze
+ * mechanism; no duplicated counter is introduced.
+ *
+ * Must be called with interrupts disabled and preemption disabled,
+ * after AP stop and before vm_phys_hibernate_reserve_all().
+ */
+void
+callout_hibernate_enter(void)
+{
+	KASSERT(hibernate_writing == false,
+	    ("%s: already in hibernate callout freeze", __func__));
+	hibernate_writing = true;
+}
+
+/*
+ * callout_hibernate_exit: leave the hibernate callout-freeze state.
+ *
+ * Clears hibernate_writing and emits a diagnostic log of any callouts
+ * that were diverted during the freeze window.  Symmetric with
+ * callout_hibernate_enter().
+ */
+void
+callout_hibernate_exit(void)
+{
+	KASSERT(hibernate_writing == true,
+	    ("%s: not in hibernate callout freeze", __func__));
+	hibernate_writing = false;
+	callout_hibernate_report();
+}
+
 void
 callout_hibernate_report(void)
 {
