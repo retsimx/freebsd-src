@@ -4217,7 +4217,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 */
 	if (!has_dumpers()) {
 	    device_printf(sc->acpi_dev,
-		"Hibernate: No dump device configured!");
+		"Hibernate: No dump device configured!\n");
 	    return_ACPI_STATUS (AE_NOT_CONFIGURED);
 	}
 	if (!sc->acpi_supported_sstates[ACPI_STATE_S4]) {

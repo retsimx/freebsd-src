@@ -215,14 +215,11 @@ static void	softclock_call_cc(struct callout *c, struct callout_cpu *cc,
 static MALLOC_DEFINE(M_CALLOUT, "callout", "Callout datastructures");
 
 static u_int callout_hibernate_blocked;
-static void *callout_hibernate_first, *callout_hibernate_last;
 
 static void
-callout_hibernate_block(void *pc)
+callout_hibernate_block(void *pc __unused)
 {
-	if (callout_hibernate_blocked++ == 0)
-		callout_hibernate_first = pc;
-	callout_hibernate_last = pc;
+	callout_hibernate_blocked++;
 }
 
 /*
@@ -265,11 +262,9 @@ callout_hibernate_report(void)
 {
 	if (callout_hibernate_blocked == 0)
 		return;
-	printf("hibernate: callout freeze blocked %u (first %p last %p)\n",
-	    callout_hibernate_blocked, callout_hibernate_first,
-	    callout_hibernate_last);
+	printf("hibernate: callout freeze blocked %u\n",
+	    callout_hibernate_blocked);
 	callout_hibernate_blocked = 0;
-	callout_hibernate_first = callout_hibernate_last = NULL;
 }
 
 /**
