@@ -375,7 +375,53 @@ SYSCTL_INT(_debug_acpi, OID_AUTO, suspend_bounce, CTLFLAG_RW,
 bool acpi_hibernate_susp_bounce = true;
 SYSCTL_BOOL(_debug_acpi, OID_AUTO, hibernate_suspend_bounce, CTLFLAG_RW,
     &acpi_hibernate_susp_bounce, 0, "Don't actually hibernate, just test.");
-#endif
+
+#ifdef INVARIANTS
+/*
+ * K-18 INVARIANTS-only test seam.
+ *
+ * One-shot injection controls: set to non-zero before a hibernate attempt
+ * to force that single failure path.  The control is cleared to zero
+ * immediately before taking the injected branch so that one write causes
+ * at most one failure.
+ *
+ * Read-only lifecycle counters: incremented adjacent to each acquire and
+ * release operation in the ACPI ownership path (including acpi_s4_resume_bsp).
+ * They are diagnostic only and must not influence ownership decisions.
+ *
+ * All variables, branches, storage, and sysctls in this block are absent
+ * from non-INVARIANTS kernels.
+ */
+static int hibernate_fail_dump_once;
+SYSCTL_INT(_debug_acpi, OID_AUTO, hibernate_fail_dump_once, CTLFLAG_RW,
+    &hibernate_fail_dump_once, 0,
+    "One-shot: force dump_for_hibernate() error path on next attempt.");
+
+static int hibernate_fail_second_suspend_once;
+SYSCTL_INT(_debug_acpi, OID_AUTO, hibernate_fail_second_suspend_once,
+    CTLFLAG_RW, &hibernate_fail_second_suspend_once, 0,
+    "One-shot: force second DEVICE_SUSPEND(root_bus) failure on next attempt.");
+
+static u_int hibernate_hcb_acquires;
+SYSCTL_UINT(_debug_acpi, OID_AUTO, hibernate_hcb_acquires, CTLFLAG_RD,
+    &hibernate_hcb_acquires, 0,
+    "Count of successful dumpsys_hibernate_create_hcb() calls.");
+
+static u_int hibernate_hcb_releases;
+SYSCTL_UINT(_debug_acpi, OID_AUTO, hibernate_hcb_releases, CTLFLAG_RD,
+    &hibernate_hcb_releases, 0,
+    "Count of dumpsys_hibernate_free_hcb() calls in the ACPI ownership path.");
+
+static u_int hibernate_pcb_acquires;
+SYSCTL_UINT(_debug_acpi, OID_AUTO, hibernate_pcb_acquires, CTLFLAG_RD,
+    &hibernate_pcb_acquires, 0, "Count of successful hpcb malloc() calls.");
+
+static u_int hibernate_pcb_releases;
+SYSCTL_UINT(_debug_acpi, OID_AUTO, hibernate_pcb_releases, CTLFLAG_RD,
+    &hibernate_pcb_releases, 0,
+    "Count of free(hpcb, M_TEMP) calls in the ACPI ownership path.");
+#endif /* INVARIANTS */
+#endif /* OS_HIBERNATE_SUPPORT */
 
 #if defined(__amd64__) || defined(__i386__)
 int acpi_override_isa_irq_polarity;
@@ -4083,7 +4129,13 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 	acpi_s4_resume_interrupts(intr_state);
 	acpi_s4_resume_clocks(sc);
 	free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+	atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 	dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+	atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
 	/*
 	 * Cold-boot firmware re-initialized devices while the restored kernel
 	 * expects them configured.  Force DEVICE_RESUME via backout.
@@ -4285,7 +4337,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	const uint64_t hardware_signature = AcpiGbl_FACS != NULL ?
 	    AcpiGbl_FACS->HardwareSignature : 0;
 	struct hibernate_save_cb *hcb = NULL;
-	struct hibernate_save_pcb *hpcb;
+	struct hibernate_save_pcb *hpcb = NULL;
 	struct hibernate_attempt ha = HIBERNATE_ATTEMPT_INIT;
 	struct vm_phys_reservation hib_res = { .vr_pages = NULL,
 	    .vr_capacity = 0, .vr_count = 0 };
@@ -4296,6 +4348,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	cpuset_t susp_cpus;
 	register_t intr_state = 0;
 	int error;
+	/*
+	 * K-18: explicit ownership flag.  False until BOTH hcb and hpcb
+	 * exist.  Every recoverable exit that owns both resources clears
+	 * this flag after releasing them.  The generic backout label must
+	 * not unconditionally free either resource.
+	 */
+	bool snapshot_owned = false;
 	/*
 	 * H2: peripheral reference held for the full attempt lifetime.
 	 * Acquired before the barrier; released on every exit path after
@@ -4310,7 +4369,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    device_printf(sc->acpi_dev, "Not enough specific memory.\n");
 	    goto backout;
 	}
+#ifdef INVARIANTS
+	atomic_add_int(&hibernate_hcb_acquires, 1);
+#endif
 	hpcb = malloc(sizeof(*hpcb), M_TEMP, M_WAITOK);
+#ifdef INVARIANTS
+	atomic_add_int(&hibernate_pcb_acquires, 1);
+#endif
+	snapshot_owned = true;
 
 	/*
 	 * P0: force the one-time MD save-context allocations (low trampoline
@@ -4323,7 +4389,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		device_printf(sc->acpi_dev,
 		    "hibernate: savectx preinit failed: %d\n", error);
 		free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 		dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		snapshot_owned = false;
 		goto backout;
 	}
 
@@ -4340,7 +4413,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		device_printf(sc->acpi_dev,
 		    "hibernate: reservation array size overflow (EOVERFLOW)\n");
 		free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 		dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		snapshot_owned = false;
 		goto backout;
 	}
 	hib_res_pages = malloc(hib_res_bytes, M_TEMP, M_WAITOK);
@@ -4359,7 +4439,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    "hibernate: coordinator acquire failed: %d\n", error);
 		free(hib_res_pages, M_TEMP);
 		free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 		dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		snapshot_owned = false;
 		goto backout;
 	}
 	hib_stages |= HIB_STAGE_COORDINATOR;
@@ -4379,7 +4466,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		hibernate_coordinator_release();
 		free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 		dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		snapshot_owned = false;
 		goto backout;
 	}
 
@@ -4493,7 +4587,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 			hibernate_coordinator_release();
 			/* hib_cam_periph is NULL here; no release needed. */
 			free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+			atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 			dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+			atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+			snapshot_owned = false;
 			goto backout;
 		}
 		ha.ha_cam_sim = _sim;
@@ -4582,9 +4683,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		free(hib_res_pages, M_TEMP);
-	    acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state,
-		hpcb, hcb, saved_td_locks, saved_td_pinned,
-		saved_td_sleeplocks);
+		/*
+		 * K-18: transfer ownership to acpi_s4_resume_bsp(), which
+		 * is the sole release site for hpcb and hcb on this path.
+		 * Clear here so subsequent backout does not release either.
+		 */
+		snapshot_owned = false;
+		acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state, hpcb,
+		    hcb, saved_td_locks, saved_td_pinned, saved_td_sleeplocks);
 		hibernate_coordinator_release();
 		/* H2: release periph reference. */
 		if (hib_cam_periph != NULL) {
@@ -4620,9 +4726,27 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		hib_cam_periph = NULL;
 	}
 
+#ifdef INVARIANTS
+	if (hibernate_fail_dump_once) {
+		hibernate_fail_dump_once = 0;
+		error = EIO;
+	}
+#endif
 	if (error != 0) {
 	    device_printf(sc->acpi_dev, "Could not dump the image!\n");
 	    status = AE_NO_HANDLER; /* XXX - Something. */
+	    /* K-18: release snapshot ownership on dump failure. */
+	    if (snapshot_owned) {
+		    free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		    atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
+		    dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		    atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		    snapshot_owned = false;
+	    }
 	    goto backout;
 	}
 
@@ -4633,7 +4757,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	if (acpi_hibernate_susp_bounce) {
 	    /* Free memory used to hibernate. */
 	    free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+	    atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
 	    dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+	    atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+	    snapshot_owned = false;
 	    goto backout;
 	}
 
@@ -4654,9 +4785,34 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	device_printf(sc->acpi_dev,
 		      "Suspending the dump device (currently, all devices)...\n");
 	EVENTHANDLER_INVOKE(power_suspend, stype);
-	if (DEVICE_SUSPEND(root_bus) != 0) {
-	    device_printf(sc->acpi_dev, "Second device suspend failed\n");
-	    goto backout;
+	{
+		int second_susp_error = DEVICE_SUSPEND(root_bus);
+#ifdef INVARIANTS
+		if (hibernate_fail_second_suspend_once) {
+			hibernate_fail_second_suspend_once = 0;
+			second_susp_error = EIO;
+		}
+#endif
+		if (second_susp_error != 0) {
+			device_printf(sc->acpi_dev,
+			    "Second device suspend failed\n");
+			/*
+			 * K-18: release snapshot ownership on
+			 * second-suspend failure.
+			 */
+			if (snapshot_owned) {
+				free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+				atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
+				dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+				atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+				snapshot_owned = false;
+			}
+			goto backout;
+		}
 	}
 	slp_state |= ACPI_SS_DEV_SUSPEND;
     }
