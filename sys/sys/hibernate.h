@@ -437,7 +437,9 @@ int hibernate_capacity_check(const struct hibernate_capacity_budget *b,
  * attempt.  Reads only attempt-owned, pre-validated state; does not
  * reparse ELF headers or inspect page queues.
  */
+#ifdef _KERNEL
 bool hibernate_page_is_destination(vm_page_t m);
+#endif
 
 /*
  * K-5: eight-stage SAVE stability barrier.
@@ -468,6 +470,31 @@ bool hibernate_page_is_destination(vm_page_t m);
 
 /* Forward declaration; full type in vm/vm_phys.h. */
 struct vm_phys_reservation;
+
+/*
+ * K-5 footprint arithmetic constants.  Defined here (not in kern_hibernate.c)
+ * so they are available in both kernel and _HIBERNATE_USERLAND_BUILD modes
+ * for hibernate_restore_footprint_compute() and host-runnable tests (N7).
+ *
+ * HIB_FOOTPRINT_DEFAULT: default restore footprint floor (262144 pages = 1 GiB).
+ * HIB_FOOTPRINT_MAX:     maximum restore footprint (16777216 pages = 64 GiB).
+ * HIB_METADATA_MAX_BYTES: maximum metadata-prefix storage (<=64029 B).
+ * HIB_FRAG_PCT:          fragmentation margin numerator (25%).
+ * HIB_FRAG_DIV:          fragmentation margin denominator.
+ * HIB_MAXPHYS_BYTES:     maximum BIO transfer size (MAXPHYS equivalent, 128 KiB).
+ * HIB_SCRATCH_STACK_BYTES: arena-external MD workspace size.
+ * HIB_RESERVATION_RECORD_BYTES: per-page reservation record size (16 bytes on amd64).
+ * HIB_PAGE_SIZE:         page size for footprint arithmetic (4096 bytes).
+ */
+#define	HIB_FOOTPRINT_DEFAULT		262144UL
+#define	HIB_FOOTPRINT_MAX		16777216UL
+#define	HIB_METADATA_MAX_BYTES		64029UL
+#define	HIB_FRAG_PCT			25UL
+#define	HIB_FRAG_DIV			100UL
+#define	HIB_MAXPHYS_BYTES		131072UL	/* 128 KiB */
+#define	HIB_SCRATCH_STACK_BYTES		65536UL		/* 64 KiB */
+#define	HIB_RESERVATION_RECORD_BYTES	16UL		/* amd64 LP64 */
+#define	HIB_PAGE_SIZE			4096UL
 
 #ifdef _KERNEL
 /*
@@ -523,31 +550,6 @@ void hibernate_barrier_publish_attempt(struct hibernate_attempt *ha);
  * unwind before resources are freed.
  */
 void hibernate_barrier_retract_attempt(void);
-
-/*
- * K-5 footprint arithmetic constants.  Defined here (not in kern_hibernate.c)
- * so they are available in both kernel and _HIBERNATE_USERLAND_BUILD modes
- * for hibernate_restore_footprint_compute() and host-runnable tests (N7).
- *
- * HIB_FOOTPRINT_DEFAULT: default restore footprint floor (262144 pages = 1 GiB).
- * HIB_FOOTPRINT_MAX:     maximum restore footprint (16777216 pages = 64 GiB).
- * HIB_METADATA_MAX_BYTES: maximum metadata-prefix storage (<=64029 B).
- * HIB_FRAG_PCT:          fragmentation margin numerator (25%).
- * HIB_FRAG_DIV:          fragmentation margin denominator.
- * HIB_MAXPHYS_BYTES:     maximum BIO transfer size (MAXPHYS equivalent, 128 KiB).
- * HIB_SCRATCH_STACK_BYTES: arena-external MD workspace size.
- * HIB_RESERVATION_RECORD_BYTES: per-page reservation record size (16 bytes on amd64).
- * HIB_PAGE_SIZE:         page size for footprint arithmetic (4096 bytes).
- */
-#define	HIB_FOOTPRINT_DEFAULT		262144UL
-#define	HIB_FOOTPRINT_MAX		16777216UL
-#define	HIB_METADATA_MAX_BYTES		64029UL
-#define	HIB_FRAG_PCT			25UL
-#define	HIB_FRAG_DIV			100UL
-#define	HIB_MAXPHYS_BYTES		131072UL	/* 128 KiB */
-#define	HIB_SCRATCH_STACK_BYTES		65536UL		/* 64 KiB */
-#define	HIB_RESERVATION_RECORD_BYTES	16UL		/* amd64 LP64 */
-#define	HIB_PAGE_SIZE			4096UL
 
 /*
  * hibernate_restore_footprint_compute: pure arithmetic core of footprint
