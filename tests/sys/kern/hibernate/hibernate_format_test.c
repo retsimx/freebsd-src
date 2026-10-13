@@ -49,7 +49,7 @@
  *   malformed_bad_xcr0          — undefined XCR0 bits rejected
  *   malformed_bad_xsave_format  — wrong XSAVE format rejected
  *   malformed_bad_xsave_len     — XSAVE length > 768 rejected
- *   malformed_xsave_tail_nonzero— XSAVE tail bytes nonzero rejected
+ *   malformed_pcb_reserved_nonzero— PCB reserved byte nonzero rejected
  *   malformed_metadata_too_large— metadata_length > 64029 rejected
  *   malformed_payload_start_too_large — payload_start > 65536 rejected
  *   malformed_payload_after_image — payload_start > image_length rejected
@@ -317,7 +317,7 @@ write_cb(uint8_t *buf, uint64_t cb_offset, uint64_t image_length,
  * Uses x87+SSE only (XCR0 = 0x3, xsave_length = 576).
  */
 static void
-write_pcb(uint8_t *buf, uint64_t pcb_offset)
+write_pcb(uint8_t *buf, uint64_t pcb_offset, uint64_t xsave_offset)
 {
 	uint8_t *p = buf + pcb_offset;
 	memset(p, 0, HIBERNATE_PCB_ENCODED_SIZE);
@@ -353,17 +353,16 @@ write_pcb(uint8_t *buf, uint64_t pcb_offset)
 	le64enc_p(p + HIBERNATE_PCB_OFF_KERNEL_GSBASE,
 	    UINT64_C(0xffffffff81200000));
 	/*
-	 * xsave_length = 576 (ABI 1 canonical: 512-byte legacy region +
-	 * 64-byte XSAVE header = HIBERNATE_PCB_XSAVE_MIN).
+	 * XSAVE descriptor (ABI 1): 576-byte canonical minimum
+	 * (512-byte legacy region + 64-byte XSAVE header), standard
+	 * non-compacted format, and a 64-byte-aligned payload offset.
+	 * The enabled mask must equal XCR0.
 	 */
 	le32enc_p(p + HIBERNATE_PCB_OFF_XSAVE_LENGTH, 576);
-	/* xsave_format = HIBERNATE_XSAVE_FORMAT = 1 */
 	le32enc_p(p + HIBERNATE_PCB_OFF_XSAVE_FORMAT, HIBERNATE_XSAVE_FORMAT);
-	/* xsave area: first 576 bytes valid, rest zero (already from memset) */
-	/* Put recognisable FCW/MXCSR in the first few bytes. */
-	le16enc_p(p + HIBERNATE_PCB_OFF_XSAVE + 0, 0x037f);  /* FCW */
-	le16enc_p(p + HIBERNATE_PCB_OFF_XSAVE + 24, 0x1f80); /* MXCSR */
-	/* bytes [576..768) are zero — already done by memset */
+	le64enc_p(p + HIBERNATE_PCB_OFF_XSAVE_OFFSET, xsave_offset);
+	le64enc_p(p + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
+	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE);
 }
 
 /*
@@ -375,7 +374,8 @@ build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
     uint64_t image_length)
 {
 	uint64_t phdr_table_end, cb_offset, pcb_offset, payload_start;
-	uint16_t phnum = 2 + n_loads; /* CB + PCB + n_loads */
+	uint64_t xsave_offset, xsave_len, load_base;
+	uint16_t phnum = 3 + n_loads; /* CB + PCB + XSAVE + n_loads */
 	uint64_t dest_pages = n_loads;
 	uint16_t i;
 
@@ -388,29 +388,36 @@ build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
 	payload_start = align_up(pcb_offset + HIBERNATE_PCB_ENCODED_SIZE,
 	    HIB_PAGE_SIZE);
 
+	/* The sole XSAVE object starts at payload_start (64-aligned). */
+	xsave_offset = payload_start;
+	xsave_len = 576;
+	load_base = align_up(payload_start + xsave_len, HIB_PAGE_SIZE);
+
 	ATF_REQUIRE(payload_start <= bufsize);
-	ATF_REQUIRE(
-	    image_length >= payload_start + (uint64_t)n_loads * HIB_PAGE_SIZE);
+	ATF_REQUIRE(image_length >=
+	    load_base + (uint64_t)n_loads * HIB_PAGE_SIZE);
 
 	/* ELF header */
 	write_ehdr(buf, phnum, EHDR_SIZE);
 
-	/* phdrs: index 0=CB, 1=PCB, 2..phnum-1=PT_LOAD */
+	/* phdrs: 0=CB, 1=PCB, 2=XSAVE, 3..=PT_LOAD */
 	write_phdr(buf, EHDR_SIZE + 0 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_CB,
 	    cb_offset, HIBERNATE_CB_ENCODED_SIZE, HIBERNATE_CB_ENCODED_SIZE, 0);
 	write_phdr(buf, EHDR_SIZE + 1 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_PCB,
 	    pcb_offset, HIBERNATE_PCB_ENCODED_SIZE, HIBERNATE_PCB_ENCODED_SIZE,
 	    0);
+	write_phdr(buf, EHDR_SIZE + 2 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_XSAVE,
+	    xsave_offset, xsave_len, xsave_len, 0);
 	for (i = 0; i < n_loads; i++) {
-		uint64_t file_off = payload_start + (uint64_t)i * HIB_PAGE_SIZE;
+		uint64_t file_off = load_base + (uint64_t)i * HIB_PAGE_SIZE;
 		uint64_t paddr = (uint64_t)i * HIB_PAGE_SIZE;
-		write_phdr(buf, EHDR_SIZE + (uint64_t)(2 + i) * PHDR_SIZE,
+		write_phdr(buf, EHDR_SIZE + (uint64_t)(3 + i) * PHDR_SIZE,
 		    PT_LOAD, file_off, HIB_PAGE_SIZE, HIB_PAGE_SIZE, paddr);
 	}
 
 	write_cb(buf, cb_offset, image_length, payload_start, phnum, dest_pages,
 	    pcb_offset);
-	write_pcb(buf, pcb_offset);
+	write_pcb(buf, pcb_offset, xsave_offset);
 
 	return (payload_start);
 }
@@ -464,16 +471,19 @@ ATF_TC_BODY(golden_pcb_encoding, tc)
 {
 	ATF_CHECK_EQ(1024U, (size_t)HIBERNATE_PCB_ENCODED_SIZE);
 	ATF_CHECK_EQ(64U, (size_t)HIBERNATE_PCB_ALIGNMENT);
-	ATF_CHECK_EQ(768U, (size_t)HIBERNATE_PCB_XSAVE_SIZE);
 	ATF_CHECK_EQ(0x000U, (unsigned)HIBERNATE_PCB_OFF_VERSION);
-	ATF_CHECK_EQ(0x0c0U, (unsigned)HIBERNATE_PCB_OFF_XSAVE);
-	ATF_CHECK_EQ(768U, (unsigned)HIBERNATE_PCB_WIDTH_XSAVE);
-	ATF_CHECK_EQ(0x3c0U, (unsigned)HIBERNATE_PCB_OFF_RESERVED_3C0);
-	ATF_CHECK_EQ(64U, (unsigned)HIBERNATE_PCB_WIDTH_RESERVED_3C0);
-	/* Coverage: 0x3c0 + 0x40 = 0x400 = 1024. */
+	ATF_CHECK_EQ(0x0b8U, (unsigned)HIBERNATE_PCB_OFF_XSAVE_LENGTH);
+	ATF_CHECK_EQ(0x0bcU, (unsigned)HIBERNATE_PCB_OFF_XSAVE_FORMAT);
+	ATF_CHECK_EQ(0x0c0U, (unsigned)HIBERNATE_PCB_OFF_XSAVE_OFFSET);
+	ATF_CHECK_EQ(8U, (unsigned)HIBERNATE_PCB_WIDTH_XSAVE_OFFSET);
+	ATF_CHECK_EQ(0x0c8U, (unsigned)HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK);
+	ATF_CHECK_EQ(8U, (unsigned)HIBERNATE_PCB_WIDTH_XSAVE_ENABLED_MASK);
+	ATF_CHECK_EQ(0x0d0U, (unsigned)HIBERNATE_PCB_OFF_RESERVED_0D0);
+	ATF_CHECK_EQ(816U, (unsigned)HIBERNATE_PCB_WIDTH_RESERVED_0D0);
+	/* Coverage: 0x0d0 + 816 = 0x400 = 1024. */
 	ATF_CHECK_EQ(1024U,
-	    (unsigned)(HIBERNATE_PCB_OFF_RESERVED_3C0 +
-		HIBERNATE_PCB_WIDTH_RESERVED_3C0));
+	    (unsigned)(HIBERNATE_PCB_OFF_RESERVED_0D0 +
+		HIBERNATE_PCB_WIDTH_RESERVED_0D0));
 }
 
 ATF_TC_WITHOUT_HEAD(golden_le_fields);
@@ -531,12 +541,12 @@ ATF_TC_BODY(golden_xsave_valid, tc)
 	    img.hi_pcb.hp_xsave_format);
 	ATF_CHECK_EQ(HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE,
 	    img.hi_pcb.hp_xcr0);
-	/* Tail bytes [576..768) must be zero. */
-	{
-		size_t i;
-		for (i = 576; i < HIBERNATE_PCB_XSAVE_SIZE; i++)
-			ATF_CHECK_EQ(0, img.hi_pcb.hp_xsave[i]);
-	}
+	/* The enabled mask must equal XCR0 (x87|SSE). */
+	ATF_CHECK_EQ(HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE,
+	    img.hi_pcb.hp_xsave_enabled_mask);
+	/* The descriptor must match the sole XSAVE program header. */
+	ATF_CHECK_EQ(img.hi_xsave_offset, img.hi_pcb.hp_xsave_offset);
+	ATF_CHECK_EQ(img.hi_xsave_length, img.hi_pcb.hp_xsave_length);
 }
 
 ATF_TC_WITHOUT_HEAD(golden_padding_payload_start);
@@ -1014,19 +1024,20 @@ ATF_TC_BODY(malformed_bad_xsave_len, tc)
 	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
 	pcb_off = align_up(cb_off + HIBERNATE_CB_ENCODED_SIZE, HIB_PAGE_SIZE);
 	/*
-	 * ABI 1: xsave_length must be in [HIBERNATE_PCB_XSAVE_MIN (576),
-	 * HIBERNATE_PCB_XSAVE_SIZE (768)].  Test both bounds.
+	 * ABI 1: xsave_length has no fixed maximum but must be at least
+	 * the 576-byte canonical minimum and must equal the sole XSAVE
+	 * program header's p_filesz.
 	 */
-	/* xsave_length > 768: rejected. */
-	le32enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_LENGTH, 769);
-	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 	/* xsave_length < 576: rejected. */
 	le32enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_LENGTH, 575);
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
+	/* xsave_length != the sole XSAVE phdr p_filesz: rejected. */
+	le32enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_LENGTH, 640);
+	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 }
 
-ATF_TC_WITHOUT_HEAD(malformed_xsave_tail_nonzero);
-ATF_TC_BODY(malformed_xsave_tail_nonzero, tc)
+ATF_TC_WITHOUT_HEAD(malformed_pcb_reserved_nonzero);
+ATF_TC_BODY(malformed_pcb_reserved_nonzero, tc)
 {
 	static uint8_t buf[HIB_PAGE_SIZE * 5];
 	struct hibernate_image img;
@@ -1035,9 +1046,8 @@ ATF_TC_BODY(malformed_xsave_tail_nonzero, tc)
 	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
 	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
 	pcb_off = align_up(cb_off + HIBERNATE_CB_ENCODED_SIZE, HIB_PAGE_SIZE);
-	/* xsave_length = 576 (canonical min); write a nonzero byte at offset
-	 * 577. */
-	buf[pcb_off + HIBERNATE_PCB_OFF_XSAVE + 576] = 0x01;
+	/* A nonzero byte in the reserved [0x0d0,0x400) region rejects. */
+	buf[pcb_off + HIBERNATE_PCB_OFF_RESERVED_0D0] = 0x01;
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 }
 
@@ -1493,7 +1503,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, malformed_bad_xcr0);
 	ATF_TP_ADD_TC(tp, malformed_bad_xsave_format);
 	ATF_TP_ADD_TC(tp, malformed_bad_xsave_len);
-	ATF_TP_ADD_TC(tp, malformed_xsave_tail_nonzero);
+	ATF_TP_ADD_TC(tp, malformed_pcb_reserved_nonzero);
 	ATF_TP_ADD_TC(tp, malformed_metadata_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_start_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_after_image);

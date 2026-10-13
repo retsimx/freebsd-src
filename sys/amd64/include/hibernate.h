@@ -61,6 +61,22 @@ hcb_size(const struct hibernate_save_cb *hcb)
 
 #ifdef _KERNEL
 
+/*
+ * ABI 1 amd64 XSAVE policy and the terminal descriptor consumed by K-10.
+ * Construction and publication of this validated tuple belong to K-7.
+ */
+#define HIBERNATE_AMD64_XSAVE_FORMAT_STANDARD	HIBERNATE_XSAVE_FORMAT
+#define HIBERNATE_AMD64_XCR0_SUPPORTED_MASK	HIBERNATE_XCR0_SUPPORTED_MASK
+#define HIBERNATE_AMD64_XSAVE_MIN_LENGTH	576U
+#define HIBERNATE_AMD64_XSAVE_ALIGNMENT		64U
+
+struct hibernate_xsave_terminal {
+	const void *hxt_staged_address;
+	uint64_t hxt_length;
+	uint64_t hxt_enabled_mask;
+	uint32_t hxt_format;
+};
+
 struct pcb;
 
 #define	HIBERNATE_SCRATCH_STACK_SIZE	(32 * 1024)

@@ -561,6 +561,7 @@ typedef struct {
 #define	PT_FREEBSD_HIBERNATE_CB		0x61000054
 /* Hibernate minimal PCB to hand over control to the kernel. */
 #define	PT_FREEBSD_HIBERNATE_PCB	0x61000055
+#define	PT_FREEBSD_HIBERNATE_XSAVE	0x61000056
 #define	PT_SUNW_UNWIND	0x6464e550	/* amd64 UNWIND program header */
 #define	PT_GNU_EH_FRAME	0x6474e550
 #define	PT_GNU_STACK	0x6474e551

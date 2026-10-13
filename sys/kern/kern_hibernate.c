@@ -1690,6 +1690,7 @@ decode_pcb(const uint8_t *buf, uint64_t pcb_offset, struct hibernate_pcb *pcb)
 	const uint8_t *p;
 	uint64_t xcr0;
 	uint32_t xsave_len, xsave_fmt;
+	uint64_t xsave_off, xsave_mask;
 
 	p = buf + pcb_offset;
 
@@ -1727,15 +1728,22 @@ decode_pcb(const uint8_t *buf, uint64_t pcb_offset, struct hibernate_pcb *pcb)
 
 	xsave_len = le32dec(p + HIBERNATE_PCB_OFF_XSAVE_LENGTH);
 	xsave_fmt = le32dec(p + HIBERNATE_PCB_OFF_XSAVE_FORMAT);
+	xsave_off = le64dec(p + HIBERNATE_PCB_OFF_XSAVE_OFFSET);
+	xsave_mask = le64dec(p + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK);
 	pcb->hp_xsave_length = xsave_len;
 	pcb->hp_xsave_format = xsave_fmt;
+	pcb->hp_xsave_offset = xsave_off;
+	pcb->hp_xsave_enabled_mask = xsave_mask;
 
-	/* xcr0 must contain only ABI-defined bits. */
-	if ((xcr0 & ~HIBERNATE_XCR0_MASK) != 0)
+	/* xcr0 must contain only ABI-supported bits. */
+	if ((xcr0 & ~HIBERNATE_XCR0_SUPPORTED_MASK) != 0)
 		return (EINVAL);
 	/* x87 and SSE are mandatory. */
 	if ((xcr0 & HIBERNATE_XCR0_REQUIRED_MASK) !=
 	    HIBERNATE_XCR0_REQUIRED_MASK)
+		return (EINVAL);
+	/* The enabled-component mask must equal xcr0. */
+	if (xsave_mask != xcr0)
 		return (EINVAL);
 
 	/* XSAVE format must be HIBERNATE_XSAVE_FORMAT. */
@@ -1743,25 +1751,12 @@ decode_pcb(const uint8_t *buf, uint64_t pcb_offset, struct hibernate_pcb *pcb)
 		return (EINVAL);
 
 	/*
-	 * ABI 1 XSAVE length range (structural, no CPUID):
-	 *   x87 + SSE only (AVX excluded in ABI 1).
-	 *   Canonical minimum: 512-byte legacy region + 64-byte XSAVE
-	 *   header = HIBERNATE_PCB_XSAVE_MIN (576) bytes.
-	 *   Maximum: HIBERNATE_PCB_XSAVE_SIZE (768) bytes.
-	 *   Tail bytes [xsave_len, 768) must be zero (checked below).
+	 * ABI 1 XSAVE length is a variable payload extent with no fixed
+	 * maximum.  Only the canonical minimum is structural here; the
+	 * exact extent and its file placement are enforced against the
+	 * sole PT_FREEBSD_HIBERNATE_XSAVE program header below.
 	 */
 	if (xsave_len < HIBERNATE_PCB_XSAVE_MIN)
-		return (EINVAL);
-	if (xsave_len > HIBERNATE_PCB_XSAVE_SIZE)
-		return (EINVAL);
-
-	/* Copy canonical XSAVE bytes from the encoded region. */
-	__builtin_memcpy(pcb->hp_xsave, p + HIBERNATE_PCB_OFF_XSAVE,
-	    HIBERNATE_PCB_XSAVE_SIZE);
-
-	/* Bytes hp_xsave[xsave_len..XSAVE_SIZE) must be zero. */
-	if (!is_all_zero(pcb->hp_xsave + xsave_len,
-		HIBERNATE_PCB_XSAVE_SIZE - xsave_len))
 		return (EINVAL);
 
 	/* Reserved ranges must be zero. */
@@ -1771,8 +1766,8 @@ decode_pcb(const uint8_t *buf, uint64_t pcb_offset, struct hibernate_pcb *pcb)
 	if (!is_all_zero(p + HIBERNATE_PCB_OFF_RESERVED_06A,
 		HIBERNATE_PCB_WIDTH_RESERVED_06A))
 		return (EINVAL);
-	if (!is_all_zero(p + HIBERNATE_PCB_OFF_RESERVED_3C0,
-		HIBERNATE_PCB_WIDTH_RESERVED_3C0))
+	if (!is_all_zero(p + HIBERNATE_PCB_OFF_RESERVED_0D0,
+		HIBERNATE_PCB_WIDTH_RESERVED_0D0))
 		return (EINVAL);
 
 	return (0);
@@ -1798,9 +1793,10 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	uint64_t cb_offset, pcb_offset;
 	uint64_t cb_aligned, pcb_aligned, payload_aligned, payload_start;
 	uint64_t prev_file_end, prev_dest_end, prev_load_file_end;
-	uint64_t load_count, cb_count, pcb_count;
+	uint64_t load_count, cb_count, pcb_count, xsave_count;
 	uint64_t load_bytes, load_pages;
 	uint64_t first_load_index, last_load_index;
+	uint64_t xsave_index, xsave_offset, xsave_length;
 	uint64_t tmp;
 	int error;
 
@@ -1867,6 +1863,10 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	/* Step 4+5: walk phdrs, classify, check monotonicity. */
 	cb_count = 0;
 	pcb_count = 0;
+	xsave_count = 0;
+	xsave_index = (uint64_t)-1;
+	xsave_offset = 0;
+	xsave_length = 0;
 	load_count = 0;
 	load_bytes = 0;
 	load_pages = 0;
@@ -1892,7 +1892,9 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 
 		/* Closed type set. */
 		if (p_type != PT_FREEBSD_HIBERNATE_CB &&
-		    p_type != PT_FREEBSD_HIBERNATE_PCB && p_type != PT_LOAD)
+		    p_type != PT_FREEBSD_HIBERNATE_PCB &&
+		    p_type != PT_FREEBSD_HIBERNATE_XSAVE &&
+		    p_type != PT_LOAD)
 			return (EINVAL);
 
 		/* Strictly increasing image-relative file offsets. */
@@ -1902,7 +1904,8 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 		/* Checked segment end; metadata must fit within the prefix. */
 		if (__builtin_add_overflow(p_offset, p_filesz, &seg_end))
 			return (EOVERFLOW);
-		if (p_type != PT_LOAD && seg_end > len)
+		if (p_type != PT_LOAD &&
+		    p_type != PT_FREEBSD_HIBERNATE_XSAVE && seg_end > len)
 			return (EINVAL);
 
 		if (p_type == PT_FREEBSD_HIBERNATE_CB) {
@@ -1917,6 +1920,21 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 				return (EINVAL);
 			pcb_offset = p_offset;
 			if (p_filesz != HIBERNATE_PCB_ENCODED_SIZE)
+				return (EINVAL);
+
+		} else if (p_type == PT_FREEBSD_HIBERNATE_XSAVE) {
+			if (xsave_count++ > 0)
+				return (EINVAL);
+			xsave_index = i;
+			xsave_offset = p_offset;
+			xsave_length = p_filesz;
+			if (p_filesz != p_memsz)
+				return (EINVAL);
+			if (p_paddr != 0)
+				return (EINVAL);
+			if (p_filesz < HIBERNATE_PCB_XSAVE_MIN)
+				return (EINVAL);
+			if ((p_offset & 63) != 0)
 				return (EINVAL);
 
 		} else {
@@ -1959,7 +1977,7 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	}
 
 	/* Require exactly one CB, one PCB, and at least one PT_LOAD. */
-	if (cb_count != 1 || pcb_count != 1 || load_count < 1)
+	if (cb_count != 1 || pcb_count != 1 || xsave_count != 1 || load_count < 1)
 		return (EINVAL);
 
 	/*
@@ -2084,6 +2102,28 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 			return (EINVAL);
 	}
 
+	/*
+	 * Step 11b: verify the sole XSAVE payload object's placement and
+	 * cross-check it against the decoded PCB descriptor.
+	 */
+	{
+		uint64_t xsave_end;
+
+		if (xsave_offset < payload_start)
+			return (EINVAL);
+		if (__builtin_add_overflow(xsave_offset, xsave_length,
+			&xsave_end))
+			return (EOVERFLOW);
+		if (xsave_end > img.hi_cb.hc_image_length)
+			return (EINVAL);
+		if (img.hi_pcb.hp_xsave_offset != xsave_offset)
+			return (EINVAL);
+		if (img.hi_pcb.hp_xsave_length != xsave_length)
+			return (EINVAL);
+		if (img.hi_pcb.hp_xsave_enabled_mask != img.hi_pcb.hp_xcr0)
+			return (EINVAL);
+	}
+
 	/* Step 12: ABI-fixed arithmetic bounds. */
 	/* destination_bytes == destination_pages * PAGE_SIZE (checked). */
 	if (__builtin_mul_overflow(img.hi_cb.hc_destination_pages,
@@ -2118,6 +2158,12 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 		img.hi_first_load_index = (uint32_t)first_load_index;
 	if (last_load_index != (uint64_t)-1)
 		img.hi_last_load_index = (uint32_t)last_load_index;
+	if (xsave_index != (uint64_t)-1)
+		img.hi_xsave_index = (uint32_t)xsave_index;
+	img.hi_xsave_offset = xsave_offset;
+	img.hi_xsave_length = xsave_length;
+	img.hi_xsave_enabled_mask = img.hi_pcb.hp_xsave_enabled_mask;
+	img.hi_xsave_format = img.hi_pcb.hp_xsave_format;
 
 	*out = img;
 	return (0);
@@ -2251,11 +2297,11 @@ hibernate_image_interval_next(struct hibernate_image_iterator *it,
 
 		/* Transition to payload phase. */
 		it->hii_phase = HIIP_PAYLOAD;
-		it->hii_next_index = img->hi_first_load_index;
+		it->hii_next_index = 0;
 		cursor = it->hii_cursor;
 	}
 
-	/* Payload phase: walk PT_LOAD entries in order. */
+	/* Payload phase: walk stored payload objects in file order. */
 	if (it->hii_phase == HIIP_PAYLOAD) {
 		const uint8_t *b;
 		const uint8_t *ph;
@@ -2267,17 +2313,25 @@ hibernate_image_interval_next(struct hibernate_image_iterator *it,
 		idx = it->hii_next_index;
 		cursor = it->hii_cursor;
 
-		/* Find the next PT_LOAD. */
+		/*
+		 * Find the next file-backed stored payload object.  Both
+		 * PT_LOAD and the sole PT_FREEBSD_HIBERNATE_XSAVE object
+		 * are emitted as HIIC_STORED in file-offset order; the
+		 * metadata CB/PCB objects live before payload_start and
+		 * are already covered by the metadata phase.
+		 */
 		while (idx < phnum) {
 			ph = b + EHDR_SIZE + (uint64_t)idx * PHDR_SIZE;
 			p_type = le32dec(ph + PHDR_OFF_P_TYPE);
-			if (p_type == PT_LOAD)
+			if ((p_type == PT_LOAD ||
+			    p_type == PT_FREEBSD_HIBERNATE_XSAVE) &&
+			    le64dec(ph + PHDR_OFF_P_OFFSET) >= payload_start)
 				break;
 			idx++;
 		}
 
 		if (idx >= phnum) {
-			/* No more PT_LOADs; emit trailing gap if any. */
+			/* No more stored objects; emit trailing gap if any. */
 			if (cursor < image_length) {
 				out->hii_offset = cursor;
 				out->hii_length = image_length - cursor;
