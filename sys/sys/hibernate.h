@@ -24,7 +24,6 @@ struct dumperinfo;
 #define HIBERNATE_CB_ALIGNMENT	      16
 #define HIBERNATE_PCB_ENCODED_SIZE    1024
 #define HIBERNATE_PCB_ALIGNMENT	      64
-#define HIBERNATE_PCB_XSAVE_SIZE      768
 
 /* Marker encoding. */
 #define HIBERNATE_MARKER_OFF_MAGIC	    0x000
@@ -153,43 +152,43 @@ struct dumperinfo;
 #define HIBERNATE_PCB_WIDTH_SFMASK	  8
 #define HIBERNATE_PCB_OFF_KERNEL_GSBASE	  0x0b0
 #define HIBERNATE_PCB_WIDTH_KERNEL_GSBASE 8
-#define HIBERNATE_PCB_OFF_XSAVE_LENGTH	  0x0b8
-#define HIBERNATE_PCB_WIDTH_XSAVE_LENGTH  4
-#define HIBERNATE_PCB_OFF_XSAVE_FORMAT	  0x0bc
-#define HIBERNATE_PCB_WIDTH_XSAVE_FORMAT  4
-#define HIBERNATE_PCB_OFF_XSAVE		  0x0c0
-#define HIBERNATE_PCB_WIDTH_XSAVE	  768
-#define HIBERNATE_PCB_OFF_RESERVED_3C0	  0x3c0
-#define HIBERNATE_PCB_WIDTH_RESERVED_3C0  64
+#define HIBERNATE_PCB_OFF_XSAVE_LENGTH		0x0b8
+#define HIBERNATE_PCB_WIDTH_XSAVE_LENGTH	4
+#define HIBERNATE_PCB_OFF_XSAVE_FORMAT		0x0bc
+#define HIBERNATE_PCB_WIDTH_XSAVE_FORMAT	4
+#define HIBERNATE_PCB_OFF_XSAVE_OFFSET		0x0c0
+#define HIBERNATE_PCB_WIDTH_XSAVE_OFFSET	8
+#define HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK	0x0c8
+#define HIBERNATE_PCB_WIDTH_XSAVE_ENABLED_MASK	8
+#define HIBERNATE_PCB_OFF_RESERVED_0D0		0x0d0
+#define HIBERNATE_PCB_WIDTH_RESERVED_0D0	816
 
 /*
- * ABI 1 accepts no machine flags.  Its canonical XSAVE image supports the
- * mandatory x87 and SSE components only.  AVX (XCR0 bit 2) is deferred
- * until a future ABI version increases the XSAVE region beyond 768 bytes:
- * AVX requires at least 832 bytes (576-byte x87+SSE region + 256-byte YMM
- * high halves), which exceeds HIBERNATE_PCB_XSAVE_SIZE.
- *
- * Canonical XSAVE length for x87+SSE (ABI 1): 576 bytes
- *   512-byte legacy region (x87 + SSE) + 64-byte XSAVE header = 576.
- * Encoded region: HIBERNATE_PCB_WIDTH_XSAVE = 768 bytes.
- * Valid range: [HIBERNATE_PCB_XSAVE_MIN, HIBERNATE_PCB_XSAVE_SIZE].
- * Tail bytes [xsave_length, 768) must be zero.
+ * ABI 1 accepts no machine flags.  XSAVE state is stored in one standard,
+ * non-compacted payload object.  These values mirror XFEATURE_ENABLED_*
+ * without requiring a kernel-only architecture header in userland builds.
  */
-#define HIBERNATE_MACHINE_FLAGS_MASK UINT64_C(0)
-#define HIBERNATE_XSAVE_FORMAT	     1
-#define HIBERNATE_XSAVE_FORMAT_MASK  (1U << HIBERNATE_XSAVE_FORMAT)
-#define HIBERNATE_XCR0_X87	     UINT64_C(0x1)
-#define HIBERNATE_XCR0_SSE	     UINT64_C(0x2)
-#define HIBERNATE_XCR0_REQUIRED_MASK (HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE)
-/*
- * ABI 1: x87 + SSE only.  AVX excluded; see comment above.
- */
-#define HIBERNATE_XCR0_MASK HIBERNATE_XCR0_REQUIRED_MASK
-/*
- * Canonical XSAVE length for ABI 1 (x87+SSE): 512-byte legacy region +
- * 64-byte XSAVE header = 576 bytes.
- */
-#define HIBERNATE_PCB_XSAVE_MIN 576U
+#define HIBERNATE_MACHINE_FLAGS_MASK		UINT64_C(0)
+#define HIBERNATE_XSAVE_FORMAT			1
+#define HIBERNATE_XSAVE_FORMAT_MASK		(1U << HIBERNATE_XSAVE_FORMAT)
+#define HIBERNATE_XCR0_X87			UINT64_C(0x000001)
+#define HIBERNATE_XCR0_SSE			UINT64_C(0x000002)
+#define HIBERNATE_XCR0_YMM_HI128		UINT64_C(0x000004)
+#define HIBERNATE_XCR0_AVX			HIBERNATE_XCR0_YMM_HI128
+#define HIBERNATE_XCR0_BNDREGS			UINT64_C(0x000008)
+#define HIBERNATE_XCR0_BNDCSR			UINT64_C(0x000010)
+#define HIBERNATE_XCR0_OPMASK			UINT64_C(0x000020)
+#define HIBERNATE_XCR0_ZMM_HI256		UINT64_C(0x000040)
+#define HIBERNATE_XCR0_HI16_ZMM			UINT64_C(0x000080)
+#define HIBERNATE_XCR0_PT			UINT64_C(0x000100)
+#define HIBERNATE_XCR0_PKRU			UINT64_C(0x000200)
+#define HIBERNATE_XCR0_TILECONFIG		UINT64_C(0x020000)
+#define HIBERNATE_XCR0_TILEDATA			UINT64_C(0x040000)
+#define HIBERNATE_XCR0_REQUIRED_MASK		\
+	(HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE)
+#define HIBERNATE_XCR0_SUPPORTED_MASK		UINT64_C(0x0603ff)
+#define HIBERNATE_XCR0_MASK			HIBERNATE_XCR0_SUPPORTED_MASK
+#define HIBERNATE_PCB_XSAVE_MIN			576U
 
 /*
  * These are decoded host-order value objects.  They are never persistent
@@ -256,7 +255,8 @@ struct hibernate_pcb {
 	uint64_t hp_kernel_gsbase;
 	uint32_t hp_xsave_length;
 	uint32_t hp_xsave_format;
-	uint8_t hp_xsave[HIBERNATE_PCB_XSAVE_SIZE];
+	uint64_t hp_xsave_offset;
+	uint64_t hp_xsave_enabled_mask;
 };
 
 enum hibernate_image_interval_class { HIIC_STORED, HIIC_ZERO_GAP };
@@ -292,6 +292,11 @@ struct hibernate_image {
 	uint64_t hi_crc_zero_length;
 	uint32_t hi_first_load_index;
 	uint32_t hi_last_load_index;
+	uint32_t hi_xsave_index;
+	uint64_t hi_xsave_offset;
+	uint64_t hi_xsave_length;
+	uint64_t hi_xsave_enabled_mask;
+	uint32_t hi_xsave_format;
 };
 
 enum hibernate_image_iterator_phase { HIIP_METADATA, HIIP_PAYLOAD, HIIP_DONE };
@@ -741,8 +746,9 @@ struct __hibernate_pcb_layout {
 	uint8_t kernel_gsbase[HIBERNATE_PCB_WIDTH_KERNEL_GSBASE];
 	uint8_t xsave_length[HIBERNATE_PCB_WIDTH_XSAVE_LENGTH];
 	uint8_t xsave_format[HIBERNATE_PCB_WIDTH_XSAVE_FORMAT];
-	uint8_t xsave[HIBERNATE_PCB_WIDTH_XSAVE];
-	uint8_t reserved_3c0[HIBERNATE_PCB_WIDTH_RESERVED_3C0];
+	uint8_t xsave_offset[HIBERNATE_PCB_WIDTH_XSAVE_OFFSET];
+	uint8_t xsave_enabled_mask[HIBERNATE_PCB_WIDTH_XSAVE_ENABLED_MASK];
+	uint8_t reserved_0d0[HIBERNATE_PCB_WIDTH_RESERVED_0D0];
 } __aligned(HIBERNATE_PCB_ALIGNMENT);
 
 #define HIBERNATE_LAYOUT_ASSERT(type, member, prefix, field) \
@@ -853,9 +859,12 @@ HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave_length, HIBERNATE_PCB,
     XSAVE_LENGTH);
 HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave_format, HIBERNATE_PCB,
     XSAVE_FORMAT);
-HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave, HIBERNATE_PCB, XSAVE);
-HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, reserved_3c0, HIBERNATE_PCB,
-    RESERVED_3C0);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave_offset, HIBERNATE_PCB,
+    XSAVE_OFFSET);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave_enabled_mask,
+    HIBERNATE_PCB, XSAVE_ENABLED_MASK);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, reserved_0d0, HIBERNATE_PCB,
+    RESERVED_0D0);
 
 _Static_assert(sizeof(struct __hibernate_marker_layout) ==
 	HIBERNATE_MARKER_ENCODED_SIZE,
@@ -875,10 +884,12 @@ _Static_assert(HIBERNATE_CB_OFF_RESERVED_0C0 +
 	    HIBERNATE_CB_WIDTH_RESERVED_0C0 ==
 	HIBERNATE_CB_ENCODED_SIZE,
     "CB collision-free complete coverage");
-_Static_assert(HIBERNATE_PCB_OFF_RESERVED_3C0 +
-	    HIBERNATE_PCB_WIDTH_RESERVED_3C0 ==
+_Static_assert(HIBERNATE_PCB_OFF_RESERVED_0D0 +
+	    HIBERNATE_PCB_WIDTH_RESERVED_0D0 ==
 	HIBERNATE_PCB_ENCODED_SIZE,
     "PCB collision-free complete coverage");
+_Static_assert(HIBERNATE_PCB_ENCODED_SIZE == 1024,
+    "PCB encoded size must remain 1024 bytes");
 _Static_assert(HIBERNATE_MARKER_OFF_RESERVED_024 +
 	    HIBERNATE_MARKER_WIDTH_RESERVED_024 ==
 	HIBERNATE_MARKER_ENCODED_SIZE,
