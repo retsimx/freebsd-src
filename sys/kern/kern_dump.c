@@ -24,6 +24,15 @@
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * _HIBERNATE_DUMP_EXTENT_TEST: narrow test-build mode.
+ *
+ * When this macro is defined, only dumpsys_hibernate_start() and the
+ * minimum headers it requires are compiled.  No other kernel symbols,
+ * functions, or types are exposed.  The normal kernel build is the full
+ * translation unit.
+ */
+#ifndef _HIBERNATE_DUMP_EXTENT_TEST
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/callout.h>
@@ -444,49 +453,73 @@ dumpsys_hibernate_free_hcb(struct hibernate_save_cb *hcb)
 	free(hcb, M_TEMP);
 }
 
+#endif /* OS_HIBERNATE_SUPPORT */
+
+#endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
+
+#ifndef _HIBERNATE_DUMP_EXTENT_TEST
 static dumper_start_t dumpsys_hibernate_start;
 static dumper_hdr_t dumpsys_hibernate_aux_headers;
+#endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
+
 
 int
 dumpsys_hibernate_start(struct dumperinfo *di, struct kerneldumpheader *kdh,
     void *key, uint32_t keysize)
 {
-	uint64_t dumpextent, span;
+	uint64_t D, S;
+	const uint64_t M = SIZEOF_METADATA;
+	const uint64_t P = (uint64_t)di->mediasize;
 
-	dumpextent = dtoh64(kdh->dumpextent);
-	span = SIZEOF_METADATA + dumpextent;
+	D = dtoh64(kdh->dumpextent);
 
 	/*
-	 * XXX - From this point on, logic is similar to that of dump_start().
+	 * K-18: guard M + D against unsigned overflow before comparing with P.
+	 * A wrapped span would make an impossible request appear to fit.
+	 */
+	if (__builtin_add_overflow(M, D, &S))
+		return (E2BIG);
+
+	/*
+	 * From this point on, logic is similar to that of dump_start().
 	 * Difference is that we don't output the dump at the end of the
 	 * partition, but at start (modulo SIZEOF_METADATA), since we don't
 	 * output an additional header at the end which would indicate
 	 * immediately where the dump starts.
 	 */
-	if (di->mediasize < span) {
+	if (P < S) {
 		if (di->kdcomp == NULL)
 			return (E2BIG);
 
 		/*
-		 * Use all space, hoping that compression will allow the dump to
-		 * fit.
+		 * K-18: guard P - M against underflow.  Compression reduces
+		 * payload size but cannot remove the fixed metadata prefix.
 		 */
-		dumpextent = di->mediasize - span + dumpextent;
+		if (P < M)
+			return (E2BIG);
+
 		/*
+		 * Use all space, hoping that compression will allow the dump to
+		 * fit.  Commit the reduced extent only after all refusal checks
+		 * pass so that the entry value is preserved on any refusal.
+		 *
 		 * XXX - This seems unnecessary, as 'dumpextent' is used only in
 		 * dump_write_headers() if there's no specific hook, and we have
 		 * installed one.
 		 */
-		kdh->dumpextent = htod64(dumpextent);
+		D = P - M;
+		kdh->dumpextent = htod64(D);
 	}
 
 	/*
 	 * Write the dump towards the start of the partition.
+	 * Set dumpoff only after all refusal checks pass.
 	 */
 	di->dumpoff = di->mediaoffset + SIZEOF_METADATA;
 	return (0);
 }
 
+#ifndef _HIBERNATE_DUMP_EXTENT_TEST
 /*
  * Dump extra (out-of-ELF) headers.
  */
@@ -743,7 +776,6 @@ finish:
 
 	return (error);
 }
-#endif /* OS_HIBERNATE_SUPPORT */
 
 int
 dumpsys_generic(struct dumperinfo *di)
@@ -993,3 +1025,5 @@ minidumpsys(struct dumperinfo *di, bool livedump)
 	return (error);
 }
 #endif /* MINIDUMP_PAGE_TRACKING == 1 */
+
+#endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
