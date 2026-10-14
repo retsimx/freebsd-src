@@ -123,11 +123,18 @@ align_up_checked(uint64_t v, uint64_t align, uint64_t *out)
 	return (0);
 }
 
-/*
- * is_all_zero: return true iff every byte in buf[0..len) is zero.
- */
 static struct hibernate_early_arena g_hibernate_early_arena;
 static struct hibernate_attempt *g_hibernate_arena_owner;
+
+/*
+ * These buffers are used only by serial early-boot arena derivation.
+ * Each active range is fully written before it is read.
+ */
+static vm_paddr_t hibernate_arena_endpoints[HIBERNATE_ARENA_INTERVAL_MAX * 2];
+static struct hibernate_arena_interval
+    hibernate_arena_sorted[HIBERNATE_ARENA_INTERVAL_MAX];
+static struct hibernate_arena_interval
+    hibernate_arena_excluded[HIBERNATE_ARENA_INTERVAL_MAX];
 
 static int
 hibernate_arena_add(uint64_t a, uint64_t b, uint64_t *result)
@@ -246,12 +253,14 @@ hibernate_arena_normalize(const struct hibernate_arena_interval *input,
     size_t input_count, struct hibernate_arena_interval *output,
     size_t output_capacity, size_t *output_count)
 {
-	vm_paddr_t endpoints[HIBERNATE_ARENA_INTERVAL_MAX * 2];
-	struct hibernate_arena_interval sorted[HIBERNATE_ARENA_INTERVAL_MAX];
 	enum hibernate_arena_interval_class class;
+	vm_paddr_t *endpoints;
+	struct hibernate_arena_interval *sorted;
 	size_t endpoint_count, i, j, n;
 	bool covered;
 
+	endpoints = hibernate_arena_endpoints;
+	sorted = hibernate_arena_sorted;
 	if (output_count == NULL)
 		return (EINVAL);
 	*output_count = 0;
@@ -333,9 +342,10 @@ int
 hibernate_arena_exclude_live(struct hibernate_arena_interval *intervals,
     size_t *count, size_t capacity, vm_paddr_t start, vm_paddr_t end)
 {
-	struct hibernate_arena_interval output[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval *output;
 	size_t i, n;
 
+	output = hibernate_arena_excluded;
 	if (intervals == NULL || count == NULL || start >= end ||
 	    *count > capacity || capacity > HIBERNATE_ARENA_INTERVAL_MAX)
 		return (EINVAL);
@@ -548,6 +558,9 @@ hibernate_arena_release(struct hibernate_attempt *ha)
 	g_hibernate_early_arena.hea_claimed = false;
 }
 
+/*
+ * is_all_zero: return true iff every byte in buf[0..len) is zero.
+ */
 static bool
 is_all_zero(const uint8_t *buf, size_t len)
 {
