@@ -3978,7 +3978,7 @@ acpi_hibernate_dump_worker(void *arg1, void *arg2)
 	 */
 	scheduler_stopped = true;
 	device_printf(args->sc->acpi_dev, "Saving the dump image...\n");
-	error = dump_for_hibernate(args->hcb, args->hpcb);
+	error = dump_for_hibernate(args->hcb, args->hpcb, args->ha);
 
 	/*
 	 * Re-enable normal mutex operation before releasing the VM reservation.
@@ -4452,6 +4452,31 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	hib_stages |= HIB_STAGE_COORDINATOR;
 
 	/*
+	 * K-9: bind the immutable early arena to this save attempt before any
+	 * freeze or destination processing.  An unavailable arena is an
+	 * ordinary hibernation refusal, not a boot failure.
+	 */
+	error = hibernate_arena_claim(&ha);
+	if (error != 0) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: early arena unavailable (%d); "
+		    "refusing\n", error);
+		free(hib_res_pages, M_TEMP);
+		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
+		hibernate_coordinator_release();
+		free(hpcb, M_TEMP);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_pcb_releases, 1);
+#endif
+		dumpsys_hibernate_free_hcb(hcb);
+#ifdef INVARIANTS
+		atomic_add_int(&hibernate_hcb_releases, 1);
+#endif
+		snapshot_owned = false;
+		goto backout;
+	}
+
+	/*
 	 * F6: enforce footprint configuration/derivation status recorded at
 	 * boot.  Refuse before AP stop so refusal is clean (no APs to resume,
 	 * no frozen state to unwind beyond stage 1).
@@ -4478,11 +4503,9 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	}
 
 	/*
-	 * N2/F3: publish arena tuple and validated destination view before
-	 * the capacity check.  All three sub-steps (arena, destination
-	 * intervals, CAM SIM) must succeed or we refuse.
-	 *
-	 * Arena: contiguous spare pages from the HCB.
+	 * N2/F3: publish the validated destination view before the capacity
+	 * check.  Arena ownership was established by hibernate_arena_claim()
+	 * immediately after coordinator admission.
 	 *
 	 * Destination view (N2, N5): K-5 SAVEABLE set upper bound is all
 	 * ingested RAM (vm_phys_segs).  vm_phys_segs are sorted and
@@ -4495,9 +4518,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * periph->sim is the SIM.  Refuse (ENXIO) if none found.
 	 * K-6 will integrate the dump-path SIM directly.
 	 */
-	ha.ha_arena_start = hcb->hc_contig_spare_start;
-	ha.ha_arena_size  = hcb->hc_contig_spare_size;
-
 	/*
 	 * K-5 deliberately does NOT publish a destination-interval view.
 	 *

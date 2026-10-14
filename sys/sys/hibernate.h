@@ -14,10 +14,69 @@
 
 struct dumperinfo;
 
+enum hibernate_arena_interval_class {
+	HAIC_ELIGIBLE,
+	HAIC_INELIGIBLE_FIRMWARE,
+	HAIC_INELIGIBLE_LIVE
+};
+
+struct hibernate_arena_interval {
+	vm_paddr_t hai_start;
+	vm_paddr_t hai_end;
+	enum hibernate_arena_interval_class hai_class;
+};
+
+struct hibernate_early_arena {
+	vm_paddr_t hea_start;
+	vm_size_t hea_size;
+	uint32_t hea_rule_version;
+	bool hea_valid;
+	bool hea_claimed;
+};
+
+struct hibernate_arena_sizing {
+	uint64_t has_private_page_tables;
+	uint64_t has_copy_run_storage;
+	uint64_t has_aux_descriptor_storage;
+	uint64_t has_descriptor_storage;
+	uint64_t has_alignment_allowance;
+	uint64_t has_raw_required;
+	uint64_t has_required;
+};
+
+
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
 #define HIBERNATE_MAX_PHDRS	      900
+
+#define HIBERNATE_ARENA_RULE_VERSION	     1U
+#define HIBERNATE_ARENA_ALIGNMENT	     UINT64_C(4096)
+#define HIBERNATE_ARENA_HEADER_BYTES	     UINT64_C(256)
+#define HIBERNATE_ARENA_TRAMPOLINE_BYTES     UINT64_C(4096)
+#define HIBERNATE_ARENA_STACK_BYTES	     UINT64_C(65536)
+#define HIBERNATE_ARENA_HANDOFF_BYTES	     UINT64_C(4096)
+#define HIBERNATE_ARENA_COPY_RUN_MAX	     UINT64_C(900)
+#define HIBERNATE_ARENA_COPY_RUN_BYTES	     UINT64_C(32)
+#define HIBERNATE_ARENA_AUX_DESCRIPTOR_MAX   UINT64_C(64)
+#define HIBERNATE_ARENA_AUX_DESCRIPTOR_BYTES UINT64_C(16)
+#define HIBERNATE_ARENA_PT_PML4_PAGES	     UINT64_C(1)
+#define HIBERNATE_ARENA_PT_PDPT_PAGES	     UINT64_C(4)
+#define HIBERNATE_ARENA_PT_PD_PAGES	     UINT64_C(8)
+#define HIBERNATE_ARENA_PT_LEAF_PAGES	     UINT64_C(16)
+#define HIBERNATE_ARENA_OBJECT_ALIGNMENTS    UINT64_C(7)
+#define HIBERNATE_ARENA_BOUNDED_SLACK_BYTES  UINT64_C(65536)
+#define HIBERNATE_ARENA_POLICY_DEFAULT_BYTES (UINT64_C(4) * 1024 * 1024)
+#define HIBERNATE_ARENA_PHYS_LIMIT	     UINT64_C(0x100000000)
+#define HIBERNATE_ARENA_INTERVAL_MAX	     128
+
+#define HIBERNATE_ARENA_PRIVATE_PT_PAGES                                 \
+	(HIBERNATE_ARENA_PT_PML4_PAGES + HIBERNATE_ARENA_PT_PDPT_PAGES + \
+	    HIBERNATE_ARENA_PT_PD_PAGES + HIBERNATE_ARENA_PT_LEAF_PAGES)
+#define HIBERNATE_ARENA_ALIGNMENT_ALLOWANCE_BYTES \
+	(HIBERNATE_ARENA_OBJECT_ALIGNMENTS *      \
+	    (HIBERNATE_ARENA_ALIGNMENT - UINT64_C(1)))
+
 
 #define HIBERNATE_MARKER_ENCODED_SIZE 40
 #define HIBERNATE_CB_ENCODED_SIZE     256
@@ -428,6 +487,29 @@ struct hibernate_capacity_result {
 
 int hibernate_capacity_check(const struct hibernate_capacity_budget *b,
     struct hibernate_capacity_result *r);
+
+/*
+ * K-9 early arena derivation and ownership contract.  The interval helpers
+ * are allocation-free and are shared by early amd64 discovery and userland
+ * fixtures.  hibernate_image_validate(), when supplied by K-7, is the sole
+ * site that may compare decoded CB arena fields with the immutable tuple.
+ */
+int hibernate_arena_required(struct hibernate_arena_sizing *sizing);
+int hibernate_arena_normalize(const struct hibernate_arena_interval *input,
+    size_t input_count, struct hibernate_arena_interval *output,
+    size_t output_capacity, size_t *output_count);
+int hibernate_arena_exclude_live(struct hibernate_arena_interval *intervals,
+    size_t *count, size_t capacity, vm_paddr_t start, vm_paddr_t end);
+int hibernate_arena_select(const struct hibernate_arena_interval *intervals,
+    size_t count, uint64_t policy_bound, vm_paddr_t *pa, vm_size_t *size);
+int hibernate_arena_split_pairs(const vm_paddr_t *input, size_t input_count,
+    vm_paddr_t arena_start, vm_paddr_t arena_end, vm_paddr_t *output,
+    size_t output_capacity, size_t *output_count);
+void hibernate_arena_reset(void);
+int hibernate_arena_reserve(vm_paddr_t pa, vm_size_t size);
+int hibernate_arena_claim(struct hibernate_attempt *ha);
+void hibernate_arena_release(struct hibernate_attempt *ha);
+
 
 /*
  * K-5: destination membership predicate.

@@ -63,6 +63,7 @@
 #include <sys/efi.h>
 #include <sys/eventhandler.h>
 #include <sys/exec.h>
+#include <sys/hibernate.h>
 #include <sys/imgact.h>
 #include <sys/kdb.h>
 #include <sys/kernel.h>
@@ -870,6 +871,190 @@ native_parse_memmap(vm_paddr_t *physmap, int *physmap_idx)
 	}
 }
 
+/*
+ * Capture the native firmware map with its original eligibility class.
+ * This fixed snapshot exists only during getmemsize(); no descriptor pointer
+ * or firmware-specific policy escapes into the shared derivation core.
+ */
+static int
+hibernate_native_memmap(struct hibernate_arena_interval *map, size_t capacity,
+    size_t *countp)
+{
+	struct bios_smap *smap, *smapend;
+	struct efi_map_header *efihdr;
+	struct efi_md *md;
+	size_t efisz, count;
+	uint64_t length;
+	int i, ndesc;
+	u_int32_t smapsize;
+
+	count = 0;
+	efihdr = (struct efi_map_header *)preload_search_info(preload_kmdp,
+	    MODINFO_METADATA | MODINFOMD_EFI_MAP);
+	smap = (struct bios_smap *)preload_search_info(preload_kmdp,
+	    MODINFO_METADATA | MODINFOMD_SMAP);
+	if (efihdr != NULL) {
+		if (efihdr->descriptor_size == 0)
+			return (EINVAL);
+		efisz = roundup2(sizeof(*efihdr), 16);
+		md = (struct efi_md *)((uint8_t *)efihdr + efisz);
+		ndesc = efihdr->memory_size / efihdr->descriptor_size;
+		for (i = 0; i < ndesc; i++,
+		    md = efi_next_descriptor(md, efihdr->descriptor_size)) {
+			if (count == capacity)
+				return (EOVERFLOW);
+			if (__builtin_mul_overflow(md->md_pages,
+				(uint64_t)EFI_PAGE_SIZE, &length) ||
+			    length == 0)
+				return (EOVERFLOW);
+			map[count].hai_start = md->md_phys;
+			if (__builtin_add_overflow(md->md_phys, length,
+				&map[count].hai_end))
+				return (EOVERFLOW);
+			map[count].hai_class = md->md_type ==
+				    EFI_MD_TYPE_FREE &&
+				(md->md_attr &
+				    (EFI_MD_ATTR_RT | EFI_MD_ATTR_RO |
+					EFI_MD_ATTR_WP | EFI_MD_ATTR_RP)) == 0 ?
+			    HAIC_ELIGIBLE :
+			    HAIC_INELIGIBLE_FIRMWARE;
+			count++;
+		}
+	} else if (smap != NULL) {
+		smapsize = *((u_int32_t *)smap - 1);
+		smapend = (struct bios_smap *)((uintptr_t)smap + smapsize);
+		for (; smap < smapend; smap++) {
+			if (count == capacity)
+				return (EOVERFLOW);
+			if (smap->length == 0)
+				return (EINVAL);
+			map[count].hai_start = smap->base;
+			if (__builtin_add_overflow(smap->base, smap->length,
+				&map[count].hai_end))
+				return (EOVERFLOW);
+			map[count].hai_class = smap->type == SMAP_TYPE_MEMORY ?
+			    HAIC_ELIGIBLE :
+			    HAIC_INELIGIBLE_FIRMWARE;
+			count++;
+		}
+	} else {
+		return (EINVAL);
+	}
+	*countp = count;
+	return (count == 0 ? EINVAL : 0);
+}
+
+static int
+hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
+    vm_paddr_t msgbuf_start, vm_paddr_t msgbuf_end,
+    const vm_paddr_t *phys_pairs, size_t phys_count,
+    const vm_paddr_t *dump_pairs, size_t dump_count,
+    vm_paddr_t *arena_start, vm_size_t *arena_size)
+{
+	struct hibernate_arena_interval raw[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval firmware[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval map[HIBERNATE_ARENA_INTERVAL_MAX];
+	vm_paddr_t start, end;
+	uint64_t policy;
+	size_t count, firmware_count, i, j, k, raw_count;
+	int error;
+
+	if (phys_pairs == NULL || dump_pairs == NULL ||
+	    phys_count == 0 || dump_count == 0 ||
+	    phys_count % 2 != 0 || dump_count % 2 != 0)
+		return (EINVAL);
+	error = hibernate_native_memmap(raw, nitems(raw), &raw_count);
+	if (error != 0)
+		return (error);
+	error = hibernate_arena_normalize(raw, raw_count, firmware,
+	    nitems(firmware), &firmware_count);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * The arena must belong to the exact accepted runs that get published,
+	 * not merely to firmware-described RAM.  Intersect each eligible
+	 * firmware interval with both accepted maps before applying live-range
+	 * exclusions and policy.
+	 */
+	count = 0;
+	for (i = 0; i < firmware_count; i++) {
+		if (firmware[i].hai_class != HAIC_ELIGIBLE)
+			continue;
+		for (j = 0; j < phys_count; j += 2) {
+			if (phys_pairs[j] >= phys_pairs[j + 1])
+				return (EINVAL);
+			for (k = 0; k < dump_count; k += 2) {
+				if (dump_pairs[k] >= dump_pairs[k + 1])
+					return (EINVAL);
+				start = MAX(firmware[i].hai_start,
+				    MAX(phys_pairs[j], dump_pairs[k]));
+				end = MIN(firmware[i].hai_end,
+				    MIN(phys_pairs[j + 1], dump_pairs[k + 1]));
+				if (start >= end)
+					continue;
+				if (count == nitems(map))
+					return (EOVERFLOW);
+				map[count].hai_start = start;
+				map[count].hai_end = end;
+				map[count].hai_class = HAIC_ELIGIBLE;
+				count++;
+			}
+		}
+	}
+	if (count == 0)
+		return (ENOMEM);
+	error = hibernate_arena_normalize(map, count, raw, nitems(raw), &count);
+	if (error != 0)
+		return (error);
+	bcopy(raw, map, count * sizeof(map[0]));
+
+	error = hibernate_arena_exclude_live(map, &count, nitems(map),
+	    (vm_paddr_t)kernphys, first);
+	if (error != 0)
+		return (error);
+	if (dcons_addr > 0 && dcons_size > 0) {
+		vm_paddr_t dcons_end;
+
+		if (__builtin_add_overflow((vm_paddr_t)dcons_addr,
+			(vm_paddr_t)dcons_size, &dcons_end))
+			return (EOVERFLOW);
+		error = hibernate_arena_exclude_live(map, &count, nitems(map),
+		    trunc_page((vm_paddr_t)dcons_addr), round_page(dcons_end));
+		if (error != 0)
+			return (error);
+	}
+	error = hibernate_arena_exclude_live(map, &count, nitems(map),
+	    msgbuf_start, msgbuf_end);
+	if (error != 0)
+		return (error);
+
+	policy = HIBERNATE_ARENA_POLICY_DEFAULT_BYTES;
+	TUNABLE_UINT64_FETCH("debug.hibernate.arena_size", &policy);
+	return (hibernate_arena_select(map, count, policy, arena_start,
+	    arena_size));
+}
+
+static int
+hibernate_arena_pairs_bytes(const vm_paddr_t *pairs, size_t count,
+    uint64_t *bytes)
+{
+	uint64_t total;
+	size_t i;
+
+	if (pairs == NULL || bytes == NULL || count % 2 != 0)
+		return (EINVAL);
+	total = 0;
+	for (i = 0; i < count; i += 2) {
+		if (pairs[i] >= pairs[i + 1] ||
+		    __builtin_add_overflow(total, pairs[i + 1] - pairs[i],
+			&total))
+			return (EINVAL);
+	}
+	*bytes = total;
+	return (0);
+}
+
 #define	PAGES_PER_GB	(1024 * 1024 * 1024 / PAGE_SIZE)
 
 /*
@@ -887,12 +1072,24 @@ getmemsize(u_int64_t first)
 {
 	int i, physmap_idx, pa_indx, da_indx;
 	vm_paddr_t pa, physmap[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t local_phys_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t local_dump_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t split_phys_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t split_dump_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t arena_start, arena_end, msgbuf_start, msgbuf_end;
+	vm_size_t arena_size;
+	size_t split_phys_count, split_dump_count;
+	uint64_t dump_after, dump_before, phys_after, phys_before;
+	int error;
 	u_long physmem_start, physmem_tunable, memtest;
 	pt_entry_t *pte;
 	quad_t dcons_addr, dcons_size;
 	int page_counter;
 
 	TSENTER();
+	hibernate_arena_reset();
+	bzero(local_phys_avail, sizeof(local_phys_avail));
+	bzero(local_dump_avail, sizeof(local_dump_avail));
 	/*
 	 * Tell the physical memory allocator about pages used to store
 	 * the kernel and preloaded data.  See kmem_bootstrap_free().
@@ -982,9 +1179,9 @@ getmemsize(u_int64_t first)
 	}
 	pa_indx = 0;
 	da_indx = 1;
-	phys_avail[pa_indx++] = physmap[0];
-	phys_avail[pa_indx] = physmap[0];
-	dump_avail[da_indx] = physmap[0];
+	local_phys_avail[pa_indx++] = physmap[0];
+	local_phys_avail[pa_indx] = physmap[0];
+	local_dump_avail[da_indx] = physmap[0];
 	pte = CMAP1;
 
 	/*
@@ -1092,8 +1289,8 @@ skip_memtest:
 			 * so that we keep going. The first bad page
 			 * will terminate the loop.
 			 */
-			if (phys_avail[pa_indx] == pa) {
-				phys_avail[pa_indx] += PAGE_SIZE;
+			if (local_phys_avail[pa_indx] == pa) {
+				local_phys_avail[pa_indx] += PAGE_SIZE;
 			} else {
 				pa_indx++;
 				if (pa_indx == PHYS_AVAIL_ENTRIES) {
@@ -1103,22 +1300,23 @@ skip_memtest:
 					full = true;
 					goto do_dump_avail;
 				}
-				phys_avail[pa_indx++] = pa;	/* start */
-				phys_avail[pa_indx] = pa + PAGE_SIZE; /* end */
+				local_phys_avail[pa_indx++] = pa; /* start */
+				local_phys_avail[pa_indx] = pa +
+				    PAGE_SIZE; /* end */
 			}
 			physmem++;
 do_dump_avail:
-			if (dump_avail[da_indx] == pa) {
-				dump_avail[da_indx] += PAGE_SIZE;
-			} else {
-				da_indx++;
-				if (da_indx == PHYS_AVAIL_ENTRIES) {
-					da_indx--;
-					goto do_next;
-				}
-				dump_avail[da_indx++] = pa; /* start */
-				dump_avail[da_indx] = pa + PAGE_SIZE; /* end */
-			}
+	if (local_dump_avail[da_indx] == pa) {
+		local_dump_avail[da_indx] += PAGE_SIZE;
+	} else {
+		da_indx++;
+		if (da_indx == PHYS_AVAIL_ENTRIES) {
+			da_indx--;
+			goto do_next;
+		}
+		local_dump_avail[da_indx++] = pa;	    /* start */
+		local_dump_avail[da_indx] = pa + PAGE_SIZE; /* end */
+	}
 do_next:
 			if (full)
 				break;
@@ -1135,20 +1333,85 @@ do_next:
 	 * buffer to avoid complicating other code (message buffer address
 	 * calculation, etc.).
 	 */
-	while (phys_avail[pa_indx - 1] + PAGE_SIZE +
-	    round_page(msgbufsize) >= phys_avail[pa_indx]) {
-		physmem -= atop(phys_avail[pa_indx] - phys_avail[pa_indx - 1]);
-		phys_avail[pa_indx--] = 0;
-		phys_avail[pa_indx--] = 0;
+	while (local_phys_avail[pa_indx - 1] + PAGE_SIZE +
+		round_page(msgbufsize) >=
+	    local_phys_avail[pa_indx]) {
+		physmem -= atop(
+		    local_phys_avail[pa_indx] - local_phys_avail[pa_indx - 1]);
+		local_phys_avail[pa_indx--] = 0;
+		local_phys_avail[pa_indx--] = 0;
 	}
 
-	Maxmem = atop(phys_avail[pa_indx]);
+	Maxmem = atop(local_phys_avail[pa_indx]);
 
 	/* Trim off space for the message buffer. */
-	phys_avail[pa_indx] -= round_page(msgbufsize);
+	msgbuf_end = local_phys_avail[pa_indx];
+	local_phys_avail[pa_indx] -= round_page(msgbufsize);
+	msgbuf_start = local_phys_avail[pa_indx];
 
-	/* Map the message buffer. */
-	msgbufp = PHYS_TO_DMAP(phys_avail[pa_indx]);
+	/*
+	 * Derive from classified firmware evidence and every exact live range,
+	 * then subtract the immutable tuple independently from both local
+	 * views. Global publication happens only after both transformations
+	 * succeed.
+	 */
+	error = hibernate_arena_derive(first, dcons_addr, dcons_size,
+	    msgbuf_start, msgbuf_end, local_phys_avail, pa_indx + 1,
+	    local_dump_avail, da_indx + 1, &arena_start, &arena_size);
+	if (error == 0 &&
+	    __builtin_add_overflow(arena_start, arena_size, &arena_end))
+		error = EOVERFLOW;
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(local_phys_avail,
+		    pa_indx + 1, &phys_before);
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(local_dump_avail,
+		    da_indx + 1, &dump_before);
+	if (error == 0)
+		error = hibernate_arena_split_pairs(local_phys_avail,
+		    pa_indx + 1, arena_start, arena_end, split_phys_avail,
+		    nitems(split_phys_avail), &split_phys_count);
+	if (error == 0)
+		error = hibernate_arena_split_pairs(local_dump_avail,
+		    da_indx + 1, arena_start, arena_end, split_dump_avail,
+		    nitems(split_dump_avail), &split_dump_count);
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(split_phys_avail,
+		    split_phys_count, &phys_after);
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(split_dump_avail,
+		    split_dump_count, &dump_after);
+	if (error == 0 &&
+	    (phys_before < phys_after || dump_before < dump_after ||
+		phys_before - phys_after != arena_size ||
+		dump_before - dump_after != arena_size))
+		error = EINVAL;
+	if (error == 0)
+		error = hibernate_arena_reserve(arena_start, arena_size);
+
+	bzero(phys_avail, PHYS_AVAIL_ENTRIES * sizeof(phys_avail[0]));
+	bzero(dump_avail, PHYS_AVAIL_ENTRIES * sizeof(dump_avail[0]));
+	if (error == 0) {
+		bcopy(split_phys_avail, phys_avail,
+		    split_phys_count * sizeof(split_phys_avail[0]));
+		bcopy(split_dump_avail, dump_avail,
+		    split_dump_count * sizeof(split_dump_avail[0]));
+		printf("hibernate arena rule %u required %ju start %#jx "
+		    "size %ju\n", HIBERNATE_ARENA_RULE_VERSION,
+		    (uintmax_t)arena_size, (uintmax_t)arena_start,
+		    (uintmax_t)arena_size);
+	} else {
+		hibernate_arena_reset();
+		bcopy(local_phys_avail, phys_avail,
+		    (pa_indx + 1) * sizeof(local_phys_avail[0]));
+		bcopy(local_dump_avail, dump_avail,
+		    (da_indx + 1) * sizeof(local_dump_avail[0]));
+		printf("hibernate arena unavailable: %d; using full memory\n",
+		    error);
+	}
+
+	/* Map the unchanged, precomputed message-buffer range. */
+	msgbufp = PHYS_TO_DMAP(msgbuf_start);
 	TSEXIT();
 }
 

@@ -737,10 +737,20 @@ fail:
  */
 int
 dump_for_hibernate(const struct hibernate_save_cb *const hcb,
-    const struct hibernate_save_pcb *const hpcb)
+    const struct hibernate_save_pcb *const hpcb,
+    const struct hibernate_attempt *const ha)
 {
 	struct dumperinfo *di;
 	int error = ENXIO;
+
+	/*
+	 * Exact K-6 consumption seam.  The current native HCB/PCB image has no
+	 * canonical 256-byte CB encoder, so it cannot encode ABI-1 offsets
+	 * 0x040 and 0x048 here without inventing K-6.  Keep the claimed tuple
+	 * attached to the writer call; K-6 must consume these exact fields.
+	 */
+	KASSERT(ha != NULL && ha->ha_arena_start != 0 &&
+	    ha->ha_arena_size != 0, ("%s: unclaimed arena", __func__));
 
 	/*
 	 * XXX - We would like that 'dumping' is not set, in case we panic while
