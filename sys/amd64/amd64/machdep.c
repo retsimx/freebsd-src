@@ -944,6 +944,21 @@ hibernate_native_memmap(struct hibernate_arena_interval *map, size_t capacity,
 	return (count == 0 ? EINVAL : 0);
 }
 
+/*
+ * These buffers are used only by the serial early-boot memory-map path.
+ * Each active range is fully written before it is read.
+ */
+static struct {
+	struct hibernate_arena_interval raw[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval firmware[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval map[HIBERNATE_ARENA_INTERVAL_MAX];
+	vm_paddr_t physmap[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t local_phys_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t local_dump_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t split_phys_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t split_dump_avail[PHYS_AVAIL_ENTRIES];
+} hibernate_boot_scratch;
+
 static int
 hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
     vm_paddr_t msgbuf_start, vm_paddr_t msgbuf_end,
@@ -951,23 +966,25 @@ hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
     const vm_paddr_t *dump_pairs, size_t dump_count,
     vm_paddr_t *arena_start, vm_size_t *arena_size)
 {
-	struct hibernate_arena_interval raw[HIBERNATE_ARENA_INTERVAL_MAX];
-	struct hibernate_arena_interval firmware[HIBERNATE_ARENA_INTERVAL_MAX];
-	struct hibernate_arena_interval map[HIBERNATE_ARENA_INTERVAL_MAX];
+	struct hibernate_arena_interval *firmware, *map, *raw;
 	vm_paddr_t start, end;
 	uint64_t policy;
 	size_t count, firmware_count, i, j, k, raw_count;
 	int error;
 
+	raw = hibernate_boot_scratch.raw;
+	firmware = hibernate_boot_scratch.firmware;
+	map = hibernate_boot_scratch.map;
 	if (phys_pairs == NULL || dump_pairs == NULL ||
 	    phys_count == 0 || dump_count == 0 ||
 	    phys_count % 2 != 0 || dump_count % 2 != 0)
 		return (EINVAL);
-	error = hibernate_native_memmap(raw, nitems(raw), &raw_count);
+	error = hibernate_native_memmap(raw, HIBERNATE_ARENA_INTERVAL_MAX,
+	    &raw_count);
 	if (error != 0)
 		return (error);
 	error = hibernate_arena_normalize(raw, raw_count, firmware,
-	    nitems(firmware), &firmware_count);
+	    HIBERNATE_ARENA_INTERVAL_MAX, &firmware_count);
 	if (error != 0)
 		return (error);
 
@@ -993,7 +1010,7 @@ hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
 				    MIN(phys_pairs[j + 1], dump_pairs[k + 1]));
 				if (start >= end)
 					continue;
-				if (count == nitems(map))
+				if (count == HIBERNATE_ARENA_INTERVAL_MAX)
 					return (EOVERFLOW);
 				map[count].hai_start = start;
 				map[count].hai_end = end;
@@ -1004,13 +1021,14 @@ hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
 	}
 	if (count == 0)
 		return (ENOMEM);
-	error = hibernate_arena_normalize(map, count, raw, nitems(raw), &count);
+	error = hibernate_arena_normalize(map, count, raw,
+	    HIBERNATE_ARENA_INTERVAL_MAX, &count);
 	if (error != 0)
 		return (error);
 	bcopy(raw, map, count * sizeof(map[0]));
 
-	error = hibernate_arena_exclude_live(map, &count, nitems(map),
-	    (vm_paddr_t)kernphys, first);
+	error = hibernate_arena_exclude_live(map, &count,
+	    HIBERNATE_ARENA_INTERVAL_MAX, (vm_paddr_t)kernphys, first);
 	if (error != 0)
 		return (error);
 	if (dcons_addr > 0 && dcons_size > 0) {
@@ -1019,13 +1037,14 @@ hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
 		if (__builtin_add_overflow((vm_paddr_t)dcons_addr,
 			(vm_paddr_t)dcons_size, &dcons_end))
 			return (EOVERFLOW);
-		error = hibernate_arena_exclude_live(map, &count, nitems(map),
+		error = hibernate_arena_exclude_live(map, &count,
+		    HIBERNATE_ARENA_INTERVAL_MAX,
 		    trunc_page((vm_paddr_t)dcons_addr), round_page(dcons_end));
 		if (error != 0)
 			return (error);
 	}
-	error = hibernate_arena_exclude_live(map, &count, nitems(map),
-	    msgbuf_start, msgbuf_end);
+	error = hibernate_arena_exclude_live(map, &count,
+	    HIBERNATE_ARENA_INTERVAL_MAX, msgbuf_start, msgbuf_end);
 	if (error != 0)
 		return (error);
 
@@ -1071,11 +1090,9 @@ static void
 getmemsize(u_int64_t first)
 {
 	int i, physmap_idx, pa_indx, da_indx;
-	vm_paddr_t pa, physmap[PHYS_AVAIL_ENTRIES];
-	vm_paddr_t local_phys_avail[PHYS_AVAIL_ENTRIES];
-	vm_paddr_t local_dump_avail[PHYS_AVAIL_ENTRIES];
-	vm_paddr_t split_phys_avail[PHYS_AVAIL_ENTRIES];
-	vm_paddr_t split_dump_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t pa, *physmap;
+	vm_paddr_t *local_phys_avail, *local_dump_avail;
+	vm_paddr_t *split_phys_avail, *split_dump_avail;
 	vm_paddr_t arena_start, arena_end, msgbuf_start, msgbuf_end;
 	vm_size_t arena_size;
 	size_t split_phys_count, split_dump_count;
@@ -1088,15 +1105,22 @@ getmemsize(u_int64_t first)
 
 	TSENTER();
 	hibernate_arena_reset();
-	bzero(local_phys_avail, sizeof(local_phys_avail));
-	bzero(local_dump_avail, sizeof(local_dump_avail));
+	physmap = hibernate_boot_scratch.physmap;
+	local_phys_avail = hibernate_boot_scratch.local_phys_avail;
+	local_dump_avail = hibernate_boot_scratch.local_dump_avail;
+	split_phys_avail = hibernate_boot_scratch.split_phys_avail;
+	split_dump_avail = hibernate_boot_scratch.split_dump_avail;
+	bzero(local_phys_avail,
+	    sizeof(hibernate_boot_scratch.local_phys_avail));
+	bzero(local_dump_avail,
+	    sizeof(hibernate_boot_scratch.local_dump_avail));
 	/*
 	 * Tell the physical memory allocator about pages used to store
 	 * the kernel and preloaded data.  See kmem_bootstrap_free().
 	 */
 	vm_phys_early_add_seg((vm_paddr_t)kernphys, trunc_page(first));
 
-	bzero(physmap, sizeof(physmap));
+	bzero(physmap, sizeof(hibernate_boot_scratch.physmap));
 	physmap_idx = 0;
 
 	init_ops.parse_memmap(physmap, &physmap_idx);
@@ -1350,10 +1374,10 @@ do_next:
 	msgbuf_start = local_phys_avail[pa_indx];
 
 	/*
-	 * Derive from classified firmware evidence and every exact live range,
-	 * then subtract the immutable tuple independently from both local
-	 * views. Global publication happens only after both transformations
-	 * succeed.
+	 * Derive from the accepted runs and exclude the arena before global
+	 * phys_avail[] and dump_avail[] publication and before VM startup.
+	 * Intersecting the accepted maps is deliberate: it prevents selection
+	 * of firmware-described RAM removed by hw.physmem or page testing.
 	 */
 	error = hibernate_arena_derive(first, dcons_addr, dcons_size,
 	    msgbuf_start, msgbuf_end, local_phys_avail, pa_indx + 1,
@@ -1370,11 +1394,11 @@ do_next:
 	if (error == 0)
 		error = hibernate_arena_split_pairs(local_phys_avail,
 		    pa_indx + 1, arena_start, arena_end, split_phys_avail,
-		    nitems(split_phys_avail), &split_phys_count);
+		    PHYS_AVAIL_ENTRIES, &split_phys_count);
 	if (error == 0)
 		error = hibernate_arena_split_pairs(local_dump_avail,
 		    da_indx + 1, arena_start, arena_end, split_dump_avail,
-		    nitems(split_dump_avail), &split_dump_count);
+		    PHYS_AVAIL_ENTRIES, &split_dump_count);
 	if (error == 0)
 		error = hibernate_arena_pairs_bytes(split_phys_avail,
 		    split_phys_count, &phys_after);
