@@ -126,6 +126,428 @@ align_up_checked(uint64_t v, uint64_t align, uint64_t *out)
 /*
  * is_all_zero: return true iff every byte in buf[0..len) is zero.
  */
+static struct hibernate_early_arena g_hibernate_early_arena;
+static struct hibernate_attempt *g_hibernate_arena_owner;
+
+static int
+hibernate_arena_add(uint64_t a, uint64_t b, uint64_t *result)
+{
+	if (__builtin_add_overflow(a, b, result))
+		return (EOVERFLOW);
+	return (0);
+}
+
+static int
+hibernate_arena_mul(uint64_t a, uint64_t b, uint64_t *result)
+{
+	if (__builtin_mul_overflow(a, b, result))
+		return (EOVERFLOW);
+	return (0);
+}
+
+int
+hibernate_arena_required(struct hibernate_arena_sizing *sizing)
+{
+	struct hibernate_arena_sizing local;
+	uint64_t descriptor_unaligned, raw;
+	int error;
+
+	if (sizing == NULL)
+		return (EINVAL);
+	__builtin_memset(&local, 0, sizeof(local));
+
+	error = hibernate_arena_mul(HIBERNATE_ARENA_PRIVATE_PT_PAGES,
+	    HIBERNATE_ARENA_ALIGNMENT, &local.has_private_page_tables);
+	if (error != 0)
+		goto out;
+	error = hibernate_arena_mul(HIBERNATE_ARENA_COPY_RUN_MAX,
+	    HIBERNATE_ARENA_COPY_RUN_BYTES, &local.has_copy_run_storage);
+	if (error != 0)
+		goto out;
+	error = hibernate_arena_mul(HIBERNATE_ARENA_AUX_DESCRIPTOR_MAX,
+	    HIBERNATE_ARENA_AUX_DESCRIPTOR_BYTES,
+	    &local.has_aux_descriptor_storage);
+	if (error != 0)
+		goto out;
+	error = hibernate_arena_add(local.has_copy_run_storage,
+	    local.has_aux_descriptor_storage, &descriptor_unaligned);
+	if (error != 0)
+		goto out;
+	error = align_up_checked(descriptor_unaligned,
+	    HIBERNATE_ARENA_ALIGNMENT, &local.has_descriptor_storage);
+	if (error != 0)
+		goto out;
+	error = hibernate_arena_mul(HIBERNATE_ARENA_OBJECT_ALIGNMENTS,
+	    HIBERNATE_ARENA_ALIGNMENT - 1, &local.has_alignment_allowance);
+	if (error != 0)
+		goto out;
+
+	raw = 0;
+#define HIBERNATE_ARENA_ADD_COMPONENT(component)                     \
+	do {                                                         \
+		error = hibernate_arena_add(raw, (component), &raw); \
+		if (error != 0)                                      \
+			goto out;                                    \
+	} while (0)
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_HEADER_BYTES);
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_TRAMPOLINE_BYTES);
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_STACK_BYTES);
+	HIBERNATE_ARENA_ADD_COMPONENT(local.has_private_page_tables);
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_HANDOFF_BYTES);
+	HIBERNATE_ARENA_ADD_COMPONENT(local.has_descriptor_storage);
+	HIBERNATE_ARENA_ADD_COMPONENT(local.has_alignment_allowance);
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_BOUNDED_SLACK_BYTES);
+#undef HIBERNATE_ARENA_ADD_COMPONENT
+
+	local.has_raw_required = raw;
+	error = align_up_checked(raw, HIBERNATE_ARENA_ALIGNMENT,
+	    &local.has_required);
+	if (error != 0)
+		goto out;
+	if (local.has_required == 0 ||
+	    local.has_required > HIBERNATE_ARENA_PHYS_LIMIT ||
+	    (vm_size_t)local.has_required != local.has_required)
+		error = EOVERFLOW;
+out:
+	if (error != 0)
+		__builtin_memset(&local, 0, sizeof(local));
+	*sizing = local;
+	return (error);
+}
+
+static int
+hibernate_arena_interval_cmp(const struct hibernate_arena_interval *a,
+    const struct hibernate_arena_interval *b)
+{
+	if (a->hai_start < b->hai_start)
+		return (-1);
+	if (a->hai_start > b->hai_start)
+		return (1);
+	if (a->hai_end < b->hai_end)
+		return (-1);
+	if (a->hai_end > b->hai_end)
+		return (1);
+	if (a->hai_class < b->hai_class)
+		return (-1);
+	if (a->hai_class > b->hai_class)
+		return (1);
+	return (0);
+}
+
+static enum hibernate_arena_interval_class
+hibernate_arena_restrictive_class(enum hibernate_arena_interval_class left,
+    enum hibernate_arena_interval_class right)
+{
+	return (left > right ? left : right);
+}
+
+int
+hibernate_arena_normalize(const struct hibernate_arena_interval *input,
+    size_t input_count, struct hibernate_arena_interval *output,
+    size_t output_capacity, size_t *output_count)
+{
+	vm_paddr_t endpoints[HIBERNATE_ARENA_INTERVAL_MAX * 2];
+	struct hibernate_arena_interval sorted[HIBERNATE_ARENA_INTERVAL_MAX];
+	enum hibernate_arena_interval_class class;
+	size_t endpoint_count, i, j, n;
+	bool covered;
+
+	if (output_count == NULL)
+		return (EINVAL);
+	*output_count = 0;
+	if (input == NULL || output == NULL || input_count == 0 ||
+	    input_count > HIBERNATE_ARENA_INTERVAL_MAX)
+		return (EINVAL);
+
+	endpoint_count = input_count * 2;
+	for (i = 0; i < input_count; i++) {
+		if (input[i].hai_start >= input[i].hai_end ||
+		    input[i].hai_class < HAIC_ELIGIBLE ||
+		    input[i].hai_class > HAIC_INELIGIBLE_LIVE)
+			return (EINVAL);
+		sorted[i] = input[i];
+		endpoints[i * 2] = input[i].hai_start;
+		endpoints[i * 2 + 1] = input[i].hai_end;
+	}
+	for (i = 1; i < input_count; i++) {
+		struct hibernate_arena_interval value;
+
+		value = sorted[i];
+		for (j = i; j > 0 &&
+		    hibernate_arena_interval_cmp(&value, &sorted[j - 1]) < 0;
+		    j--)
+			sorted[j] = sorted[j - 1];
+		sorted[j] = value;
+	}
+	for (i = 1; i < endpoint_count; i++) {
+		vm_paddr_t value;
+
+		value = endpoints[i];
+		for (j = i; j > 0 && value < endpoints[j - 1]; j--)
+			endpoints[j] = endpoints[j - 1];
+		endpoints[j] = value;
+	}
+	for (i = 0, j = 0; i < endpoint_count; i++) {
+		if (j == 0 || endpoints[i] != endpoints[j - 1])
+			endpoints[j++] = endpoints[i];
+	}
+	endpoint_count = j;
+
+	n = 0;
+	for (i = 0; i + 1 < endpoint_count; i++) {
+		if (endpoints[i] == endpoints[i + 1])
+			continue;
+		covered = false;
+		class = HAIC_ELIGIBLE;
+		for (j = 0; j < input_count; j++) {
+			if (sorted[j].hai_start > endpoints[i] ||
+			    sorted[j].hai_end < endpoints[i + 1])
+				continue;
+			if (!covered) {
+				class = sorted[j].hai_class;
+				covered = true;
+			} else {
+				class = hibernate_arena_restrictive_class(class,
+				    sorted[j].hai_class);
+			}
+		}
+		if (!covered)
+			continue;
+		if (n != 0 && output[n - 1].hai_end == endpoints[i] &&
+		    output[n - 1].hai_class == class) {
+			output[n - 1].hai_end = endpoints[i + 1];
+			continue;
+		}
+		if (n == output_capacity)
+			return (EOVERFLOW);
+		output[n].hai_start = endpoints[i];
+		output[n].hai_end = endpoints[i + 1];
+		output[n].hai_class = class;
+		n++;
+	}
+	*output_count = n;
+	return (n == 0 ? EINVAL : 0);
+}
+
+int
+hibernate_arena_exclude_live(struct hibernate_arena_interval *intervals,
+    size_t *count, size_t capacity, vm_paddr_t start, vm_paddr_t end)
+{
+	struct hibernate_arena_interval output[HIBERNATE_ARENA_INTERVAL_MAX];
+	size_t i, n;
+
+	if (intervals == NULL || count == NULL || start >= end ||
+	    *count > capacity || capacity > HIBERNATE_ARENA_INTERVAL_MAX)
+		return (EINVAL);
+	n = 0;
+	for (i = 0; i < *count; i++) {
+		struct hibernate_arena_interval current;
+
+		current = intervals[i];
+		if (current.hai_start >= current.hai_end)
+			return (EINVAL);
+		if (current.hai_class != HAIC_ELIGIBLE ||
+		    end <= current.hai_start || start >= current.hai_end) {
+			if (n == capacity)
+				return (EOVERFLOW);
+			output[n++] = current;
+			continue;
+		}
+		if (current.hai_start < start) {
+			if (n == capacity)
+				return (EOVERFLOW);
+			output[n] = current;
+			output[n++].hai_end = start;
+		}
+		if (end < current.hai_end) {
+			if (n == capacity)
+				return (EOVERFLOW);
+			output[n] = current;
+			output[n].hai_start = end;
+			n++;
+		}
+	}
+	__builtin_memcpy(intervals, output, n * sizeof(output[0]));
+	*count = n;
+	return (0);
+}
+
+int
+hibernate_arena_select(const struct hibernate_arena_interval *intervals,
+    size_t count, uint64_t policy_bound, vm_paddr_t *pa, vm_size_t *size)
+{
+	struct hibernate_arena_sizing sizing;
+	vm_paddr_t best_start, best_end, candidate, candidate_end;
+	size_t i;
+	int error;
+
+	if (intervals == NULL || count == 0 || pa == NULL || size == NULL)
+		return (EINVAL);
+	*pa = 0;
+	*size = 0;
+	if (policy_bound == 0 ||
+	    (policy_bound & (HIBERNATE_ARENA_ALIGNMENT - 1)) != 0 ||
+	    policy_bound > HIBERNATE_ARENA_PHYS_LIMIT)
+		return (EINVAL);
+	error = hibernate_arena_required(&sizing);
+	if (error != 0)
+		return (error);
+	if (sizing.has_required > policy_bound)
+		return (ENOMEM);
+
+	best_start = 0;
+	best_end = 0;
+	for (i = 0; i < count; i++) {
+		if (intervals[i].hai_start >= intervals[i].hai_end)
+			return (EINVAL);
+		if (intervals[i].hai_class != HAIC_ELIGIBLE ||
+		    intervals[i].hai_end > HIBERNATE_ARENA_PHYS_LIMIT)
+			continue;
+		if (intervals[i].hai_end - intervals[i].hai_start <
+		    sizing.has_required)
+			continue;
+		candidate = (intervals[i].hai_end - sizing.has_required) &
+		    ~(HIBERNATE_ARENA_ALIGNMENT - 1);
+		if (candidate < intervals[i].hai_start ||
+		    __builtin_add_overflow(candidate, sizing.has_required,
+			&candidate_end) ||
+		    candidate_end > intervals[i].hai_end ||
+		    candidate_end > HIBERNATE_ARENA_PHYS_LIMIT)
+			continue;
+		if (best_end == 0 || intervals[i].hai_end > best_end ||
+		    (intervals[i].hai_end == best_end &&
+			candidate > best_start)) {
+			best_start = candidate;
+			best_end = intervals[i].hai_end;
+		}
+	}
+	if (best_end == 0)
+		return (ENOMEM);
+	*pa = best_start;
+	*size = (vm_size_t)sizing.has_required;
+	return (0);
+}
+
+int
+hibernate_arena_split_pairs(const vm_paddr_t *input, size_t input_count,
+    vm_paddr_t arena_start, vm_paddr_t arena_end, vm_paddr_t *output,
+    size_t output_capacity, size_t *output_count)
+{
+	vm_paddr_t start, end;
+	size_t i, n;
+
+	if (output_count == NULL)
+		return (EINVAL);
+	*output_count = 0;
+	if (input == NULL || output == NULL || input_count % 2 != 0 ||
+	    arena_start >= arena_end)
+		return (EINVAL);
+	n = 0;
+	for (i = 0; i < input_count; i += 2) {
+		start = input[i];
+		end = input[i + 1];
+		if (start >= end || (i != 0 && input[i - 1] > start))
+			return (EINVAL);
+#define HIBERNATE_ARENA_EMIT(pair_start, pair_end)                  \
+	do {                                                        \
+		if (n > output_capacity || output_capacity - n < 2) \
+			return (EOVERFLOW);                         \
+		output[n++] = (pair_start);                         \
+		output[n++] = (pair_end);                           \
+	} while (0)
+		if (end <= arena_start || start >= arena_end) {
+			HIBERNATE_ARENA_EMIT(start, end);
+		} else {
+			if (start < arena_start)
+				HIBERNATE_ARENA_EMIT(start, arena_start);
+			if (end > arena_end)
+				HIBERNATE_ARENA_EMIT(arena_end, end);
+		}
+#undef HIBERNATE_ARENA_EMIT
+	}
+	*output_count = n;
+	return (0);
+}
+
+void
+hibernate_arena_reset(void)
+{
+	__builtin_memset(&g_hibernate_early_arena, 0,
+	    sizeof(g_hibernate_early_arena));
+	g_hibernate_arena_owner = NULL;
+}
+
+int
+hibernate_arena_reserve(vm_paddr_t pa, vm_size_t size)
+{
+	vm_paddr_t end;
+
+	if (size == 0 || (pa & (HIBERNATE_ARENA_ALIGNMENT - 1)) != 0 ||
+	    ((uint64_t)size & (HIBERNATE_ARENA_ALIGNMENT - 1)) != 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(pa, size, &end))
+		return (EOVERFLOW);
+	if (end > HIBERNATE_ARENA_PHYS_LIMIT)
+		return (EINVAL);
+	if (g_hibernate_early_arena.hea_valid) {
+		if (!g_hibernate_early_arena.hea_claimed &&
+		    g_hibernate_early_arena.hea_start == pa &&
+		    g_hibernate_early_arena.hea_size == size &&
+		    g_hibernate_early_arena.hea_rule_version ==
+			HIBERNATE_ARENA_RULE_VERSION)
+			return (0);
+		return (EBUSY);
+	}
+	g_hibernate_early_arena.hea_start = pa;
+	g_hibernate_early_arena.hea_size = size;
+	g_hibernate_early_arena.hea_rule_version = HIBERNATE_ARENA_RULE_VERSION;
+	g_hibernate_early_arena.hea_claimed = false;
+	g_hibernate_early_arena.hea_valid = true;
+	return (0);
+}
+
+int
+hibernate_arena_claim(struct hibernate_attempt *ha)
+{
+	if (ha == NULL)
+		return (EINVAL);
+	if (!g_hibernate_early_arena.hea_valid ||
+	    g_hibernate_early_arena.hea_rule_version !=
+		HIBERNATE_ARENA_RULE_VERSION)
+		return (EINVAL);
+	if (ha->ha_arena_start != 0 || ha->ha_arena_size != 0) {
+		if (g_hibernate_early_arena.hea_claimed &&
+		    g_hibernate_arena_owner == ha &&
+		    ha->ha_arena_start == g_hibernate_early_arena.hea_start &&
+		    ha->ha_arena_size == g_hibernate_early_arena.hea_size)
+			return (0);
+		return (EINVAL);
+	}
+	if (g_hibernate_early_arena.hea_claimed)
+		return (EBUSY);
+	ha->ha_arena_start = g_hibernate_early_arena.hea_start;
+	ha->ha_arena_size = g_hibernate_early_arena.hea_size;
+	g_hibernate_arena_owner = ha;
+	g_hibernate_early_arena.hea_claimed = true;
+	return (0);
+}
+
+void
+hibernate_arena_release(struct hibernate_attempt *ha)
+{
+	if (ha == NULL || !g_hibernate_early_arena.hea_valid ||
+	    !g_hibernate_early_arena.hea_claimed)
+		return;
+	if (g_hibernate_arena_owner != ha ||
+	    ha->ha_arena_start != g_hibernate_early_arena.hea_start ||
+	    ha->ha_arena_size != g_hibernate_early_arena.hea_size)
+		return;
+	ha->ha_arena_start = 0;
+	ha->ha_arena_size = 0;
+	g_hibernate_arena_owner = NULL;
+	g_hibernate_early_arena.hea_claimed = false;
+}
+
 static bool
 is_all_zero(const uint8_t *buf, size_t len)
 {
@@ -1445,6 +1867,13 @@ hibernate_barrier_unwind(struct hibernate_attempt *ha,
 	if (s & HIB_STAGE_COORDINATOR)
 		s &= ~HIB_STAGE_COORDINATOR;
 
+	/*
+	 * K-9 arena ownership is attempt-scoped and independent of the barrier
+	 * stage mask.  Keep the tuple valid through reservation unwind, then
+	 * release it last.  Release is idempotent for refusal paths that never
+	 * acquired ownership and for repeated common-unwind calls.
+	 */
+	hibernate_arena_release(ha);
 	*stages = s;
 }
 
