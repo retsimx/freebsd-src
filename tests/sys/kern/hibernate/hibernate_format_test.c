@@ -369,15 +369,29 @@ write_pcb(uint8_t *buf, uint64_t pcb_offset, uint64_t xsave_offset)
  * build_image: builds a complete valid ABI 1 metadata prefix.
  * Returns payload_start.
  */
+/*
+ * build_image_ex: build a valid ABI 1 metadata prefix with configurable
+ * XSAVE-object composition.  Returns payload_start.
+ *
+ * File-backed objects are laid out in strictly increasing file order:
+ *   [0]=CB, [1]=PCB, [2]=XSAVE (if include_xsave),
+ *   [3]=duplicate XSAVE (if dup_xsave), then n_loads PT_LOAD entries.
+ */
 static uint64_t
-build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
-    uint64_t image_length)
+build_image_ex(uint8_t *buf, size_t bufsize, uint16_t n_loads,
+    uint64_t image_length, int include_xsave, int dup_xsave)
 {
 	uint64_t phdr_table_end, cb_offset, pcb_offset, payload_start;
-	uint64_t xsave_offset, xsave_len, load_base;
-	uint16_t phnum = 3 + n_loads; /* CB + PCB + XSAVE + n_loads */
+	uint64_t xsave_offset, xsave_len, load_base, file_off;
+	uint16_t phnum, idx;
 	uint64_t dest_pages = n_loads;
 	uint16_t i;
+
+	phnum = 2 + n_loads; /* CB + PCB + n_loads */
+	if (include_xsave)
+		phnum += 1;
+	if (dup_xsave)
+		phnum += 1;
 
 	memset(buf, 0, bufsize);
 
@@ -388,10 +402,20 @@ build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
 	payload_start = align_up(pcb_offset + HIBERNATE_PCB_ENCODED_SIZE,
 	    HIB_PAGE_SIZE);
 
-	/* The sole XSAVE object starts at payload_start (64-aligned). */
-	xsave_offset = payload_start;
+	/*
+	 * The sole XSAVE object (and an optional duplicate) precede the
+	 * page-aligned PT_LOAD objects; file offsets stay strictly
+	 * increasing and non-overlapping.  The XSAVE object is 64-byte
+	 * aligned because payload_start is page aligned.
+	 */
 	xsave_len = 576;
-	load_base = align_up(payload_start + xsave_len, HIB_PAGE_SIZE);
+	xsave_offset = payload_start;
+	file_off = payload_start;
+	if (include_xsave)
+		file_off += xsave_len;
+	if (dup_xsave)
+		file_off += xsave_len;
+	load_base = align_up(file_off, HIB_PAGE_SIZE);
 
 	ATF_REQUIRE(payload_start <= bufsize);
 	ATF_REQUIRE(image_length >=
@@ -400,19 +424,30 @@ build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
 	/* ELF header */
 	write_ehdr(buf, phnum, EHDR_SIZE);
 
-	/* phdrs: 0=CB, 1=PCB, 2=XSAVE, 3..=PT_LOAD */
 	write_phdr(buf, EHDR_SIZE + 0 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_CB,
 	    cb_offset, HIBERNATE_CB_ENCODED_SIZE, HIBERNATE_CB_ENCODED_SIZE, 0);
 	write_phdr(buf, EHDR_SIZE + 1 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_PCB,
 	    pcb_offset, HIBERNATE_PCB_ENCODED_SIZE, HIBERNATE_PCB_ENCODED_SIZE,
 	    0);
-	write_phdr(buf, EHDR_SIZE + 2 * PHDR_SIZE, PT_FREEBSD_HIBERNATE_XSAVE,
-	    xsave_offset, xsave_len, xsave_len, 0);
+	idx = 2;
+	if (include_xsave) {
+		write_phdr(buf, EHDR_SIZE + (uint64_t)idx * PHDR_SIZE,
+		    PT_FREEBSD_HIBERNATE_XSAVE, xsave_offset, xsave_len,
+		    xsave_len, 0);
+		idx++;
+	}
+	if (dup_xsave) {
+		write_phdr(buf, EHDR_SIZE + (uint64_t)idx * PHDR_SIZE,
+		    PT_FREEBSD_HIBERNATE_XSAVE, xsave_offset + xsave_len,
+		    xsave_len, xsave_len, 0);
+		idx++;
+	}
 	for (i = 0; i < n_loads; i++) {
-		uint64_t file_off = load_base + (uint64_t)i * HIB_PAGE_SIZE;
+		uint64_t off = load_base + (uint64_t)i * HIB_PAGE_SIZE;
 		uint64_t paddr = (uint64_t)i * HIB_PAGE_SIZE;
-		write_phdr(buf, EHDR_SIZE + (uint64_t)(3 + i) * PHDR_SIZE,
-		    PT_LOAD, file_off, HIB_PAGE_SIZE, HIB_PAGE_SIZE, paddr);
+		write_phdr(buf, EHDR_SIZE + (uint64_t)idx * PHDR_SIZE,
+		    PT_LOAD, off, HIB_PAGE_SIZE, HIB_PAGE_SIZE, paddr);
+		idx++;
 	}
 
 	write_cb(buf, cb_offset, image_length, payload_start, phnum, dest_pages,
@@ -420,6 +455,17 @@ build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
 	write_pcb(buf, pcb_offset, xsave_offset);
 
 	return (payload_start);
+}
+
+/*
+ * build_image: build a valid ABI 1 metadata prefix with exactly one
+ * XSAVE program header.  Returns payload_start.
+ */
+static uint64_t
+build_image(uint8_t *buf, size_t bufsize, uint16_t n_loads,
+    uint64_t image_length)
+{
+	return (build_image_ex(buf, bufsize, n_loads, image_length, 1, 0));
 }
 
 /* ------------------------------------------------------------------ */
@@ -605,8 +651,8 @@ ATF_TC_BODY(golden_phnum_2, tc)
 	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
 }
 
-ATF_TC_WITHOUT_HEAD(golden_phnum_3);
-ATF_TC_BODY(golden_phnum_3, tc)
+ATF_TC_WITHOUT_HEAD(golden_phnum_4);
+ATF_TC_BODY(golden_phnum_4, tc)
 {
 	static uint8_t buf[HIB_PAGE_SIZE * 5];
 	struct hibernate_image img;
@@ -615,30 +661,32 @@ ATF_TC_BODY(golden_phnum_3, tc)
 	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
 	ATF_CHECK_EQ(0, hibernate_image_decode(buf, ps, &img));
 	ATF_CHECK_EQ(1U, img.hi_load_count);
-	ATF_CHECK_EQ(3U, img.hi_phnum);
+	/* A minimal valid K-20 image has CB + PCB + XSAVE + 1 load. */
+	ATF_CHECK_EQ(4U, img.hi_phnum);
 }
 
 ATF_TC_WITHOUT_HEAD(golden_phnum_900);
 ATF_TC_BODY(golden_phnum_900, tc)
 {
 	/*
-	 * 900 phdrs: 2 (CB+PCB) + 898 PT_LOAD.
+	 * 900 phdrs: 3 fixed (CB + PCB + XSAVE) + 897 PT_LOAD.
 	 * phdr_table_end = 64 + 900*56 = 50464
-	 * cb_offset = align_up(50464, 4096) = 51200
-	 * pcb_offset = align_up(51200+256, 4096) = 53248
-	 * payload_start = align_up(53248+1024, 4096) = 57344
+	 * cb_offset     = align_up(50464, 4096) = 53248
+	 * pcb_offset    = align_up(53248+256, 4096) = 57344
+	 * payload_start = align_up(57344+1024, 4096) = 61440
+	 * load_base     = align_up(61440+576, 4096) = 65536
 	 */
-	static uint8_t buf[57344 + 898UL * HIB_PAGE_SIZE];
+	static uint8_t buf[65536 + 897UL * HIB_PAGE_SIZE];
 	uint64_t ps;
 	struct hibernate_image img;
 	int err;
 	uint64_t image_len = sizeof(buf);
 
-	/* build_image uses n_loads PT_LOADs; we want 898. */
-	ps = build_image(buf, sizeof(buf), 898, image_len);
+	/* build_image uses n_loads PT_LOADs; 3 + 897 = 900 headers. */
+	ps = build_image(buf, sizeof(buf), 897, image_len);
 	err = hibernate_image_decode(buf, ps, &img);
 	ATF_REQUIRE_EQ_MSG(0, err, "900-phdr decode failed: %d", err);
-	ATF_CHECK_EQ(898U, img.hi_load_count);
+	ATF_CHECK_EQ(897U, img.hi_load_count);
 	ATF_CHECK_EQ(900U, img.hi_phnum);
 }
 
@@ -849,8 +897,9 @@ ATF_TC_WITHOUT_HEAD(malformed_overlapping_load);
 ATF_TC_BODY(malformed_overlapping_load, tc)
 {
 	/*
-	 * Build a 2-load image, then make the second PT_LOAD start
-	 * within the first (overlapping file ranges).
+	 * Build a 2-load image, then make the second PT_LOAD overlap the
+	 * first (its file offset equals the first load's).  phdrs:
+	 * 0=CB, 1=PCB, 2=XSAVE, 3=PT_LOAD#0, 4=PT_LOAD#1.
 	 */
 	static uint8_t buf[HIB_PAGE_SIZE * 6];
 	struct hibernate_image img;
@@ -858,9 +907,9 @@ ATF_TC_BODY(malformed_overlapping_load, tc)
 
 	ps = build_image(buf, sizeof(buf), 2, HIB_PAGE_SIZE * 6);
 
-	/* Second PT_LOAD: set p_offset back by half a page. */
-	uint64_t off2 = ps + HIB_PAGE_SIZE / 2; /* overlaps first load */
-	le64enc_p(buf + EHDR_SIZE + 3 * PHDR_SIZE + PHDR_OFF_P_OFFSET, off2);
+	/* PT_LOAD#0 file offset is ps + HIB_PAGE_SIZE (XSAVE < 1 page). */
+	le64enc_p(buf + EHDR_SIZE + 4 * PHDR_SIZE + PHDR_OFF_P_OFFSET,
+	    ps + HIB_PAGE_SIZE);
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 }
 
@@ -986,16 +1035,27 @@ ATF_TC_BODY(malformed_bad_xcr0, tc)
 	cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
 	pcb_off = align_up(cb_off + HIBERNATE_CB_ENCODED_SIZE, HIB_PAGE_SIZE);
 	/*
-	 * ABI 1: HIBERNATE_XCR0_MASK = x87|SSE only.  Any additional bit
-	 * (including AVX bit 2 and arbitrary bit 3) must be rejected.
+	 * ABI 1 accepts any enabled component within
+	 * HIBERNATE_XCR0_SUPPORTED_MASK (0x603ff), which includes AVX
+	 * (bit 2).  hp_xsave_enabled_mask must equal hp_xcr0.
 	 */
-	/* bit 3 set: rejected. */
+	/* AVX (bit 2) is supported: accepted when the mask mirrors XCR0. */
 	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XCR0,
-	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | UINT64_C(0x8));
+	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | HIBERNATE_XCR0_AVX);
+	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
+	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | HIBERNATE_XCR0_AVX);
+	ATF_CHECK_EQ(0, hibernate_image_decode(buf, ps, &img));
+	/* A component outside the closed supported mask is rejected. */
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XCR0,
+	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | (UINT64_C(1) << 63));
+	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
+	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | (UINT64_C(1) << 63));
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
-	/* AVX (bit 2) set: also rejected (ABI 1 limitation). */
-	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XCR0,
-	    HIBERNATE_XCR0_X87 | HIBERNATE_XCR0_SSE | UINT64_C(0x4));
+	/* hp_xsave_enabled_mask != hp_xcr0 is rejected. */
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	le64enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
+	    HIBERNATE_XCR0_X87);
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
 }
 
@@ -1049,6 +1109,87 @@ ATF_TC_BODY(malformed_pcb_reserved_nonzero, tc)
 	/* A nonzero byte in the reserved [0x0d0,0x400) region rejects. */
 	buf[pcb_off + HIBERNATE_PCB_OFF_RESERVED_0D0] = 0x01;
 	ATF_CHECK(hibernate_image_decode(buf, ps, &img) != 0);
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_missing_xsave);
+ATF_TC_BODY(malformed_missing_xsave, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t ps;
+
+	/* CB + PCB + 1 load, but no XSAVE program header. */
+	ps = build_image_ex(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5, 0, 0);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_duplicate_xsave);
+ATF_TC_BODY(malformed_duplicate_xsave, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t ps;
+
+	/* Two XSAVE program headers. */
+	ps = build_image_ex(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5, 1, 1);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_xsave_paddr);
+ATF_TC_BODY(malformed_xsave_paddr, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	/* phdr[2] is the sole XSAVE object; p_paddr must be 0. */
+	le64enc_p(buf + EHDR_SIZE + 2 * PHDR_SIZE + PHDR_OFF_P_PADDR,
+	    UINT64_C(0x40));
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_xsave_misalign);
+ATF_TC_BODY(malformed_xsave_misalign, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	/* XSAVE p_offset must be 64-byte aligned. */
+	le64enc_p(buf + EHDR_SIZE + 2 * PHDR_SIZE + PHDR_OFF_P_OFFSET,
+	    ps + 8);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_xsave_filesz_memsz);
+ATF_TC_BODY(malformed_xsave_filesz_memsz, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	/* XSAVE p_filesz must equal p_memsz. */
+	le64enc_p(buf + EHDR_SIZE + 2 * PHDR_SIZE + PHDR_OFF_P_MEMSZ,
+	    UINT64_C(576) + 64);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
+}
+
+ATF_TC_WITHOUT_HEAD(malformed_xsave_desc_mismatch);
+ATF_TC_BODY(malformed_xsave_desc_mismatch, tc)
+{
+	static uint8_t buf[HIB_PAGE_SIZE * 5];
+	struct hibernate_image img;
+	uint64_t cb_off, pcb_off, ps;
+
+	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
+	cb_off = align_up(EHDR_SIZE + 4 * PHDR_SIZE, HIB_PAGE_SIZE);
+	pcb_off = align_up(cb_off + HIBERNATE_CB_ENCODED_SIZE, HIB_PAGE_SIZE);
+	/* Descriptor hp_xsave_length must equal the XSAVE p_filesz. */
+	le32enc_p(buf + pcb_off + HIBERNATE_PCB_OFF_XSAVE_LENGTH, 640);
+	ATF_CHECK_EQ(EINVAL, hibernate_image_decode(buf, ps, &img));
 }
 
 ATF_TC_WITHOUT_HEAD(malformed_metadata_too_large);
@@ -1108,7 +1249,8 @@ ATF_TC_BODY(malformed_checked_overflow, tc)
 	uint64_t ps;
 
 	ps = build_image(buf, sizeof(buf), 1, HIB_PAGE_SIZE * 5);
-	ph = buf + EHDR_SIZE + 2 * PHDR_SIZE;
+	/* phdr[3] is the sole PT_LOAD (0=CB, 1=PCB, 2=XSAVE). */
+	ph = buf + EHDR_SIZE + 3 * PHDR_SIZE;
 	le64enc_p(ph + PHDR_OFF_P_OFFSET, UINT64_MAX - HIB_PAGE_SIZE + 1);
 	ATF_CHECK_EQ(EOVERFLOW, hibernate_image_decode(buf, ps, &img));
 }
@@ -1160,7 +1302,8 @@ ATF_TC_BODY(arithmetic_boundaries, tc)
 	for (i = 0; i < nitems(bounds); i++) {
 		ps = build_image(buf, sizeof(buf), 1, bounds[i]);
 		cb_off = align_up(EHDR_SIZE + 3 * PHDR_SIZE, HIB_PAGE_SIZE);
-		ph = buf + EHDR_SIZE + 2 * PHDR_SIZE;
+		/* phdr[3] is the sole PT_LOAD (0=CB, 1=PCB, 2=XSAVE). */
+		ph = buf + EHDR_SIZE + 3 * PHDR_SIZE;
 
 		le64enc_p(ph + PHDR_OFF_P_OFFSET, bounds[i] - HIB_PAGE_SIZE);
 		ATF_CHECK_EQ_MSG(0, hibernate_image_decode(buf, ps, &img),
@@ -1244,8 +1387,22 @@ ATF_TC_BODY(crc_whole_image_recompute, tc)
 	ATF_CHECK(crc != test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
 	buf[cb_off + HIBERNATE_CB_OFF_COPY_LIST_BOUND] ^= 1;
 
-	buf[ps + 17] ^= 1;
-	ATF_CHECK(crc != test_image_crc32c(buf, sizeof(buf), (size_t)crc_off));
+	/* First, middle, and final XSAVE bytes are all CRC-covered. */
+	{
+		uint64_t xo = img.hi_xsave_offset;
+		uint64_t xl = img.hi_xsave_length;
+		uint64_t xb[3];
+
+		xb[0] = xo;
+		xb[1] = xo + xl / 2;
+		xb[2] = xo + xl - 1;
+		for (i = 0; i < 3; i++) {
+			buf[xb[i]] ^= 1;
+			ATF_CHECK_MSG(crc != test_image_crc32c(buf, sizeof(buf),
+			    (size_t)crc_off), "XSAVE byte %zu not covered", i);
+			buf[xb[i]] ^= 1;
+		}
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1428,13 +1585,13 @@ ATF_TC_BODY(iterator_sticky_error, tc)
 ATF_TC_WITHOUT_HEAD(iterator_900_phdr);
 ATF_TC_BODY(iterator_900_phdr, tc)
 {
-	static uint8_t buf[57344 + 898UL * HIB_PAGE_SIZE];
+	static uint8_t buf[65536 + 897UL * HIB_PAGE_SIZE];
 	static struct hibernate_image_interval ivs[MAX_INTERVALS];
 	struct hibernate_image img;
 	uint64_t ps, total;
 	int n, i, err;
 
-	ps = build_image(buf, sizeof(buf), 898, sizeof(buf));
+	ps = build_image(buf, sizeof(buf), 897, sizeof(buf));
 	err = hibernate_image_decode(buf, ps, &img);
 	ATF_REQUIRE_EQ(0, err);
 
@@ -1474,7 +1631,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, golden_pt_load_intervals);
 	ATF_TP_ADD_TC(tp, golden_phnum_1);
 	ATF_TP_ADD_TC(tp, golden_phnum_2);
-	ATF_TP_ADD_TC(tp, golden_phnum_3);
+	ATF_TP_ADD_TC(tp, golden_phnum_4);
 	ATF_TP_ADD_TC(tp, golden_phnum_900);
 	ATF_TP_ADD_TC(tp, malformed_phnum_0);
 	ATF_TP_ADD_TC(tp, malformed_phnum_901);
@@ -1504,6 +1661,12 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, malformed_bad_xsave_format);
 	ATF_TP_ADD_TC(tp, malformed_bad_xsave_len);
 	ATF_TP_ADD_TC(tp, malformed_pcb_reserved_nonzero);
+	ATF_TP_ADD_TC(tp, malformed_missing_xsave);
+	ATF_TP_ADD_TC(tp, malformed_duplicate_xsave);
+	ATF_TP_ADD_TC(tp, malformed_xsave_paddr);
+	ATF_TP_ADD_TC(tp, malformed_xsave_misalign);
+	ATF_TP_ADD_TC(tp, malformed_xsave_filesz_memsz);
+	ATF_TP_ADD_TC(tp, malformed_xsave_desc_mismatch);
 	ATF_TP_ADD_TC(tp, malformed_metadata_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_start_too_large);
 	ATF_TP_ADD_TC(tp, malformed_payload_after_image);
