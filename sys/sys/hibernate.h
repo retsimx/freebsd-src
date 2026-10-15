@@ -711,6 +711,7 @@ void hibernate_barrier_retract_attempt(void);
  * derivation, parameterized by wired_pages so it is testable in userland
  * without vm_wire_count() (N7).  Compiled in both kernel and userland modes.
  */
+
 int hibernate_restore_footprint_compute(uint64_t destination_union_pages,
     uint64_t wired_pages, uint64_t *derived_pages_out);
 
@@ -757,6 +758,21 @@ int hibernate_coordinator_acquire(void);
  */
 void hibernate_coordinator_release(void);
 #endif /* _KERNEL */
+
+/*
+ * hibernate_dst_interval_contains / hibernate_dst_page_agrees: H-1 fix --
+ * dual-build (kernel + _HIBERNATE_USERLAND_BUILD) predicate core shared by
+ * hibernate_page_is_destination() and the production publish-then-verify
+ * gate hibernate_writer_runs_verify().  Declared here, outside any
+ * #ifdef _KERNEL block, so host-runnable tests can exercise the identical
+ * logic the kernel predicate and the K-6 construction-verification path
+ * both depend on.  See kern/kern_hibernate.c for full documentation.
+ */
+bool hibernate_dst_interval_contains(const struct hibernate_attempt *ha,
+    vm_paddr_t pa);
+bool hibernate_dst_page_agrees(const struct hibernate_attempt *ha,
+    const vm_paddr_t *sorted_free, size_t free_count, size_t *free_idx,
+    vm_paddr_t arena_start, vm_paddr_t arena_end, vm_paddr_t pa);
 
 int hibernate_probe(struct hibernate_attempt *ha);
 bool hibernate_provider_conflicts(const struct hibernate_provider_id *id);
@@ -901,6 +917,27 @@ int hibernate_writer_runs_build(struct hibernate_attempt *ha,
     size_t free_scratch_capacity, uint64_t payload_cursor,
     struct hibernate_writer_run *runs, size_t runs_capacity,
     size_t *run_count_out);
+
+/*
+ * hibernate_writer_runs_verify: H-1 fix -- publish-then-verify gate.
+ *
+ * Caller contract: publish ha_dst_intervals/ha_dst_count/ha_dst_valid
+ * (from the just-built run set) BEFORE calling this function.  This
+ * function then walks every ingested physical page and confirms
+ * hibernate_page_is_destination()'s predicate logic
+ * (hibernate_dst_interval_contains(), via hibernate_dst_page_agrees())
+ * agrees with the independently recomputed FREE/arena classification for
+ * every single page.  res and free_scratch must be the same reservation
+ * and scratch buffer passed to the preceding hibernate_writer_runs_build()
+ * call.
+ *
+ * Returns 0 when the predicate agrees with construction for every page.
+ * On any disagreement or argument error, forces ha_dst_valid = false and
+ * returns EINVAL; the caller must refuse the image.
+ */
+int hibernate_writer_runs_verify(struct hibernate_attempt *ha,
+    const struct vm_phys_reservation *res, vm_paddr_t *free_scratch,
+    size_t free_scratch_capacity);
 #endif /* _KERNEL */
 
 int hibernate_commit_pending(struct hibernate_attempt *,

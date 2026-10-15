@@ -1022,6 +1022,95 @@ hibernate_restore_footprint_compute(uint64_t destination_union_pages,
 	return (0);
 }
 
+/*
+ * hibernate_dst_interval_contains: test whether physical address pa falls
+ * within ha's published [start, end) destination-interval view.
+ *
+ * This is the pure, dual-build-compiled core shared by
+ * hibernate_page_is_destination() (the kernel-only vm_page_t-based public
+ * predicate, below) and the production publish-then-verify gate in
+ * hibernate_writer_runs_verify().  Factoring the interval scan out of
+ * hibernate_page_is_destination() lets the identical logic run in
+ * userland tests, which cannot construct a real vm_page_t.
+ *
+ * Returns false when ha is NULL, no view has been published
+ * (ha_dst_valid == false), or the interval array/count is empty.
+ */
+bool
+hibernate_dst_interval_contains(const struct hibernate_attempt *ha,
+    vm_paddr_t pa)
+{
+	uint64_t i;
+
+	if (ha == NULL || !ha->ha_dst_valid ||
+	    ha->ha_dst_intervals == NULL || ha->ha_dst_count == 0)
+		return (false);
+
+	/*
+	 * Linear scan over validated [start, end) pairs.
+	 * Intervals are sorted and non-overlapping; we could binary-search
+	 * but the count is small and linear scan is simpler and correct.
+	 */
+	for (i = 0; i < ha->ha_dst_count; i++) {
+		vm_paddr_t start, end;
+
+		start = ha->ha_dst_intervals[i * 2];
+		end   = ha->ha_dst_intervals[i * 2 + 1];
+		if (pa >= start && pa < end)
+			return (true);
+		/* Intervals are sorted; stop early if past pa. */
+		if (start > pa)
+			break;
+	}
+	return (false);
+}
+
+/*
+ * hibernate_dst_page_agrees: compare two independently derived
+ * classifications for the single physical page at pa and report whether
+ * they agree.
+ *
+ *   1. "expected": FREE-set/arena exclusion, recomputed from sorted_free
+ *      and [arena_start, arena_end) using the identical merge-scan rule
+ *      hibernate_writer_runs_build() applies while constructing runs.
+ *   2. "predicate": hibernate_dst_interval_contains(ha, pa) -- the exact
+ *      logic hibernate_page_is_destination() evaluates against the
+ *      *published* view (ha->ha_dst_intervals / ha->ha_dst_valid).
+ *
+ * This is the pure, dual-build-compiled comparator shared by the
+ * production hibernate_writer_runs_verify() gate and host-runnable tests,
+ * which cannot walk vm_phys_segs[] directly.
+ *
+ * *free_idx is a monotonic merge-scan cursor the caller must carry across
+ * strictly ascending pa values drawn from one sorted_free array; sorted_free
+ * must already be sorted ascending (the same array hibernate_writer_runs_
+ * build() produces via qsort(free_scratch, ...)).  arena_end == 0 means no
+ * arena is in effect.
+ *
+ * Returns true when the expected classification and the predicate verdict
+ * agree, false on any disagreement.
+ */
+bool
+hibernate_dst_page_agrees(const struct hibernate_attempt *ha,
+    const vm_paddr_t *sorted_free, size_t free_count, size_t *free_idx,
+    vm_paddr_t arena_start, vm_paddr_t arena_end, vm_paddr_t pa)
+{
+	bool excluded, expected_dst, predicate_dst;
+
+	while (*free_idx < free_count && sorted_free[*free_idx] < pa)
+		(*free_idx)++;
+	excluded = (*free_idx < free_count && sorted_free[*free_idx] == pa);
+	if (excluded)
+		(*free_idx)++;
+	if (!excluded && arena_end != 0 &&
+	    pa >= arena_start && pa < arena_end)
+		excluded = true;
+
+	expected_dst = !excluded;
+	predicate_dst = hibernate_dst_interval_contains(ha, pa);
+	return (expected_dst == predicate_dst);
+}
+
 #ifndef _HIBERNATE_USERLAND_BUILD
 
 struct hibernate_provider_owner {
@@ -1556,33 +1645,18 @@ bool
 hibernate_page_is_destination(vm_page_t m)
 {
 	const struct hibernate_attempt *ha;
-	vm_paddr_t pa;
-	uint64_t i;
-
-	ha = atomic_load_ptr(&hibernate_current_attempt);
-	if (ha == NULL || !ha->ha_dst_valid ||
-	    ha->ha_dst_intervals == NULL || ha->ha_dst_count == 0)
-		return (false);
-
-	pa = VM_PAGE_TO_PHYS(m);
 
 	/*
-	 * Linear scan over validated [start, end) pairs.
-	 * Intervals are sorted and non-overlapping; we could binary-search
-	 * but the count is small and linear scan is simpler and correct.
+	 * H-1 fix: delegate to the shared dual-build predicate core
+	 * (hibernate_dst_interval_contains()) instead of duplicating the
+	 * interval scan here.  This is the SAME function the production
+	 * publish-then-verify gate (hibernate_writer_runs_verify(), via
+	 * hibernate_dst_page_agrees()) calls once per ingested physical
+	 * page, so this public entry point and the construction-time
+	 * verification path are now provably evaluating identical logic.
 	 */
-	for (i = 0; i < ha->ha_dst_count; i++) {
-		vm_paddr_t start, end;
-
-		start = ha->ha_dst_intervals[i * 2];
-		end   = ha->ha_dst_intervals[i * 2 + 1];
-		if (pa >= start && pa < end)
-			return (true);
-		/* Intervals are sorted; stop early if past pa. */
-		if (start > pa)
-			break;
-	}
-	return (false);
+	ha = atomic_load_ptr(&hibernate_current_attempt);
+	return (hibernate_dst_interval_contains(ha, VM_PAGE_TO_PHYS(m)));
 }
 
 /*
@@ -2207,6 +2281,114 @@ hibernate_writer_runs_build(struct hibernate_attempt *ha,
 #undef HIB_RUN_CLOSE
 
 	*run_count_out = count;
+	return (0);
+}
+
+/*
+ * hibernate_writer_runs_verify: H-1 fix -- publish-then-verify gate.
+ *
+ * issue #8 mandates that PT_LOAD destinations be selected "using
+ * hibernate_page_is_destination()".  hibernate_writer_runs_build() builds
+ * the maximal destination-run set directly from live state (FREE-set/arena
+ * merge-scan) because the predicate cannot classify anything until a view
+ * has been published -- there is no destination view before construction.
+ *
+ * This function closes that gap with publish-then-verify: the caller
+ * (hibernate_writer_plan_live()) publishes the just-built run-derived view
+ * (ha_dst_intervals / ha_dst_count / ha_dst_valid) FIRST, and then calls
+ * this function, which walks every ingested physical page in
+ * vm_phys_segs[] EXACTLY ONCE and checks each one through
+ * hibernate_dst_page_agrees() -- which in turn evaluates
+ * hibernate_dst_interval_contains(), the IDENTICAL logic
+ * hibernate_page_is_destination() uses against hibernate_current_attempt.
+ * The independently recomputed FREE/arena classification is compared
+ * against the predicate's verdict for every page; any single mismatch
+ * invalidates the view (ha_dst_valid = false) and the function returns
+ * EINVAL, which the caller propagates as a refusal of the image.
+ *
+ * This makes the mandated predicate genuinely live and material: the
+ * production path cannot publish a passing view without the predicate
+ * itself agreeing, page for page, with the construction logic.
+ *
+ * Preconditions: ha->ha_dst_valid must already be true and
+ * ha->ha_dst_intervals/ha_dst_count must already describe the exact view
+ * being verified (the caller publishes before calling, per the function
+ * name).  res and free_scratch are the same reservation and scratch buffer
+ * passed to the preceding hibernate_writer_runs_build() call.
+ *
+ * Returns 0 when every ingested page's predicate verdict agrees with the
+ * expected FREE/arena classification.  Returns EINVAL on any argument
+ * problem, on disagreement, or if ha_dst_valid is not already true (the
+ * view must be published before verification, not after).  On EINVAL from
+ * disagreement, ha_dst_valid is forced false before returning so no later
+ * reader can observe a partially-trusted view.
+ */
+int
+hibernate_writer_runs_verify(struct hibernate_attempt *ha,
+    const struct vm_phys_reservation *res, vm_paddr_t *free_scratch,
+    size_t free_scratch_capacity)
+{
+	vm_paddr_t arena_end, pa, seg_start, seg_end, last_seg_end;
+	size_t free_idx, i;
+	int segind;
+
+	if (ha == NULL || res == NULL || !ha->ha_dst_valid)
+		return (EINVAL);
+	if (res->vr_count != 0 && free_scratch == NULL)
+		return (EINVAL);
+	if (res->vr_count > free_scratch_capacity)
+		return (EINVAL);
+	if (ha->ha_arena_size != 0 &&
+	    __builtin_add_overflow(ha->ha_arena_start, ha->ha_arena_size,
+		&arena_end))
+		return (EOVERFLOW);
+	if (ha->ha_arena_size == 0)
+		arena_end = 0;
+
+	/*
+	 * Re-sort a fresh copy of the FREE set into free_scratch.  This is
+	 * the same caller-owned scratch buffer hibernate_writer_runs_build()
+	 * just used; re-populating it here keeps this function independently
+	 * correct (it does not rely on the scratch buffer's contents having
+	 * survived unmodified) at the cost of one more O(n log n) sort.
+	 */
+	for (i = 0; i < res->vr_count; i++)
+		free_scratch[i] = VM_PAGE_TO_PHYS(res->vr_pages[i].vrp_page);
+	if (res->vr_count > 1)
+		qsort(free_scratch, res->vr_count, sizeof(free_scratch[0]),
+		    hib_vm_paddr_cmp);
+
+	free_idx = 0;
+	last_seg_end = 0;
+	for (segind = 0; segind < vm_phys_nsegs; segind++) {
+		seg_start = vm_phys_segs[segind].start;
+		seg_end = vm_phys_segs[segind].end;
+		if (seg_start >= seg_end) {
+			ha->ha_dst_valid = false;
+			return (EINVAL);
+		}
+		if (segind != 0 && seg_start < last_seg_end) {
+			ha->ha_dst_valid = false;
+			return (EINVAL);
+		}
+		last_seg_end = seg_end;
+
+		for (pa = seg_start; pa < seg_end; pa += HIB_PAGE_SIZE) {
+			if (!hibernate_dst_page_agrees(ha, free_scratch,
+				res->vr_count, &free_idx, ha->ha_arena_start,
+				arena_end, pa)) {
+				/*
+				 * The mandated predicate disagrees with the
+				 * independently recomputed classification for
+				 * this page: refuse to trust the published
+				 * view and refuse the image.
+				 */
+				ha->ha_dst_valid = false;
+				return (EINVAL);
+			}
+		}
+	}
+
 	return (0);
 }
 
