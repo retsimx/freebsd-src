@@ -462,7 +462,6 @@ dumpsys_hibernate_free_hcb(struct hibernate_save_cb *hcb)
 
 #ifndef _HIBERNATE_DUMP_EXTENT_TEST
 static dumper_start_t dumpsys_hibernate_start;
-static dumper_hdr_t dumpsys_hibernate_aux_headers;
 #endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
 
 
@@ -862,6 +861,24 @@ hibernate_writer_plan_live(const struct hibernate_save_cb *hcb,
 	attempt->ha_dst_count = run_count;
 	atomic_thread_fence_rel();
 	attempt->ha_dst_valid = true;
+
+	/*
+	 * H-1 fix: publish-then-verify.  The destination view published
+	 * above was constructed by hibernate_writer_runs_build()'s inline
+	 * FREE-set/arena exclusion scan.  Before trusting that view for
+	 * image construction, confirm -- for every ingested physical page
+	 * -- that the mandated hibernate_page_is_destination() predicate
+	 * (evaluated here through hibernate_writer_runs_verify(), which
+	 * shares its core logic with the public predicate) agrees with the
+	 * construction logic.  reservation and workspace->hww_free_scratch/
+	 * hww_free_scratch_capacity are the identical arguments already
+	 * passed to hibernate_writer_runs_build() above.  Any disagreement
+	 * forces ha_dst_valid back to false and refuses the image.
+	 */
+	error = hibernate_writer_runs_verify(attempt, reservation,
+	    workspace->hww_free_scratch, workspace->hww_free_scratch_capacity);
+	if (error != 0)
+		return (error);
 	return (0);
 }
 

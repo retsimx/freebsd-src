@@ -1061,6 +1061,72 @@ ATF_TC_BODY(writer_plan_arena_collision_edges, tc)
 	ATF_CHECK_EQ(EINVAL, hibernate_writer_plan_assemble(&plan, &cb, &pcb));
 }
 
+ATF_TC_WITHOUT_HEAD(writer_dst_verify_agreement);
+ATF_TC_BODY(writer_dst_verify_agreement, tc)
+{
+	struct hibernate_attempt ha;
+	vm_paddr_t dst_intervals[4];
+	vm_paddr_t sorted_free[2];
+	vm_paddr_t arena_start, arena_end, pa;
+	size_t free_idx;
+
+	ha = (struct hibernate_attempt)HIBERNATE_ATTEMPT_INIT;
+	sorted_free[0] = UINT64_C(0x2000);
+	sorted_free[1] = UINT64_C(0x3000);
+	arena_start = UINT64_C(0x5000);
+	arena_end = UINT64_C(0x6000);
+
+	dst_intervals[0] = UINT64_C(0x0000);
+	dst_intervals[1] = UINT64_C(0x2000);
+	dst_intervals[2] = UINT64_C(0x4000);
+	dst_intervals[3] = UINT64_C(0x5000);
+	ha.ha_dst_intervals = dst_intervals;
+	ha.ha_dst_count = 2;
+	ha.ha_dst_valid = true;
+
+	free_idx = 0;
+	for (pa = 0; pa < UINT64_C(0x6000); pa += HIB_PAGE_SIZE) {
+		ATF_CHECK(hibernate_dst_page_agrees(&ha, sorted_free,
+		    nitems(sorted_free), &free_idx, arena_start, arena_end,
+		    pa));
+	}
+
+	ATF_CHECK(hibernate_dst_interval_contains(&ha, UINT64_C(0x0000)));
+	ATF_CHECK(hibernate_dst_interval_contains(&ha, UINT64_C(0x1000)));
+	ATF_CHECK(!hibernate_dst_interval_contains(&ha, UINT64_C(0x2000)));
+	ATF_CHECK(!hibernate_dst_interval_contains(&ha, UINT64_C(0x3000)));
+	ATF_CHECK(hibernate_dst_interval_contains(&ha, UINT64_C(0x4000)));
+	ATF_CHECK(!hibernate_dst_interval_contains(&ha, UINT64_C(0x5000)));
+}
+
+ATF_TC_WITHOUT_HEAD(writer_dst_verify_refuses);
+ATF_TC_BODY(writer_dst_verify_refuses, tc)
+{
+	struct hibernate_attempt ha;
+	vm_paddr_t dst_intervals[2];
+	vm_paddr_t sorted_free[2];
+	size_t free_idx;
+
+	ha = (struct hibernate_attempt)HIBERNATE_ATTEMPT_INIT;
+	sorted_free[0] = UINT64_C(0x2000);
+	sorted_free[1] = UINT64_C(0x3000);
+
+	dst_intervals[0] = UINT64_C(0x0000);
+	dst_intervals[1] = UINT64_C(0x3000);
+	ha.ha_dst_intervals = dst_intervals;
+	ha.ha_dst_count = 1;
+	ha.ha_dst_valid = true;
+
+	free_idx = 0;
+	ATF_CHECK(hibernate_dst_page_agrees(&ha, sorted_free,
+	    nitems(sorted_free), &free_idx, 0, 0, UINT64_C(0x0000)));
+	ATF_CHECK(hibernate_dst_page_agrees(&ha, sorted_free,
+	    nitems(sorted_free), &free_idx, 0, 0, UINT64_C(0x1000)));
+	ATF_CHECK(!hibernate_dst_page_agrees(&ha, sorted_free,
+	    nitems(sorted_free), &free_idx, 0, 0, UINT64_C(0x2000)));
+	ATF_CHECK(hibernate_dst_interval_contains(&ha, UINT64_C(0x2000)));
+}
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, fixed_wire_sizes);
@@ -1092,5 +1158,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, writer_stream_malformed_completion);
 	ATF_TP_ADD_TC(tp, writer_stream_one_four_byte_rewrite);
 	ATF_TP_ADD_TC(tp, writer_plan_arena_collision_edges);
+	ATF_TP_ADD_TC(tp, writer_dst_verify_agreement);
+	ATF_TP_ADD_TC(tp, writer_dst_verify_refuses);
 	return (atf_no_error());
 }
