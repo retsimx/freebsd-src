@@ -3782,6 +3782,65 @@ resume_other_cpus(const cpuset_t *const susp_cpus)
 static char hibernate_dump_stack[HIBERNATE_SCRATCH_STACK_SIZE]
     __aligned(PAGE_SIZE);
 
+static void
+acpi_hibernate_writer_workspace_free(struct hibernate_writer_workspace *workspace)
+{
+	if (workspace->hww_io_buffer != NULL)
+		free(workspace->hww_io_buffer, M_TEMP);
+	if (workspace->hww_destination_intervals != NULL)
+		free(workspace->hww_destination_intervals, M_TEMP);
+	if (workspace->hww_free_scratch != NULL)
+		free(workspace->hww_free_scratch, M_TEMP);
+	if (workspace->hww_runs != NULL)
+		free(workspace->hww_runs, M_TEMP);
+	if (workspace->hww_xsave != NULL)
+		free(workspace->hww_xsave, M_TEMP);
+	if (workspace->hww_prefix != NULL)
+		free(workspace->hww_prefix, M_TEMP);
+	bzero(workspace, sizeof(*workspace));
+}
+
+static int
+acpi_hibernate_writer_workspace_alloc(
+    struct hibernate_writer_workspace *workspace,
+    struct hibernate_xsave_terminal *terminal)
+{
+	size_t destination_bytes, free_bytes, run_bytes;
+	size_t run_capacity;
+
+	bzero(workspace, sizeof(*workspace));
+	run_capacity = HIBERNATE_MAX_PHDRS - 3;
+	if (__builtin_mul_overflow(run_capacity,
+		sizeof(struct hibernate_writer_run), &run_bytes) ||
+	    __builtin_mul_overflow((size_t)physmem, sizeof(vm_paddr_t),
+		&free_bytes) ||
+	    __builtin_mul_overflow(run_capacity * 2,
+		sizeof(vm_paddr_t), &destination_bytes))
+		return (EOVERFLOW);
+
+	workspace->hww_prefix_capacity = HIBERNATE_META_BUF_MAX;
+	workspace->hww_prefix = malloc(workspace->hww_prefix_capacity, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	workspace->hww_xsave_capacity =
+	    MAX((size_t)cpu_max_ext_state_size,
+		(size_t)HIBERNATE_AMD64_XSAVE_MIN_LENGTH);
+	workspace->hww_xsave = malloc_aligned(workspace->hww_xsave_capacity,
+	    HIBERNATE_AMD64_XSAVE_ALIGNMENT, M_TEMP, M_WAITOK | M_ZERO);
+	workspace->hww_runs_capacity = run_capacity;
+	workspace->hww_runs = malloc(run_bytes, M_TEMP, M_WAITOK | M_ZERO);
+	workspace->hww_free_scratch_capacity = physmem;
+	workspace->hww_free_scratch = malloc(free_bytes, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	workspace->hww_destination_capacity = run_capacity;
+	workspace->hww_destination_intervals = malloc(destination_bytes, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	workspace->hww_io_capacity = 2 * DEV_BSIZE;
+	workspace->hww_io_buffer = malloc(workspace->hww_io_capacity, M_TEMP,
+	    M_WAITOK | M_ZERO);
+	workspace->hww_xsave_terminal = terminal;
+	return (0);
+}
+
 struct hibernate_dump_args {
 	struct acpi_softc		*sc;
 	struct hibernate_save_cb	*hcb;
@@ -3795,6 +3854,8 @@ struct hibernate_dump_args {
 	 * is not pinned during the longjmp.
 	 */
 	struct hibernate_attempt	*ha;
+	struct hibernate_writer_workspace *workspace;
+	bool				*image_committed;
 	struct vm_phys_reservation	*hib_res;
 	struct vm_phys_reservation_page *hib_res_pages;
 	u_long				hib_res_cap;
@@ -3978,7 +4039,8 @@ acpi_hibernate_dump_worker(void *arg1, void *arg2)
 	 */
 	scheduler_stopped = true;
 	device_printf(args->sc->acpi_dev, "Saving the dump image...\n");
-	error = dump_for_hibernate(args->hcb, args->hpcb, args->ha);
+	error = dump_for_hibernate(args->hcb, args->hpcb, args->ha,
+	    args->hib_res, args->workspace, args->image_committed);
 
 	/*
 	 * Re-enable normal mutex operation before releasing the VM reservation.
@@ -4191,6 +4253,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
     ACPI_STATUS status;
     enum acpi_sleep_state slp_state;
     int acpi_sstate = ACPI_STATE_UNKNOWN;
+#ifdef OS_HIBERNATE_SUPPORT
+    struct hibernate_attempt ha = HIBERNATE_ATTEMPT_INIT;
+    struct hibernate_writer_workspace hib_workspace = { 0 };
+    struct hibernate_xsave_terminal hib_xsave_terminal;
+    struct dumperinfo *hib_dumper = NULL;
+    bool image_committed = false;
+#endif
 
     ACPI_FUNCTION_TRACE_U32((char *)(uintptr_t)__func__, stype);
 
@@ -4338,7 +4407,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	    AcpiGbl_FACS->HardwareSignature : 0;
 	struct hibernate_save_cb *hcb = NULL;
 	struct hibernate_save_pcb *hpcb = NULL;
-	struct hibernate_attempt ha = HIBERNATE_ATTEMPT_INIT;
 	struct vm_phys_reservation hib_res = { .vr_pages = NULL,
 	    .vr_capacity = 0, .vr_count = 0 };
 	struct vm_phys_reservation_page *hib_res_pages;
@@ -4362,6 +4430,15 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * NULL until successfully acquired; NULL means no release needed.
 	 */
 	struct cam_periph *hib_cam_periph = NULL;
+
+	error = acpi_hibernate_writer_workspace_alloc(&hib_workspace,
+	    &hib_xsave_terminal);
+	if (error != 0) {
+		device_printf(sc->acpi_dev,
+		    "hibernate: writer workspace allocation failed: %d\n",
+		    error);
+		goto backout;
+	}
 
 	device_printf(sc->acpi_dev, "Creating hibernate control block...\n");
 	error = dumpsys_hibernate_create_hcb(hardware_signature, &hcb);
@@ -4577,7 +4654,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 
 		mtx_lock(&dumpconf_list_lk);
 		_di = TAILQ_FIRST(&dumper_configs);
-		if (_di != NULL && _di->priv != NULL) {
+		if (_di != NULL && _di->priv != NULL &&
+		    _di->provider_valid &&
+		    _di->provider_media_size != 0 &&
+		    _di->dumper_read != NULL &&
+		    _di->dumper_flush != NULL &&
+		    _di->blocksize == DEV_BSIZE &&
+		    dumper_hold(_di)) {
 			_dp = (struct disk *)_di->priv;
 			/*
 			 * Type discriminator: di->dumper == dp->d_dump proves
@@ -4590,11 +4673,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 				_periph = (struct cam_periph *)_dp->d_drv1;
 				if (cam_sim_pollable(_periph->sim) &&
 				    cam_periph_acquire(_periph) == 0) {
-					/* Reference held; survives dumpconf_list_lk release. */
 					_sim = _periph->sim;
 					hib_cam_periph = _periph;
+					hib_dumper = _di;
 				}
 			}
+			if (hib_dumper == NULL)
+				dumper_drop(_di);
 		}
 		mtx_unlock(&dumpconf_list_lk);
 
@@ -4618,7 +4703,10 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 			goto backout;
 		}
 		ha.ha_cam_sim = _sim;
-		/* hib_cam_periph reference is now live; must be released on all paths. */
+		ha.ha_dumper = hib_dumper;
+		ha.ha_marker_offset = hib_dumper->mediaoffset;
+		ha.ha_provider_offset = 0;
+		ha.ha_provider_size = hib_dumper->provider_media_size;
 	}
 
 	/*
@@ -4658,6 +4746,8 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		.hpcb = hpcb,
 		.slp_state = slp_state,
 		.ha = &ha,
+		.workspace = &hib_workspace,
+		.image_committed = &image_committed,
 		.hib_res = &hib_res,
 		.hib_res_pages = hib_res_pages,
 		.hib_res_cap = hib_res_cap,
@@ -4752,8 +4842,9 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		error = EIO;
 	}
 #endif
-	if (error != 0) {
-	    device_printf(sc->acpi_dev, "Could not dump the image!\n");
+	if (error != 0 || !hibernate_s4_commit_gate(image_committed)) {
+	    device_printf(sc->acpi_dev,
+		"Could not commit the hibernate image!\n");
 	    status = AE_NO_HANDLER; /* XXX - Something. */
 	    /* K-18: release snapshot ownership on dump failure. */
 	    if (snapshot_owned) {
@@ -4790,9 +4881,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 
 	if (!sc->acpi_supported_sstates[ACPI_STATE_S4]) {
 	    /*
-	     * Not going to follow the usual suspend path, as we are going to
-	     * do a regular shutdown right now (without syncing).
+	     * The power-off fallback is reachable only after the image and
+	     * durable PENDING marker have both completed successfully.
 	     */
+	    if (!hibernate_s4_commit_gate(image_committed)) {
+		status = AE_NO_HANDLER;
+		goto backout;
+	    }
 	    kern_reboot(RB_POWEROFF | RB_NOSYNC);
 	    /* NOTREACHED */
 	}
@@ -4856,7 +4951,15 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	break;
     case POWER_STYPE_FW_SUSPEND:
     case POWER_STYPE_FW_HIBERNATE:
+	do_sleep(sc, &slp_state, intr, acpi_sstate);
+	break;
     case POWER_STYPE_OS_HIBERNATE:
+	if (!hibernate_s4_commit_gate(image_committed)) {
+	    intr_restore(intr);
+	    resumeclock();
+	    status = AE_NO_HANDLER;
+	    goto backout;
+	}
 	do_sleep(sc, &slp_state, intr, acpi_sstate);
 	break;
     case POWER_STYPE_SUSPEND_TO_IDLE:
@@ -4876,6 +4979,15 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
      * process.  This handles both the error and success cases.
      */
 backout:
+#ifdef OS_HIBERNATE_SUPPORT
+    if (hib_dumper != NULL) {
+	dumper_drop(hib_dumper);
+	hib_dumper = NULL;
+	ha.ha_dumper = NULL;
+    }
+    if (stype == POWER_STYPE_OS_HIBERNATE)
+	acpi_hibernate_writer_workspace_free(&hib_workspace);
+#endif
     if ((slp_state & ACPI_SS_GPE_SET) != 0) {
 	acpi_wake_prep_walk(sc, stype);
 	sc->acpi_stype = POWER_STYPE_AWAKE;

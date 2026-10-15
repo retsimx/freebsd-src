@@ -37,6 +37,8 @@
 #include <sys/systm.h>
 #include <sys/callout.h>
 #include <sys/conf.h>
+#include <sys/endian.h>
+#include <sys/hibernate.h>
 #include <sys/cons.h>
 #include <sys/kdb.h>
 #include <sys/kernel.h>
@@ -61,6 +63,7 @@
 #include <machine/elf.h>
 #include <machine/md_var.h>
 #include <machine/pcb.h>
+#include <machine/vmparam.h>
 #ifdef OS_HIBERNATE_SUPPORT
 #include <machine/hibernate.h>
 #endif
@@ -520,270 +523,415 @@ dumpsys_hibernate_start(struct dumperinfo *di, struct kerneldumpheader *kdh,
 }
 
 #ifndef _HIBERNATE_DUMP_EXTENT_TEST
+
 /*
- * Dump extra (out-of-ELF) headers.
+ * K-6 canonical ABI-1 provider adapter.
+ *
+ * The portable core owns image geometry, interval coverage, CRC accounting,
+ * and transaction ordering.  This file owns only provider I/O and physical
+ * source access.  Every provider write is block-aligned and uses the single
+ * caller-preallocated staging buffer.
  */
-int
-dumpsys_hibernate_aux_headers(struct dumperinfo *di, struct kerneldumpheader *kdh)
+struct hibernate_provider_stream {
+	struct hibernate_attempt *hps_attempt;
+	struct hibernate_writer_workspace *hps_workspace;
+	struct dumperinfo *hps_dumper;
+	uint64_t hps_image_offset;
+	uint64_t hps_logical_cursor;
+	uint64_t hps_block_file_offset;
+	size_t hps_block_used;
+	size_t hps_block_size;
+	uint8_t *hps_crc_block;
+	uint64_t hps_crc_block_file_offset;
+	struct hibernate_marker *hps_pending;
+	bool hps_crc_block_valid;
+};
+
+static int
+hibernate_provider_write_block(struct hibernate_provider_stream *stream)
 {
-	/* We have none. */
+	struct hibernate_writer_workspace *workspace;
+	uint64_t provider_offset;
+	int error;
+
+	workspace = stream->hps_workspace;
+	if (stream->hps_block_used != stream->hps_block_size)
+		return (EINVAL);
+	if (__builtin_add_overflow(stream->hps_image_offset,
+		stream->hps_block_file_offset, &provider_offset) ||
+	    provider_offset > OFF_MAX)
+		return (EOVERFLOW);
+
+	error = dump_write(stream->hps_dumper, workspace->hww_io_buffer,
+	    (off_t)provider_offset, stream->hps_block_size);
+	if (error != 0)
+		return (error);
+
+	if (workspace->hww_plan.hwp_image.hi_crc_zero_offset >=
+	    stream->hps_block_file_offset &&
+	    workspace->hww_plan.hwp_image.hi_crc_zero_offset <
+	    stream->hps_block_file_offset + stream->hps_block_size) {
+		memcpy(stream->hps_crc_block, workspace->hww_io_buffer,
+		    stream->hps_block_size);
+		stream->hps_crc_block_file_offset =
+		    stream->hps_block_file_offset;
+		stream->hps_crc_block_valid = true;
+	}
+
+	stream->hps_block_file_offset += stream->hps_block_size;
+	stream->hps_block_used = 0;
+	bzero(workspace->hww_io_buffer, stream->hps_block_size);
 	return (0);
 }
 
-/*
- * Hibernate's additional ELF program headers.
- *
- * Two additional headers, one containing a 'struct hibernate_save_cb'
- * (PT_FREEBSD_HIBERNATE_CB) and another containing a
- * 'struct hibernate_save_pcb'
- * (PT_FREEBSD_HIBERNATE_PCB).
- */
-static const int hibernate_addphdr_nb = 2;
-
-static inline size_t
-dumpsys_hibernate_addphdr_size(const struct hibernate_save_cb *const hcb)
-{
-	return (hcb_size(hcb) + sizeof(struct hibernate_save_pcb));
-}
-
 static int
-dumpsys_hibernate_addphdr_write_elf_headers(struct dumperinfo *di, uint64_t offset,
-    const struct hibernate_save_cb *const hcb)
+hibernate_provider_append(struct hibernate_provider_stream *stream,
+    const void *source, uint64_t length, bool zero, uint32_t *crc)
 {
-	Elf_Phdr phdr;
+	struct hibernate_writer_workspace *workspace;
+	const uint8_t *bytes;
+	uint32_t next_crc;
+	uint64_t remaining;
+	size_t amount;
 	int error;
 
-	bzero(&phdr, sizeof(phdr));
+	if (stream == NULL || crc == NULL || length == 0)
+		return (EINVAL);
+	workspace = stream->hps_workspace;
+	bytes = source;
+	remaining = length;
+	next_crc = *crc;
 
-	phdr.p_type = PT_FREEBSD_HIBERNATE_CB;
-	/*
-	 * Does not matter for image restoration.  May matter for external ELF
-	 * analysis tools, if ever used on the dump.
-	 */
-	phdr.p_flags = PF_R;
-	phdr.p_offset = offset;
-	phdr.p_filesz = hcb_size(hcb);
-	phdr.p_memsz = phdr.p_filesz;
-	error = dumpsys_buf_write(di, (char *)&phdr, sizeof(phdr));
-	if (error != 0)
-		return (error);
+	while (remaining != 0) {
+		amount = MIN((uint64_t)(stream->hps_block_size -
+		    stream->hps_block_used), remaining);
+		if (zero) {
+			bzero(workspace->hww_io_buffer + stream->hps_block_used,
+			    amount);
+		} else {
+			if (bytes == NULL)
+				return (EINVAL);
+			memcpy(workspace->hww_io_buffer + stream->hps_block_used,
+			    bytes, amount);
+		}
+		next_crc = hibernate_crc32c_update(next_crc,
+		    workspace->hww_io_buffer + stream->hps_block_used, amount);
+		stream->hps_block_used += amount;
+		stream->hps_logical_cursor += amount;
+		remaining -= amount;
+		if (!zero)
+			bytes += amount;
 
-	phdr.p_type = PT_FREEBSD_HIBERNATE_PCB;
-	phdr.p_flags = PF_R;
-	phdr.p_offset = offset + hcb_size(hcb);
-	phdr.p_filesz = sizeof(struct hibernate_save_pcb);
-	phdr.p_memsz = phdr.p_filesz;
-	error = dumpsys_buf_write(di, (char *)&phdr, sizeof(phdr));
-	return (error);
-}
-
-static int
-dumpsys_hibernate_addphdr_write(struct dumperinfo *di,
-    const struct hibernate_save_cb *const hcb,
-    const struct hibernate_save_pcb *const hpcb)
-{
-	int error;
-
-	error = dumpsys_buf_write(di, (const char *)hcb, hcb_size(hcb));
-	if (error != 0)
-		return (error);
-	error = dumpsys_buf_write(di, (const char *)hpcb, sizeof(*hpcb));
-	return (error);
-}
-
-/*
- * XXX - For now, this is mostly a copy/paste of dumpsys_generic() with
- * adaptations.  Should look into factoring out what makes sense and remove
- * specifics that do not really apply to hibernate dumps at some point.  But
- * maybe not be worth it until late, as we may want to switch to something
- * similar to a minidump.
- */
-/* Keep out-of-line: issue #2 requires this symbol under static inspection. */
-static __noinline int
-dumpsys_hibernate(struct dumperinfo *di,
-    const struct hibernate_save_cb *const hcb,
-    const struct hibernate_save_pcb *const hpcb)
-{
-	static struct kerneldumpheader kdh;
-	Elf_Ehdr ehdr;
-	uint64_t dumpsize, hdrgap, hdrsiz, size_before_pages;
-	int error;
-
-	/*
-	 * XXX - Temporarily hook into dump start and header callbacks, pending
-	 * a better architecture.
-	 */
-	if (di->dumper_start != NULL || di->dumper_hdr != NULL)
-		return (EOPNOTSUPP);
-	di->dumper_start = dumpsys_hibernate_start;
-	di->dumper_hdr = dumpsys_hibernate_aux_headers;
-
-	bzero(&ehdr, sizeof(ehdr));
-	ehdr.e_ident[EI_MAG0] = ELFMAG0;
-	ehdr.e_ident[EI_MAG1] = ELFMAG1;
-	ehdr.e_ident[EI_MAG2] = ELFMAG2;
-	ehdr.e_ident[EI_MAG3] = ELFMAG3;
-	ehdr.e_ident[EI_CLASS] = ELF_CLASS;
-#if BYTE_ORDER == LITTLE_ENDIAN
-	ehdr.e_ident[EI_DATA] = ELFDATA2LSB;
-#else
-	ehdr.e_ident[EI_DATA] = ELFDATA2MSB;
-#endif
-	ehdr.e_ident[EI_VERSION] = EV_CURRENT;
-	ehdr.e_ident[EI_OSABI] = ELFOSABI_FREEBSD;
-	ehdr.e_type = ET_FREEBSD_HIBERNATE_IMAGE;
-	ehdr.e_machine = EM_VALUE;
-	ehdr.e_phoff = sizeof(ehdr);
-	ehdr.e_flags = 0;
-	ehdr.e_ehsize = sizeof(ehdr);
-	ehdr.e_phentsize = sizeof(Elf_Phdr);
-	ehdr.e_shentsize = sizeof(Elf_Shdr);
-
-	dumpsys_pa_init();
-
-	dumpsize = 0;
-	ehdr.e_phnum = dumpsys_foreach_chunk(cb_size, &dumpsize) +
-	    hibernate_addphdr_nb;
-	hdrsiz = ehdr.e_phoff + ehdr.e_phnum * ehdr.e_phentsize;
-	size_before_pages = hdrsiz + dumpsys_hibernate_addphdr_size(hcb);
-	fileofs = DEV_ALIGN(MD_ALIGN(size_before_pages), di->blocksize);
-	dumpsize += fileofs;
-	hdrgap = fileofs - DEV_ALIGN(size_before_pages, di->blocksize);
-
-	/*
-	 * XXX - Passed magic and version are not used, as we don't emit headers
-	 * in addition to the ELF file, contrary to all other styles of dumps.
-	 */
-	dump_init_header(di, &kdh, KERNELDUMPMAGIC, KERNELDUMP_ARCH_VERSION,
-	    dumpsize);
-
-	/* Calls back dumpsys_hibernate_start(). */
-	error = dump_start(di, &kdh);
-	if (error != 0)
-		goto fail;
-
-	printf("Saving %" PRIu64 " MB (%d chunks)\n", dumpsize >> 20,
-	    ehdr.e_phnum - hibernate_addphdr_nb);
-
-	/* Dump ELF header */
-	error = dumpsys_buf_write(di, (char *)&ehdr, sizeof(ehdr));
-	if (error)
-		goto fail;
-
-	/* Dump hibernate specific headers. */
-	error = dumpsys_hibernate_addphdr_write_elf_headers(di, hdrsiz, hcb);
-	if (error != 0)
-		goto fail;
-
-	/* Dump program headers. */
-	error = dumpsys_foreach_chunk(cb_dumphdr, di);
-	if (error < 0)
-		goto fail;
-
-	/* Dump hibernate specific info. */
-	error = dumpsys_hibernate_addphdr_write(di, hcb, hpcb);
-	if (error != 0)
-		goto fail;
-
-	dumpsys_buf_flush(di);
-
-	/*
-	 * Skip to align segments containing pages to page boundaries.
-	 *
-	 * XXX: Does this really matter?
-	 */
-	error = dumpsys_buf_seek(di, (size_t)hdrgap);
-	if (error)
-		goto fail;
-
-	/* Dump memory chunks. */
-	error = dumpsys_foreach_chunk(dumpsys_cb_dumpdata, di);
-	if (error < 0)
-		goto fail;
-
-	/* Calls back dumpsys_hibernate_aux_headers(). */
-	error = dump_finish(di, &kdh);
-	if (error != 0)
-		goto fail;
-
-	printf("\nHibernate image saving complete\n");
-	error = 0;
-
-finish:
-	/* Remove our specific hooks. */
-	di->dumper_start = NULL;
-	di->dumper_hdr = NULL;
-	return (error);
-
-fail:
-	if (error < 0)
-		error = -error;
-
-	if (error == ECANCELED)
-		printf("\nDump aborted\n");
-	else if (error == E2BIG || error == ENOSPC)
-		printf("\nDump failed. Partition too small.\n");
-	else
-		printf("\n** DUMP FAILED (ERROR %d) **\n", error);
-	goto finish;
-}
-
-/*
- * Hibernate dump.
- *
- * All other processors and the scheduler must have been stopped.
- *
- * XXX - Factor this out with existing dump functions?
- */
-int
-dump_for_hibernate(const struct hibernate_save_cb *const hcb,
-    const struct hibernate_save_pcb *const hpcb,
-    const struct hibernate_attempt *const ha)
-{
-	struct dumperinfo *di;
-	int error = ENXIO;
-
-	/*
-	 * Exact K-6 consumption seam.  The current native HCB/PCB image has no
-	 * canonical 256-byte CB encoder, so it cannot encode ABI-1 offsets
-	 * 0x040 and 0x048 here without inventing K-6.  Keep the claimed tuple
-	 * attached to the writer call; K-6 must consume these exact fields.
-	 */
-	KASSERT(ha != NULL && ha->ha_arena_start != 0 &&
-	    ha->ha_arena_size != 0, ("%s: unclaimed arena", __func__));
-
-	/*
-	 * XXX - We would like that 'dumping' is not set, in case we panic while
-	 * dumping here, in which case we'd want a panic dump.  But currently we
-	 * can't, as the ada dump routine cannot work without it set.  Dumping
-	 * needs peculiar conditions to work, and at least for the time being,
-	 * we need to reproduce these here.
-	 */
-	++dumping;
-	/*
-	 * hibernate_writing is set and cleared by the K-5 stability barrier
-	 * (callout_hibernate_enter / callout_hibernate_exit) which brackets
-	 * the entire save window including this call.  Do not touch it here.
-	 */
-
-	/* XXX - Validity of 'dumper_configs' under SCHEDULER_STOPPED(). */
-	TAILQ_FOREACH(di, &dumper_configs, di_next) {
-		error = dumpsys_hibernate(di, hcb, hpcb);
-		switch (error) {
-		case 0:
-			goto finish;
-		case E2BIG:
-		case ENOSPC:
-			continue;
-		default:
-			/* Other errors considered as not recoverable. */
-			goto finish;
+		if (stream->hps_block_used == stream->hps_block_size) {
+			error = hibernate_provider_write_block(stream);
+			if (error != 0)
+				return (error);
 		}
 	}
 
-finish:
-	--dumping;
+	*crc = next_crc;
+	return (0);
+}
 
+static int
+hibernate_provider_stored_source(struct hibernate_provider_stream *stream,
+    uint64_t file_offset, uint64_t length, uint32_t *crc)
+{
+	struct hibernate_writer_workspace *workspace;
+	const struct hibernate_writer_run *run;
+	uint64_t end, object_end, source_offset;
+	size_t i;
+
+	workspace = stream->hps_workspace;
+	if (file_offset != stream->hps_logical_cursor ||
+	    __builtin_add_overflow(file_offset, length, &end))
+		return (EINVAL);
+
+	if (file_offset < workspace->hww_plan.hwp_prefix_length) {
+		if (end > workspace->hww_plan.hwp_prefix_length)
+			return (EINVAL);
+		return (hibernate_provider_append(stream,
+		    workspace->hww_prefix + file_offset, length, false, crc));
+	}
+
+	if (file_offset == workspace->hww_plan.hwp_image.hi_xsave_offset) {
+		if (__builtin_add_overflow(file_offset,
+			workspace->hww_plan.hwp_image.hi_xsave_length,
+			&object_end) ||
+		    end != object_end)
+			return (EINVAL);
+		return (hibernate_provider_append(stream, workspace->hww_xsave,
+		    length, false, crc));
+	}
+
+	for (i = 0; i < workspace->hww_plan.hwp_run_count; i++) {
+		run = &workspace->hww_runs[i];
+		if (__builtin_add_overflow(run->hwr_file_offset,
+			run->hwr_length, &object_end))
+			return (EOVERFLOW);
+		if (file_offset < run->hwr_file_offset || end > object_end)
+			continue;
+
+		source_offset = run->hwr_source_offset +
+		    (file_offset - run->hwr_file_offset);
+		if (!PHYS_IN_DMAP(source_offset) ||
+		    source_offset > dmaplimit ||
+		    length > dmaplimit - source_offset)
+			return (EFAULT);
+		return (hibernate_provider_append(stream,
+		    PHYS_TO_DMAP(source_offset), length, false, crc));
+	}
+
+	return (EINVAL);
+}
+
+static int
+hibernate_provider_write_stored(void *arg, uint64_t file_offset,
+    uint64_t length, uint32_t *crc)
+{
+	return (hibernate_provider_stored_source(arg, file_offset, length, crc));
+}
+
+static int
+hibernate_provider_write_zero(void *arg, uint64_t file_offset,
+    uint64_t length, uint32_t *crc)
+{
+	struct hibernate_provider_stream *stream;
+
+	stream = arg;
+	if (stream == NULL || file_offset != stream->hps_logical_cursor)
+		return (EINVAL);
+	return (hibernate_provider_append(stream, NULL, length, true, crc));
+}
+
+static int
+hibernate_provider_rewrite_crc(void *arg, uint64_t crc_offset,
+    uint32_t final_crc)
+{
+	struct hibernate_provider_stream *stream;
+	struct hibernate_writer_workspace *workspace;
+	uint64_t provider_offset;
+	size_t within;
+
+	stream = arg;
+	if (stream == NULL || !stream->hps_crc_block_valid ||
+	    crc_offset < stream->hps_crc_block_file_offset ||
+	    crc_offset + sizeof(final_crc) >
+	    stream->hps_crc_block_file_offset + stream->hps_block_size)
+		return (EINVAL);
+
+	workspace = stream->hps_workspace;
+	within = (size_t)(crc_offset - stream->hps_crc_block_file_offset);
+	le32enc(stream->hps_crc_block + within, final_crc);
+	workspace->hww_crc32c = final_crc;
+	if (stream->hps_pending == NULL)
+		return (EINVAL);
+	stream->hps_pending->hm_crc32c = final_crc;
+
+	if (__builtin_add_overflow(stream->hps_image_offset,
+		stream->hps_crc_block_file_offset, &provider_offset) ||
+	    provider_offset > OFF_MAX)
+		return (EOVERFLOW);
+	return (dump_write(stream->hps_dumper, stream->hps_crc_block,
+	    (off_t)provider_offset, stream->hps_block_size));
+}
+
+static int
+hibernate_provider_stream_image(void *arg)
+{
+	struct hibernate_provider_stream *stream;
+	int error;
+
+	stream = arg;
+	error = hibernate_writer_plan_stream(&stream->hps_workspace->hww_plan,
+	    hibernate_provider_write_stored, hibernate_provider_write_zero,
+	    hibernate_provider_rewrite_crc, stream);
+	if (error != 0)
+		return (error);
+	if (stream->hps_block_used != 0)
+		return (EINVAL);
+	if (stream->hps_logical_cursor !=
+	    stream->hps_workspace->hww_plan.hwp_image.hi_image_length)
+		return (EINVAL);
+	return (0);
+}
+
+static int
+hibernate_writer_plan_live(const struct hibernate_save_cb *hcb,
+    const struct hibernate_save_pcb *hpcb, struct hibernate_attempt *attempt,
+    const struct vm_phys_reservation *reservation,
+    struct hibernate_writer_workspace *workspace)
+{
+	struct hibernate_xsave_terminal terminal;
+	struct hibernate_writer_plan *plan;
+	uint64_t destination_pages, image_length, payload_start, xsave_end;
+	size_t run_count, i;
+	int error;
+
+	if (hcb == NULL || hpcb == NULL || attempt == NULL ||
+	    reservation == NULL || workspace == NULL ||
+	    workspace->hww_prefix == NULL || workspace->hww_xsave == NULL ||
+	    workspace->hww_runs == NULL ||
+	    workspace->hww_free_scratch == NULL ||
+	    workspace->hww_destination_intervals == NULL ||
+	    workspace->hww_xsave_terminal == NULL)
+		return (EINVAL);
+
+	error = hibernate_amd64_xsave_collect(workspace->hww_xsave,
+	    workspace->hww_xsave_capacity, &terminal);
+	if (error != 0)
+		return (error);
+	*workspace->hww_xsave_terminal = terminal;
+
+	error = hibernate_amd64_pcb_populate(hpcb, &terminal,
+	    &workspace->hww_pcb);
+	if (error != 0)
+		return (error);
+
+	error = hibernate_writer_runs_build(attempt, reservation,
+	    workspace->hww_free_scratch, workspace->hww_free_scratch_capacity,
+	    0, NULL, 0, &run_count);
+	if (error != 0)
+		return (error);
+	if (run_count == 0 || run_count > workspace->hww_runs_capacity ||
+	    run_count > workspace->hww_destination_capacity)
+		return (E2BIG);
+
+	error = hibernate_writer_payload_start(run_count, &payload_start);
+	if (error != 0)
+		return (error);
+	workspace->hww_pcb.hp_xsave_offset = payload_start;
+	if (__builtin_add_overflow(payload_start, terminal.hxt_length,
+		&xsave_end))
+		return (EOVERFLOW);
+
+	error = hibernate_writer_runs_build(attempt, reservation,
+	    workspace->hww_free_scratch, workspace->hww_free_scratch_capacity,
+	    xsave_end, workspace->hww_runs, workspace->hww_runs_capacity,
+	    &run_count);
+	if (error != 0)
+		return (error);
+
+	destination_pages = 0;
+	for (i = 0; i < run_count; i++) {
+		if (__builtin_add_overflow(destination_pages,
+			workspace->hww_runs[i].hwr_length / HIB_PAGE_SIZE,
+			&destination_pages))
+			return (EOVERFLOW);
+		workspace->hww_destination_intervals[i * 2] =
+		    workspace->hww_runs[i].hwr_destination;
+		workspace->hww_destination_intervals[i * 2 + 1] =
+		    workspace->hww_runs[i].hwr_destination +
+		    workspace->hww_runs[i].hwr_length;
+	}
+
+	if (__builtin_add_overflow(workspace->hww_runs[run_count - 1].
+		hwr_file_offset, workspace->hww_runs[run_count - 1].hwr_length,
+		&image_length))
+		return (EOVERFLOW);
+
+	bzero(&workspace->hww_cb, sizeof(workspace->hww_cb));
+	workspace->hww_cb.hc_magic = HIBERNATE_MARKER_MAGIC;
+	workspace->hww_cb.hc_version = HCB_VERSION;
+	workspace->hww_cb.hc_encoded_size = HIBERNATE_CB_ENCODED_SIZE;
+	workspace->hww_cb.hc_page_size = HIB_PAGE_SIZE;
+	workspace->hww_cb.hc_physmem_bytes = (uint64_t)physmem * PAGE_SIZE;
+	workspace->hww_cb.hc_image_length = image_length;
+	workspace->hww_cb.hc_source_vector_bytes =
+	    destination_pages * sizeof(uint64_t);
+	workspace->hww_cb.hc_arena_start = attempt->ha_arena_start;
+	workspace->hww_cb.hc_arena_size = attempt->ha_arena_size;
+	workspace->hww_cb.hc_facs_hardware_signature =
+	    hcb->hc_hardware_signature;
+	workspace->hww_cb.hc_restore_footprint_pages =
+	    hibernate_footprint_effective();
+	workspace->hww_cb.hc_copy_list_bound = destination_pages;
+
+	plan = &workspace->hww_plan;
+	bzero(plan, sizeof(*plan));
+	plan->hwp_prefix = workspace->hww_prefix;
+	plan->hwp_prefix_capacity = workspace->hww_prefix_capacity;
+	plan->hwp_runs = workspace->hww_runs;
+	plan->hwp_run_count = run_count;
+	error = hibernate_writer_plan_assemble(plan, &workspace->hww_cb,
+	    &workspace->hww_pcb);
+	if (error != 0)
+		return (error);
+
+	attempt->ha_dst_intervals = workspace->hww_destination_intervals;
+	attempt->ha_dst_count = run_count;
+	atomic_thread_fence_rel();
+	attempt->ha_dst_valid = true;
+	return (0);
+}
+
+int
+dump_for_hibernate(const struct hibernate_save_cb *hcb,
+    const struct hibernate_save_pcb *hpcb, struct hibernate_attempt *attempt,
+    const struct vm_phys_reservation *reservation,
+    struct hibernate_writer_workspace *workspace, bool *image_committed)
+{
+	struct hibernate_provider_stream stream;
+	struct hibernate_marker pending;
+	struct dumperinfo *di;
+	uint64_t image_offset, image_end, provider_end;
+	int error;
+
+	if (image_committed == NULL)
+		return (EINVAL);
+	*image_committed = false;
+	if (attempt == NULL || reservation == NULL || workspace == NULL ||
+	    attempt->ha_dumper == NULL)
+		return (EINVAL);
+
+	di = attempt->ha_dumper;
+	if (di->dumper == NULL || di->dumper_read == NULL ||
+	    di->dumper_flush == NULL || di->blocksize != DEV_BSIZE ||
+	    di->kdcomp != NULL || di->kdcrypto != NULL ||
+	    workspace->hww_io_buffer == NULL ||
+	    workspace->hww_io_capacity < 2 * di->blocksize)
+		return (EOPNOTSUPP);
+
+	error = hibernate_writer_plan_live(hcb, hpcb, attempt, reservation,
+	    workspace);
+	if (error != 0)
+		return (error);
+
+	if (di->mediaoffset < 0 || di->mediasize <= 0 ||
+	    __builtin_add_overflow((uint64_t)di->mediaoffset,
+		(uint64_t)di->mediasize, &provider_end) ||
+	    __builtin_add_overflow((uint64_t)di->mediaoffset,
+		HIBERNATE_METADATA_SIZE, &image_offset) ||
+	    __builtin_add_overflow(image_offset,
+		workspace->hww_plan.hwp_image.hi_image_length, &image_end))
+		return (EOVERFLOW);
+	if (image_end > provider_end)
+		return (ENOSPC);
+
+	bzero(&stream, sizeof(stream));
+	stream.hps_attempt = attempt;
+	stream.hps_workspace = workspace;
+	stream.hps_dumper = di;
+	stream.hps_image_offset = image_offset;
+	stream.hps_block_size = di->blocksize;
+	stream.hps_crc_block = workspace->hww_io_buffer + di->blocksize;
+	stream.hps_pending = &pending;
+	bzero(workspace->hww_io_buffer, workspace->hww_io_capacity);
+
+	bzero(&pending, sizeof(pending));
+	pending.hm_magic = HIBERNATE_MARKER_MAGIC;
+	pending.hm_version = HIBERNATE_MARKER_VERSION;
+	pending.hm_state = HIBERNATE_MARKER_STATE_PENDING;
+	pending.hm_image_offset = image_offset;
+	pending.hm_image_length =
+	    workspace->hww_plan.hwp_image.hi_image_length;
+
+	++dumping;
+	error = hibernate_commit_pending(attempt,
+	    hibernate_provider_stream_image, &stream, &pending,
+	    image_committed);
+	--dumping;
+	workspace->hww_image_committed = *image_committed;
 	return (error);
 }
 

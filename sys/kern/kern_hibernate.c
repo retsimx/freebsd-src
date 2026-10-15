@@ -2050,7 +2050,825 @@ hibernate_barrier_prepare(struct hibernate_attempt *ha,
 	return (0);
 }
 
+/*
+ * hib_vm_paddr_cmp: ascending vm_paddr_t comparator for qsort().
+ */
+static int
+hib_vm_paddr_cmp(const void *a, const void *b)
+{
+	vm_paddr_t pa, pb;
+
+	pa = *(const vm_paddr_t *)a;
+	pb = *(const vm_paddr_t *)b;
+	if (pa < pb)
+		return (-1);
+	if (pa > pb)
+		return (1);
+	return (0);
+}
+
+/*
+ * hibernate_writer_runs_build: see declaration in sys/sys/hibernate.h.
+ *
+ * Single forward merge pass: segments are walked in increasing physical
+ * address order (asserted non-overlapping and sorted as they are produced);
+ * the locked FREE reservation is pre-sorted into free_scratch and consumed
+ * with one monotonic cursor.  A destination page continues the open run
+ * only when it is exactly one page above the previous destination page,
+ * so a run closes at every FREE/arena exclusion and at every true gap
+ * between segments, but spans adjacent segments transparently.
+ */
+int
+hibernate_writer_runs_build(struct hibernate_attempt *ha,
+    const struct vm_phys_reservation *res, vm_paddr_t *free_scratch,
+    size_t free_scratch_capacity, uint64_t payload_cursor,
+    struct hibernate_writer_run *runs, size_t runs_capacity,
+    size_t *run_count_out)
+{
+	struct hibernate_writer_run *run;
+	vm_paddr_t arena_end, pa, seg_start, seg_end, last_seg_end;
+	vm_paddr_t run_start, prev_dest_pa;
+	uint64_t cursor, run_pages, run_bytes;
+	size_t free_idx, count, i;
+	int segind;
+	bool run_open;
+
+	if (run_count_out == NULL)
+		return (EINVAL);
+	*run_count_out = 0;
+
+	/*
+	 * runs == NULL (with runs_capacity == 0) is a dry-run count pass:
+	 * classification is identical, but no run is stored and runs_capacity
+	 * is never consulted.  Callers use this to size the real runs[]
+	 * array before a second, storing pass.  payload_cursor is ignored
+	 * in dry-run mode (file offsets are not meaningful without it).
+	 */
+	if (ha == NULL || res == NULL ||
+	    (runs == NULL) != (runs_capacity == 0))
+		return (EINVAL);
+	if (res->vr_count != 0 && free_scratch == NULL)
+		return (EINVAL);
+	if (res->vr_count > free_scratch_capacity)
+		return (EINVAL);
+	if (ha->ha_arena_size != 0 &&
+	    __builtin_add_overflow(ha->ha_arena_start, ha->ha_arena_size,
+		&arena_end))
+		return (EOVERFLOW);
+	if (ha->ha_arena_size == 0)
+		arena_end = 0;
+
+	for (i = 0; i < res->vr_count; i++)
+		free_scratch[i] = VM_PAGE_TO_PHYS(res->vr_pages[i].vrp_page);
+	if (res->vr_count > 1)
+		qsort(free_scratch, res->vr_count, sizeof(free_scratch[0]),
+		    hib_vm_paddr_cmp);
+
+	if (align_up_checked(payload_cursor, HIB_PAGE_SIZE, &cursor) != 0)
+		return (EOVERFLOW);
+
+	count = 0;
+	free_idx = 0;
+	run_open = false;
+	run_start = 0;
+	run_pages = 0;
+	prev_dest_pa = 0;
+	last_seg_end = 0;
+
+#define HIB_RUN_CLOSE()							\
+	do {								\
+		if (__builtin_mul_overflow(run_pages,			\
+			(uint64_t)HIB_PAGE_SIZE, &run_bytes))		\
+			return (EOVERFLOW);				\
+		if (runs != NULL) {					\
+			if (count >= runs_capacity)			\
+				return (E2BIG);				\
+			run = &runs[count];				\
+			run->hwr_destination = run_start;		\
+			run->hwr_file_offset = cursor;			\
+			run->hwr_length = run_bytes;			\
+			run->hwr_source = 0;				\
+			run->hwr_source_offset = (uint64_t)run_start;	\
+			if (__builtin_add_overflow(cursor, run_bytes,	\
+				&cursor))				\
+				return (EOVERFLOW);			\
+		}							\
+		count++;						\
+	} while (0)
+
+	for (segind = 0; segind < vm_phys_nsegs; segind++) {
+		seg_start = vm_phys_segs[segind].start;
+		seg_end = vm_phys_segs[segind].end;
+		if (seg_start >= seg_end)
+			return (EINVAL);
+		if (segind != 0 && seg_start < last_seg_end)
+			return (EINVAL);
+		last_seg_end = seg_end;
+
+		for (pa = seg_start; pa < seg_end; pa += HIB_PAGE_SIZE) {
+			bool excluded;
+
+			while (free_idx < res->vr_count &&
+			    free_scratch[free_idx] < pa)
+				free_idx++;
+			excluded = (free_idx < res->vr_count &&
+			    free_scratch[free_idx] == pa);
+			if (excluded)
+				free_idx++;
+			if (!excluded && arena_end != 0 &&
+			    pa >= ha->ha_arena_start && pa < arena_end)
+				excluded = true;
+
+			if (excluded) {
+				if (run_open) {
+					HIB_RUN_CLOSE();
+					run_open = false;
+				}
+				continue;
+			}
+
+			if (run_open &&
+			    pa == prev_dest_pa + HIB_PAGE_SIZE) {
+				run_pages++;
+			} else {
+				if (run_open)
+					HIB_RUN_CLOSE();
+				run_open = true;
+				run_start = pa;
+				run_pages = 1;
+			}
+			prev_dest_pa = pa;
+		}
+	}
+
+	if (run_open)
+		HIB_RUN_CLOSE();
+
+#undef HIB_RUN_CLOSE
+
+	*run_count_out = count;
+	return (0);
+}
+
 #endif /* !_HIBERNATE_USERLAND_BUILD */
+
+/*
+ * Encode the fixed ABI 1 control block into its canonical little-endian wire
+ * representation.  The complete destination is cleared first, so every
+ * reserved byte and the high half of hc_crc32c remain zero.
+ *
+ * The initial image stream always carries eight zero CRC bytes.  K-6 rewrites
+ * only the low four bytes after completing whole-image CRC calculation.
+ */
+int
+hibernate_cb_encode(uint8_t *buf, size_t len, const struct hibernate_cb *cb)
+{
+	if (buf == NULL || cb == NULL || len != HIBERNATE_CB_ENCODED_SIZE)
+		return (EINVAL);
+	if (cb->hc_version != HCB_VERSION ||
+	    cb->hc_encoded_size != HIBERNATE_CB_ENCODED_SIZE ||
+	    cb->hc_page_size != HIB_PAGE_SIZE ||
+	    cb->hc_machine_flags != 0 ||
+	    cb->hc_saved_pcb_size != HIBERNATE_PCB_ENCODED_SIZE ||
+	    cb->hc_payload_start == 0 ||
+	    cb->hc_payload_start > 64029 ||
+	    cb->hc_payload_start > HIBERNATE_META_BUF_MAX ||
+	    cb->hc_metadata_length != cb->hc_payload_start ||
+	    cb->hc_payload_start > cb->hc_image_length)
+		return (EINVAL);
+
+	__builtin_memset(buf, 0, HIBERNATE_CB_ENCODED_SIZE);
+	le64enc(buf + HIBERNATE_CB_OFF_MAGIC, cb->hc_magic);
+	le32enc(buf + HIBERNATE_CB_OFF_VERSION, cb->hc_version);
+	le32enc(buf + HIBERNATE_CB_OFF_ENCODED_SIZE, cb->hc_encoded_size);
+	le64enc(buf + HIBERNATE_CB_OFF_PAGE_SIZE, cb->hc_page_size);
+	le64enc(buf + HIBERNATE_CB_OFF_PHYSMEM_BYTES,
+	    cb->hc_physmem_bytes);
+	le64enc(buf + HIBERNATE_CB_OFF_IMAGE_LENGTH,
+	    cb->hc_image_length);
+	le64enc(buf + HIBERNATE_CB_OFF_PAYLOAD_START,
+	    cb->hc_payload_start);
+	le64enc(buf + HIBERNATE_CB_OFF_DESTINATION_PAGES,
+	    cb->hc_destination_pages);
+	le64enc(buf + HIBERNATE_CB_OFF_SOURCE_VECTOR_BYTES,
+	    cb->hc_source_vector_bytes);
+	le64enc(buf + HIBERNATE_CB_OFF_ARENA_START, cb->hc_arena_start);
+	le64enc(buf + HIBERNATE_CB_OFF_ARENA_SIZE, cb->hc_arena_size);
+	le64enc(buf + HIBERNATE_CB_OFF_FACS_HARDWARE_SIGNATURE,
+	    cb->hc_facs_hardware_signature);
+	le64enc(buf + HIBERNATE_CB_OFF_SAVED_PCB_OFFSET,
+	    cb->hc_saved_pcb_offset);
+	le64enc(buf + HIBERNATE_CB_OFF_SAVED_PCB_SIZE,
+	    cb->hc_saved_pcb_size);
+	le64enc(buf + HIBERNATE_CB_OFF_ELF_PHNUM, cb->hc_elf_phnum);
+	le64enc(buf + HIBERNATE_CB_OFF_METADATA_LENGTH,
+	    cb->hc_metadata_length);
+	/*
+	 * HIBERNATE_CB_WIDTH_CRC32C is eight bytes.  Both halves stay zero
+	 * during the forward stream, irrespective of the host-order field.
+	 */
+	le64enc(buf + HIBERNATE_CB_OFF_RESTORE_FOOTPRINT_PAGES,
+	    cb->hc_restore_footprint_pages);
+	le64enc(buf + HIBERNATE_CB_OFF_MACHINE_FLAGS,
+	    cb->hc_machine_flags);
+	le64enc(buf + HIBERNATE_CB_OFF_DESTINATION_BYTES,
+	    cb->hc_destination_bytes);
+	le64enc(buf + HIBERNATE_CB_OFF_COPY_LIST_BOUND,
+	    cb->hc_copy_list_bound);
+	return (0);
+}
+
+/*
+ * Derive the exact standard-format XSAVE extent from an enabled XCR0 mask and
+ * synthetic CPUID leaf 0xD component facts.
+ *
+ * The architectural legacy region and XSAVE header occupy the first 576
+ * bytes.  Each enabled component numbered 2 or above must have exactly one
+ * nonempty fact.  Disabled, duplicate, legacy-region, out-of-mask and
+ * unrepresentable facts are rejected rather than ignored.
+ */
+int
+hibernate_xsave_extent(uint64_t enabled_mask,
+    const struct hibernate_xsave_component_fact *facts, size_t fact_count,
+    uint32_t *extentp)
+{
+	const struct hibernate_xsave_component_fact *fact;
+	uint64_t bit, seen;
+	uint32_t end, extent;
+	size_t i;
+
+	if (extentp == NULL)
+		return (EINVAL);
+	*extentp = 0;
+
+	if ((enabled_mask & HIBERNATE_XCR0_REQUIRED_MASK) !=
+	    HIBERNATE_XCR0_REQUIRED_MASK ||
+	    (enabled_mask & ~HIBERNATE_XCR0_SUPPORTED_MASK) != 0)
+		return (EINVAL);
+	if (fact_count != 0 && facts == NULL)
+		return (EINVAL);
+
+	extent = HIBERNATE_PCB_XSAVE_MIN;
+	seen = 0;
+	for (i = 0; i < fact_count; i++) {
+		fact = &facts[i];
+		if (fact->hxcf_component < 2 ||
+		    fact->hxcf_component >= 64 ||
+		    fact->hxcf_size == 0)
+			return (EINVAL);
+
+		bit = UINT64_C(1) << fact->hxcf_component;
+		if ((enabled_mask & bit) == 0 || (seen & bit) != 0)
+			return (EINVAL);
+		if (fact->hxcf_offset < HIBERNATE_PCB_XSAVE_MIN)
+			return (EINVAL);
+		if (__builtin_add_overflow(fact->hxcf_offset,
+			fact->hxcf_size, &end))
+			return (EOVERFLOW);
+
+		seen |= bit;
+		if (end > extent)
+			extent = end;
+	}
+
+	/*
+	 * Components 0 and 1 are represented by the fixed legacy region.
+	 * Every other enabled component must have exactly one supplied fact.
+	 */
+	if (seen !=
+	    (enabled_mask & ~HIBERNATE_XCR0_REQUIRED_MASK))
+		return (EINVAL);
+
+	*extentp = extent;
+	return (0);
+}
+
+/*
+ * Encode the fixed ABI 1 amd64 PCB descriptor.  XSAVE bytes are not inline:
+ * one standard-format, 64-byte-aligned payload object is described here and
+ * emitted separately by the portable writer.
+ */
+int
+hibernate_pcb_encode(uint8_t *buf, size_t len,
+    const struct hibernate_pcb *pcb)
+{
+	uint64_t required;
+
+	if (buf == NULL || pcb == NULL ||
+	    len != HIBERNATE_PCB_ENCODED_SIZE)
+		return (EINVAL);
+	if (pcb->hp_version != 1 ||
+	    pcb->hp_encoded_size != HIBERNATE_PCB_ENCODED_SIZE)
+		return (EINVAL);
+	if ((pcb->hp_xcr0 & ~HIBERNATE_XCR0_SUPPORTED_MASK) != 0)
+		return (EINVAL);
+	required = HIBERNATE_XCR0_REQUIRED_MASK;
+	if ((pcb->hp_xcr0 & required) != required ||
+	    pcb->hp_xsave_enabled_mask != pcb->hp_xcr0)
+		return (EINVAL);
+	if (pcb->hp_xsave_format != HIBERNATE_XSAVE_FORMAT ||
+	    pcb->hp_xsave_length < HIBERNATE_PCB_XSAVE_MIN ||
+	    pcb->hp_xsave_offset == 0 ||
+	    (pcb->hp_xsave_offset &
+		(HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
+		return (EINVAL);
+
+	__builtin_memset(buf, 0, HIBERNATE_PCB_ENCODED_SIZE);
+	le32enc(buf + HIBERNATE_PCB_OFF_VERSION, pcb->hp_version);
+	le32enc(buf + HIBERNATE_PCB_OFF_ENCODED_SIZE,
+	    pcb->hp_encoded_size);
+	le64enc(buf + HIBERNATE_PCB_OFF_CR0, pcb->hp_cr0);
+	le64enc(buf + HIBERNATE_PCB_OFF_CR3, pcb->hp_cr3);
+	le64enc(buf + HIBERNATE_PCB_OFF_CR4, pcb->hp_cr4);
+	le64enc(buf + HIBERNATE_PCB_OFF_EFER, pcb->hp_efer);
+	le64enc(buf + HIBERNATE_PCB_OFF_PAT, pcb->hp_pat);
+	le64enc(buf + HIBERNATE_PCB_OFF_XCR0, pcb->hp_xcr0);
+	le64enc(buf + HIBERNATE_PCB_OFF_RFLAGS, pcb->hp_rflags);
+	le64enc(buf + HIBERNATE_PCB_OFF_RSP, pcb->hp_rsp);
+	le64enc(buf + HIBERNATE_PCB_OFF_RIP, pcb->hp_rip);
+	le64enc(buf + HIBERNATE_PCB_OFF_R12_PCB_PA,
+	    pcb->hp_r12_pcb_pa);
+	le16enc(buf + HIBERNATE_PCB_OFF_GDTR_LIMIT,
+	    pcb->hp_gdtr_limit);
+	le64enc(buf + HIBERNATE_PCB_OFF_GDTR_BASE,
+	    pcb->hp_gdtr_base);
+	le16enc(buf + HIBERNATE_PCB_OFF_IDTR_LIMIT,
+	    pcb->hp_idtr_limit);
+	le64enc(buf + HIBERNATE_PCB_OFF_IDTR_BASE,
+	    pcb->hp_idtr_base);
+	le64enc(buf + HIBERNATE_PCB_OFF_FSBASE, pcb->hp_fsbase);
+	le64enc(buf + HIBERNATE_PCB_OFF_GSBASE, pcb->hp_gsbase);
+	le64enc(buf + HIBERNATE_PCB_OFF_KGSBASE, pcb->hp_kgsbase);
+	le64enc(buf + HIBERNATE_PCB_OFF_STAR, pcb->hp_star);
+	le64enc(buf + HIBERNATE_PCB_OFF_LSTAR, pcb->hp_lstar);
+	le64enc(buf + HIBERNATE_PCB_OFF_CSTAR, pcb->hp_cstar);
+	le64enc(buf + HIBERNATE_PCB_OFF_SFMASK, pcb->hp_sfmask);
+	le64enc(buf + HIBERNATE_PCB_OFF_KERNEL_GSBASE,
+	    pcb->hp_kernel_gsbase);
+	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_LENGTH,
+	    pcb->hp_xsave_length);
+	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_FORMAT,
+	    pcb->hp_xsave_format);
+	le64enc(buf + HIBERNATE_PCB_OFF_XSAVE_OFFSET,
+	    pcb->hp_xsave_offset);
+	le64enc(buf + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
+	    pcb->hp_xsave_enabled_mask);
+	return (0);
+}
+
+/*
+ * Encode one ELF64 program header without relying on a native ELF layout.
+ */
+static void
+hibernate_writer_phdr_encode(uint8_t *ph, uint32_t type, uint64_t offset,
+    uint64_t filesz, uint64_t paddr, uint64_t alignment)
+{
+	__builtin_memset(ph, 0, PHDR_SIZE);
+	le32enc(ph + PHDR_OFF_P_TYPE, type);
+	le64enc(ph + PHDR_OFF_P_OFFSET, offset);
+	le64enc(ph + PHDR_OFF_P_PADDR, paddr);
+	le64enc(ph + PHDR_OFF_P_FILESZ, filesz);
+	le64enc(ph + PHDR_OFF_P_MEMSZ, filesz);
+	le64enc(ph + 48, alignment);
+}
+
+/*
+ * hibernate_writer_payload_start: see declaration in sys/sys/hibernate.h.
+ * Shares the exact prefix-geometry arithmetic hibernate_writer_plan_assemble()
+ * performs, so a caller computing run file offsets before assembly cannot
+ * drift from what assembly itself will require.
+ */
+int
+hibernate_writer_payload_start(size_t run_count, uint64_t *payload_start_out)
+{
+	uint64_t phdr_bytes, phdr_end, cb_offset, cb_end;
+	uint64_t pcb_offset, pcb_end, payload_start;
+	uint64_t phnum64;
+	int error;
+
+	if (payload_start_out == NULL)
+		return (EINVAL);
+	*payload_start_out = 0;
+	if (run_count == 0 || run_count > HIBERNATE_MAX_PHDRS - 3)
+		return (EINVAL);
+
+	if (__builtin_add_overflow((uint64_t)run_count, UINT64_C(3),
+		&phnum64) ||
+	    phnum64 > HIBERNATE_MAX_PHDRS || phnum64 > UINT16_MAX)
+		return (EOVERFLOW);
+	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE,
+		&phdr_bytes) ||
+	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes,
+		&phdr_end))
+		return (EOVERFLOW);
+	if (phdr_end > 50464)
+		return (E2BIG);
+
+	error = align_up_checked(phdr_end, HIB_PAGE_SIZE, &cb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(cb_offset,
+		(uint64_t)HIBERNATE_CB_ENCODED_SIZE, &cb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(cb_end, HIB_PAGE_SIZE, &pcb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(pcb_offset,
+		(uint64_t)HIBERNATE_PCB_ENCODED_SIZE, &pcb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(pcb_end, HIB_PAGE_SIZE, &payload_start);
+	if (error != 0)
+		return (error);
+	if (payload_start == 0 || payload_start > 64029 ||
+	    payload_start > HIBERNATE_META_BUF_MAX)
+		return (E2BIG);
+
+	*payload_start_out = payload_start;
+	return (0);
+}
+
+/*
+ * Assemble and self-decode the immutable ABI 1 writer plan.
+ *
+ * The caller supplies the exact intended payload file offsets.  Requiring
+ * each object to begin at the cursor's canonical aligned position detects
+ * omitted gaps, interleaving, backward motion, and duplicate slices before
+ * any provider operation can begin.
+ */
+int
+hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
+    const struct hibernate_cb *input_cb,
+    const struct hibernate_pcb *input_pcb)
+{
+	struct hibernate_cb cb;
+	struct hibernate_pcb pcb;
+	struct hibernate_image image;
+	const struct hibernate_writer_run *run, *other;
+	uint8_t *prefix, *ph;
+	uint64_t phdr_bytes, phdr_end, cb_offset, cb_end;
+	uint64_t pcb_offset, pcb_end, payload_start;
+	uint64_t cursor, image_length, destination_bytes;
+	uint64_t destination_pages, destination_end, arena_end;
+	uint64_t source_end, other_source_end, xsave_end;
+	uint64_t phnum64;
+	uint16_t phnum;
+	size_t i, j;
+	int error;
+
+	if (plan == NULL || input_cb == NULL || input_pcb == NULL)
+		return (EINVAL);
+	plan->hwp_prefix_length = 0;
+	__builtin_memset(&plan->hwp_image, 0, sizeof(plan->hwp_image));
+	__builtin_memset(&plan->hwp_iterator, 0, sizeof(plan->hwp_iterator));
+
+	if (plan->hwp_prefix == NULL ||
+	    (plan->hwp_run_count != 0 && plan->hwp_runs == NULL) ||
+	    plan->hwp_run_count == 0 ||
+	    plan->hwp_run_count > HIBERNATE_MAX_PHDRS - 3)
+		return (EINVAL);
+
+	if (__builtin_add_overflow((uint64_t)plan->hwp_run_count,
+		UINT64_C(3), &phnum64) ||
+	    phnum64 > HIBERNATE_MAX_PHDRS || phnum64 > UINT16_MAX)
+		return (EOVERFLOW);
+	phnum = (uint16_t)phnum64;
+
+	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE,
+		&phdr_bytes) ||
+	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes,
+		&phdr_end))
+		return (EOVERFLOW);
+	if (phdr_end > 50464)
+		return (E2BIG);
+
+	error = align_up_checked(phdr_end, HIB_PAGE_SIZE, &cb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(cb_offset,
+		(uint64_t)HIBERNATE_CB_ENCODED_SIZE, &cb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(cb_end, HIB_PAGE_SIZE, &pcb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(pcb_offset,
+		(uint64_t)HIBERNATE_PCB_ENCODED_SIZE, &pcb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(pcb_end, HIB_PAGE_SIZE, &payload_start);
+	if (error != 0)
+		return (error);
+	if (payload_start == 0 || payload_start > 64029 ||
+	    payload_start > HIBERNATE_META_BUF_MAX ||
+	    payload_start > plan->hwp_prefix_capacity)
+		return (E2BIG);
+
+	cb = *input_cb;
+	pcb = *input_pcb;
+	destination_bytes = 0;
+	destination_pages = 0;
+	destination_end = 0;
+
+	if (__builtin_add_overflow(cb.hc_arena_start, cb.hc_arena_size,
+		&arena_end))
+		return (EOVERFLOW);
+
+	cursor = payload_start;
+	if (pcb.hp_xsave_length < HIBERNATE_PCB_XSAVE_MIN)
+		return (EINVAL);
+	if (pcb.hp_xsave_offset != cursor ||
+	    (pcb.hp_xsave_offset &
+		(HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(cursor, pcb.hp_xsave_length, &xsave_end))
+		return (EOVERFLOW);
+	cursor = xsave_end;
+
+	for (i = 0; i < plan->hwp_run_count; i++) {
+		run = &plan->hwp_runs[i];
+		if (run->hwr_length == 0 ||
+		    (run->hwr_destination & (HIB_PAGE_SIZE - 1)) != 0 ||
+		    (run->hwr_file_offset & (HIB_PAGE_SIZE - 1)) != 0 ||
+		    (run->hwr_length & (HIB_PAGE_SIZE - 1)) != 0)
+			return (EINVAL);
+
+		error = align_up_checked(cursor, HIB_PAGE_SIZE, &cursor);
+		if (error != 0)
+			return (error);
+		if (run->hwr_file_offset != cursor)
+			return (EINVAL);
+		if (i != 0 && run->hwr_destination < destination_end)
+			return (EINVAL);
+		if (__builtin_add_overflow(run->hwr_destination,
+			run->hwr_length, &destination_end))
+			return (EOVERFLOW);
+
+		if (cb.hc_arena_size != 0 &&
+		    run->hwr_destination < arena_end &&
+		    destination_end > cb.hc_arena_start)
+			return (EINVAL);
+
+		if (__builtin_add_overflow(run->hwr_source_offset,
+			run->hwr_length, &source_end))
+			return (EOVERFLOW);
+		for (j = 0; j < i; j++) {
+			other = &plan->hwp_runs[j];
+			if (run->hwr_source != other->hwr_source)
+				continue;
+			if (__builtin_add_overflow(other->hwr_source_offset,
+				other->hwr_length, &other_source_end))
+				return (EOVERFLOW);
+			if (run->hwr_source_offset < other_source_end &&
+			    source_end > other->hwr_source_offset)
+				return (EINVAL);
+		}
+
+		if (__builtin_add_overflow(destination_bytes,
+			run->hwr_length, &destination_bytes) ||
+		    __builtin_add_overflow(destination_pages,
+			run->hwr_length / HIB_PAGE_SIZE,
+			&destination_pages) ||
+		    __builtin_add_overflow(cursor, run->hwr_length,
+			&cursor))
+			return (EOVERFLOW);
+	}
+	image_length = cursor;
+	if (input_cb->hc_image_length != image_length ||
+	    payload_start > image_length)
+		return (EINVAL);
+
+	cb.hc_payload_start = payload_start;
+	cb.hc_metadata_length = payload_start;
+	cb.hc_saved_pcb_offset = pcb_offset;
+	cb.hc_saved_pcb_size = HIBERNATE_PCB_ENCODED_SIZE;
+	cb.hc_elf_phnum = phnum;
+	cb.hc_destination_pages = destination_pages;
+	cb.hc_destination_bytes = destination_bytes;
+	cb.hc_crc32c = 0;
+
+	prefix = plan->hwp_prefix;
+	__builtin_memset(prefix, 0, payload_start);
+	prefix[EHDR_OFF_EI_MAG0] = ELFMAG0;
+	prefix[EHDR_OFF_EI_MAG1] = ELFMAG1;
+	prefix[EHDR_OFF_EI_MAG2] = ELFMAG2;
+	prefix[EHDR_OFF_EI_MAG3] = ELFMAG3;
+	prefix[EHDR_OFF_EI_CLASS] = ELFCLASS64;
+	prefix[EHDR_OFF_EI_DATA] = ELFDATA2LSB;
+	prefix[EHDR_OFF_EI_VERSION] = EV_CURRENT;
+	le16enc(prefix + EHDR_OFF_E_TYPE, ET_FREEBSD_HIBERNATE_IMAGE);
+	le16enc(prefix + EHDR_OFF_E_MACHINE, EM_X86_64);
+	le32enc(prefix + EHDR_OFF_E_VERSION, EV_CURRENT);
+	le64enc(prefix + EHDR_OFF_E_PHOFF, EHDR_SIZE);
+	le16enc(prefix + EHDR_OFF_E_EHSIZE, EHDR_SIZE);
+	le16enc(prefix + EHDR_OFF_E_PHENTSIZE, PHDR_SIZE);
+	le16enc(prefix + EHDR_OFF_E_PHNUM, phnum);
+
+	ph = prefix + EHDR_SIZE;
+	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_CB,
+	    cb_offset, HIBERNATE_CB_ENCODED_SIZE, 0,
+	    HIBERNATE_CB_ALIGNMENT);
+	ph += PHDR_SIZE;
+	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_PCB,
+	    pcb_offset, HIBERNATE_PCB_ENCODED_SIZE, 0,
+	    HIBERNATE_PCB_ALIGNMENT);
+	ph += PHDR_SIZE;
+	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_XSAVE,
+	    pcb.hp_xsave_offset, pcb.hp_xsave_length, 0,
+	    HIBERNATE_PCB_ALIGNMENT);
+	ph += PHDR_SIZE;
+	for (i = 0; i < plan->hwp_run_count; i++) {
+		run = &plan->hwp_runs[i];
+		hibernate_writer_phdr_encode(ph, PT_LOAD,
+		    run->hwr_file_offset, run->hwr_length,
+		    run->hwr_destination, HIB_PAGE_SIZE);
+		ph += PHDR_SIZE;
+	}
+
+	error = hibernate_cb_encode(prefix + cb_offset,
+	    HIBERNATE_CB_ENCODED_SIZE, &cb);
+	if (error != 0)
+		return (error);
+	error = hibernate_pcb_encode(prefix + pcb_offset,
+	    HIBERNATE_PCB_ENCODED_SIZE, &pcb);
+	if (error != 0)
+		return (error);
+
+	error = hibernate_image_decode(prefix, (size_t)payload_start, &image);
+	if (error != 0)
+		return (error);
+	if (image.hi_phnum != phnum ||
+	    image.hi_load_count != plan->hwp_run_count ||
+	    image.hi_payload_start != payload_start ||
+	    image.hi_image_length != image_length ||
+	    image.hi_destination_bytes != destination_bytes ||
+	    image.hi_destination_pages != destination_pages ||
+	    image.hi_xsave_offset != pcb.hp_xsave_offset ||
+	    image.hi_xsave_length != pcb.hp_xsave_length)
+		return (EINVAL);
+
+	plan->hwp_prefix_length = (size_t)payload_start;
+	plan->hwp_image = image;
+	plan->hwp_iterator.hii_image = &plan->hwp_image;
+	plan->hwp_iterator.hii_phase = HIIP_METADATA;
+	return (0);
+}
+
+/*
+ * Forward-only seam for the later provider-streaming chunk.
+ */
+int
+hibernate_writer_plan_interval_next(struct hibernate_writer_plan *plan,
+    struct hibernate_image_interval *interval)
+{
+	if (plan == NULL || interval == NULL ||
+	    plan->hwp_prefix_length == 0 ||
+	    plan->hwp_iterator.hii_image != &plan->hwp_image)
+		return (EINVAL);
+	return (hibernate_image_interval_next(&plan->hwp_iterator, interval));
+}
+
+/*
+ * hibernate_writer_plan_stream: the task-4 forward-stream driver.
+ *
+ * hibernate_writer_plan_interval_next() is the sole source of coverage
+ * intervals; this function performs no phdr reparse and builds no second
+ * interval plan.  Each interval is dispatched to exactly one of
+ * write_stored/write_zero in strictly increasing file-offset order (the
+ * iterator itself already enforces forward-only, non-overlapping,
+ * gap-complete coverage).  The running CRC is threaded through *crc by
+ * value across calls: each callback receives the CRC accumulated so far,
+ * folds in its own logical bytes only after they are confirmed complete,
+ * and returns the updated value through the same pointer.  A callback
+ * that fails leaves the CRC and the iterator cursor exactly as they were
+ * before the call, so no partial interval can be double-counted on a
+ * caller-level retry of the whole stream (there is none: a single failed
+ * interval aborts the entire stream, per the K-6 transaction contract).
+ *
+ * After the iterator reports ENOENT, the cursor must equal
+ * hi_image_length exactly; any other cursor value is an uncovered or
+ * over-covered image and is refused.  The CRC is then finalized with the
+ * closing XOR 0xffffffff and passed, together with the image-relative
+ * offset of the low half of hc_crc32c (hi_crc_zero_offset), to exactly
+ * one call to rewrite().  No byte outside that bounded four-byte field is
+ * touched by this function.
+ */
+int
+hibernate_writer_plan_stream(struct hibernate_writer_plan *plan,
+    hibernate_writer_write_t *write_stored, hibernate_writer_zero_t *write_zero,
+    hibernate_writer_rewrite_t *rewrite, void *arg)
+{
+	struct hibernate_image_interval interval;
+	uint32_t crc;
+	int error;
+
+	if (plan == NULL || write_stored == NULL || write_zero == NULL ||
+	    rewrite == NULL)
+		return (EINVAL);
+
+	crc = 0xffffffffU;
+	for (;;) {
+		struct hibernate_image_iterator checkpoint;
+		uint32_t checkpoint_crc;
+
+		/*
+		 * interval_next() advances before the logical callback runs.
+		 * Snapshot the complete iterator and CRC so a failed logical write
+		 * remains retryable from the last completed boundary.
+		 */
+		checkpoint = plan->hwp_iterator;
+		checkpoint_crc = crc;
+		error = hibernate_writer_plan_interval_next(plan, &interval);
+		if (error == ENOENT)
+			break;
+		if (error != 0)
+			return (error);
+		if (interval.hii_length == 0) {
+			plan->hwp_iterator = checkpoint;
+			return (EINVAL);
+		}
+
+		if (interval.hii_class == HIIC_STORED)
+			error = write_stored(arg, interval.hii_offset,
+			    interval.hii_length, &crc);
+		else
+			error = write_zero(arg, interval.hii_offset,
+			    interval.hii_length, &crc);
+		if (error != 0) {
+			plan->hwp_iterator = checkpoint;
+			crc = checkpoint_crc;
+			return (error);
+		}
+	}
+
+	if (plan->hwp_iterator.hii_cursor != plan->hwp_image.hi_image_length)
+		return (EINVAL);
+
+	crc ^= 0xffffffffU;
+	return (rewrite(arg, plan->hwp_image.hi_crc_zero_offset, crc));
+}
+
+/*
+ * Execute the K-6 durable-PENDING transaction around one already-planned image
+ * operation.  The image callback owns dump start, forward streaming, and the
+ * bounded CRC rewrite.  This helper owns only the durability order:
+ *
+ *   clear, clear flush, image operation, image flush,
+ *   PENDING write, PENDING flush.
+ *
+ * image_committed is cleared before any operation and becomes true only after
+ * the final PENDING flush succeeds.  Thus every callback, write, and flush
+ * failure leaves the S4 gate closed.
+ */
+int
+hibernate_commit_pending(struct hibernate_attempt *ha,
+    hibernate_image_write_t *write_image, void *write_arg,
+    const struct hibernate_marker *pending, bool *image_committed)
+{
+	int error;
+
+	if (image_committed == NULL)
+		return (EINVAL);
+	*image_committed = false;
+
+	if (ha == NULL || write_image == NULL || pending == NULL)
+		return (EINVAL);
+	if (pending->hm_magic != HIBERNATE_MARKER_MAGIC ||
+	    pending->hm_version != HIBERNATE_MARKER_VERSION ||
+	    pending->hm_state != HIBERNATE_MARKER_STATE_PENDING)
+		return (EINVAL);
+
+	error = hibernate_marker_clear(ha);
+	if (error != 0)
+		return (error);
+	error = hibernate_marker_flush(ha);
+	if (error != 0)
+		return (error);
+
+	error = write_image(write_arg);
+	if (error != 0)
+		return (error);
+	error = hibernate_marker_flush(ha);
+	if (error != 0)
+		return (error);
+
+	error = hibernate_marker_write(ha, pending);
+	if (error != 0)
+		return (error);
+	error = hibernate_marker_flush(ha);
+	if (error != 0)
+		return (error);
+
+	*image_committed = true;
+	return (0);
+}
+
+/*
+ * Pure fail-closed predicate shared by the ACPI gate and host fixtures.
+ * Only a successfully flushed PENDING marker may supply true.
+ */
+bool
+hibernate_s4_commit_gate(bool image_committed)
+{
+	return (image_committed);
+}
 
 /*
  * decode_cb: decode and validate the CB from buf at cb_offset.

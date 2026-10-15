@@ -216,17 +216,23 @@ EVENTHANDLER_DECLARE(livedumper_finish, livedump_finish_fn);
 struct hibernate_attempt;
 struct hibernate_save_cb;
 struct hibernate_save_pcb;
+struct hibernate_writer_workspace;
+struct vm_phys_reservation;
 
 int dumpsys_hibernate_create_hcb(uint64_t _hardware_signature,
     struct hibernate_save_cb **_hcb_out);
 void dumpsys_hibernate_free_hcb(struct hibernate_save_cb *);
+
 /*
- * K-9/K-6 seam: ha owns the immutable early arena.  The canonical K-6
- * writer must encode ha_arena_start and ha_arena_size at ABI-1 CB offsets
- * 0x040 and 0x048 respectively.  This native writer predates that encoder.
+ * Build and commit one canonical ABI-1 image through the attempt-bound
+ * dumper.  All workspace storage is caller-owned and preallocated.
+ * image_committed is false on entry and becomes true only after the durable
+ * PENDING flush succeeds.
  */
 int dump_for_hibernate(const struct hibernate_save_cb *,
-    const struct hibernate_save_pcb *, const struct hibernate_attempt *);
+    const struct hibernate_save_pcb *, struct hibernate_attempt *,
+    const struct vm_phys_reservation *, struct hibernate_writer_workspace *,
+    bool *);
 #endif /* OS_HIBERNATE_SUPPORT */
 
 #endif /* _KERNEL */
