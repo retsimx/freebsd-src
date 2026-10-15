@@ -99,6 +99,35 @@ void hibernate_resume_tramp(void);
 extern uint32_t hibernate_resume_tramp_size;
 extern uint64_t hibernate_tramp_cr3;
 
+/*
+ * K-6: live amd64 XSAVE fact collection and canonical PCB population.
+ *
+ * hibernate_amd64_xsave_collect() validates the live XCR0 against
+ * HIBERNATE_XCR0_SUPPORTED_MASK (fail closed on any unsupported or
+ * inconsistent bit), derives the exact standard-format extent via
+ * hibernate_xsave_extent() fed by live CPUID leaf 0xD facts, and captures
+ * the complete non-compacted XSAVE image into the caller's 64-byte-aligned
+ * preallocated buffer.  No allocation occurs; buf/buf_capacity must already
+ * satisfy the derived extent.  Returns 0 on success with *out populated
+ * (hxt_staged_address == buf, hxt_length == derived extent, hxt_enabled_mask
+ * == live XCR0, hxt_format == HIBERNATE_XSAVE_FORMAT), EINVAL on
+ * unsupported/inconsistent XCR0 or a misaligned/undersized buffer, or the
+ * error propagated from hibernate_xsave_extent().
+ */
+int hibernate_amd64_xsave_collect(void *buf, size_t buf_capacity,
+    struct hibernate_xsave_terminal *out);
+
+/*
+ * hibernate_amd64_pcb_populate: populate every host-order canonical PCB
+ * field from the saved machine context (hpcb), the live control/MSR/
+ * descriptor-table state, and the already-captured XSAVE terminal
+ * descriptor (xt).  Does not encode; the caller passes *pcb to
+ * hibernate_pcb_encode().  Returns 0 on success, EINVAL on a null
+ * argument or an xt that fails hibernate_pcb_encode()'s own checks.
+ */
+int hibernate_amd64_pcb_populate(const struct hibernate_save_pcb *hpcb,
+    const struct hibernate_xsave_terminal *xt, struct hibernate_pcb *pcb);
+
 #endif
 
 

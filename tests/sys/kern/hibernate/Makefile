@@ -22,6 +22,7 @@ ATF_TESTS_C+=	hibernate_classify_test
 ATF_TESTS_C+=	hibernate_dump_extent_test
 ATF_TESTS_C+=	hibernate_format_test
 ATF_TESTS_C+=	hibernate_marker_test
+ATF_TESTS_C+=	hibernate_writer_test
 
 SRCS.hibernate_arena_test+=	hibernate_arena_test.c
 SRCS.hibernate_arena_test+=	kern_hibernate.c
@@ -39,6 +40,9 @@ SRCS.hibernate_format_test+=	kern_hibernate.c
 
 SRCS.hibernate_marker_test+=	hibernate_marker_test.c
 SRCS.hibernate_marker_test+=	kern_hibernate.c
+
+SRCS.hibernate_writer_test+=	hibernate_writer_test.c
+SRCS.hibernate_writer_test+=	kern_hibernate.c
 
 # Pull in kern_hibernate.c and kern_dump.c from the kernel source tree.
 .PATH:	${SRCTOP}/sys/kern
@@ -62,6 +66,7 @@ CFLAGS.hibernate_capacity_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_classify_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_format_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_marker_test.c+=	-D_HIBERNATE_USERLAND_BUILD
+CFLAGS.hibernate_writer_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 
 # The extent test defines _HIBERNATE_DUMP_EXTENT_TEST itself before including
 # kern_dump.c, compiling only dumpsys_hibernate_start() and its minimal

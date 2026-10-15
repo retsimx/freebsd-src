@@ -9,6 +9,8 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/endian.h>
+#include <sys/hibernate.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
 #include <sys/errno.h>
@@ -25,7 +27,9 @@
 #include <machine/pcb.h>
 #include <machine/pmap.h>
 #include <machine/psl.h>
+#include <machine/segments.h>
 #include <machine/specialreg.h>
+#include <x86/x86_var.h>
 
 /*
  * XXX
@@ -186,4 +190,113 @@ dumpsys_hibernate_savectx(struct hibernate_save_pcb *hpcb, void *stack_top,
 		    NULL);
 
 	return (error);
+}
+
+int
+hibernate_amd64_xsave_collect(void *buf, size_t buf_capacity,
+    struct hibernate_xsave_terminal *out)
+{
+	struct hibernate_xsave_component_fact facts[64];
+	size_t nfacts;
+	uint64_t live_xcr0;
+	uint32_t extent;
+	u_int cp[4];
+	int bit, error;
+
+	if (buf == NULL || out == NULL)
+		return (EINVAL);
+	if (((uintptr_t)buf & (HIBERNATE_AMD64_XSAVE_ALIGNMENT - 1)) != 0)
+		return (EINVAL);
+	if (!use_xsave)
+		return (EINVAL);
+
+	live_xcr0 = rxcr(XCR0);
+	if ((live_xcr0 & HIBERNATE_XCR0_REQUIRED_MASK) !=
+	    HIBERNATE_XCR0_REQUIRED_MASK ||
+	    (live_xcr0 & ~HIBERNATE_AMD64_XCR0_SUPPORTED_MASK) != 0)
+		return (EINVAL);
+	if (live_xcr0 != xsave_mask)
+		return (EINVAL);
+
+	nfacts = 0;
+	for (bit = 2; bit < 64; bit++) {
+		if ((live_xcr0 & (UINT64_C(1) << bit)) == 0)
+			continue;
+		if (nfacts >= nitems(facts))
+			return (EINVAL);
+		cpuid_count(0xd, bit, cp);
+		facts[nfacts].hxcf_component = (uint32_t)bit;
+		facts[nfacts].hxcf_size = cp[0];
+		facts[nfacts].hxcf_offset = cp[1];
+		nfacts++;
+	}
+
+	error = hibernate_xsave_extent(live_xcr0, facts, nfacts, &extent);
+	if (error != 0)
+		return (error);
+	if (buf_capacity < (size_t)extent)
+		return (EINVAL);
+
+	memset(buf, 0, extent);
+	fpusave(buf);
+
+	out->hxt_staged_address = buf;
+	out->hxt_length = extent;
+	out->hxt_enabled_mask = live_xcr0;
+	out->hxt_format = HIBERNATE_AMD64_XSAVE_FORMAT_STANDARD;
+	return (0);
+}
+
+int
+hibernate_amd64_pcb_populate(const struct hibernate_save_pcb *hpcb,
+    const struct hibernate_xsave_terminal *xt, struct hibernate_pcb *pcb)
+{
+	struct region_descriptor rd;
+	uint64_t kgsbase;
+
+	if (hpcb == NULL || xt == NULL || pcb == NULL)
+		return (EINVAL);
+	if (xt->hxt_staged_address == NULL ||
+	    xt->hxt_length < HIBERNATE_PCB_XSAVE_MIN ||
+	    xt->hxt_length > UINT32_MAX ||
+	    xt->hxt_format != HIBERNATE_AMD64_XSAVE_FORMAT_STANDARD)
+		return (EINVAL);
+
+	memset(pcb, 0, sizeof(*pcb));
+	pcb->hp_version = 1;
+	pcb->hp_encoded_size = HIBERNATE_PCB_ENCODED_SIZE;
+
+	pcb->hp_cr0 = hpcb->cr0;
+	pcb->hp_cr3 = hpcb->cr3;
+	pcb->hp_cr4 = hpcb->cr4;
+	pcb->hp_efer = rdmsr(MSR_EFER);
+	pcb->hp_pat = rdmsr(MSR_PAT);
+	pcb->hp_xcr0 = xt->hxt_enabled_mask;
+	pcb->hp_rflags = (uint64_t)read_rflags();
+	pcb->hp_rsp = hpcb->rsp;
+	pcb->hp_rip = hpcb->rip;
+	pcb->hp_r12_pcb_pa = vtophys((void *)(uintptr_t)hpcb->r12);
+
+	sgdt(&rd);
+	pcb->hp_gdtr_limit = (uint16_t)rd.rd_limit;
+	pcb->hp_gdtr_base = (uint64_t)rd.rd_base;
+	sidt(&rd);
+	pcb->hp_idtr_limit = (uint16_t)rd.rd_limit;
+	pcb->hp_idtr_base = (uint64_t)rd.rd_base;
+
+	pcb->hp_fsbase = rdmsr(MSR_FSBASE);
+	pcb->hp_gsbase = rdmsr(MSR_GSBASE);
+	kgsbase = rdmsr(MSR_KGSBASE);
+	pcb->hp_kgsbase = kgsbase;
+	pcb->hp_star = rdmsr(MSR_STAR);
+	pcb->hp_lstar = rdmsr(MSR_LSTAR);
+	pcb->hp_cstar = rdmsr(MSR_CSTAR);
+	pcb->hp_sfmask = rdmsr(MSR_SF_MASK);
+	pcb->hp_kernel_gsbase = kgsbase;
+
+	pcb->hp_xsave_length = (uint32_t)xt->hxt_length;
+	pcb->hp_xsave_format = xt->hxt_format;
+	pcb->hp_xsave_offset = 0;
+	pcb->hp_xsave_enabled_mask = xt->hxt_enabled_mask;
+	return (0);
 }

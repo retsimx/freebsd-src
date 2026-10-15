@@ -13,6 +13,7 @@
 #include <sys/_stdint.h>
 
 struct dumperinfo;
+struct hibernate_xsave_terminal;
 
 enum hibernate_arena_interval_class {
 	HAIC_ELIGIBLE,
@@ -287,6 +288,32 @@ struct hibernate_cb {
 	uint64_t hc_copy_list_bound;
 };
 
+/*
+ * Synthetic CPUID leaf 0xD component fact used by the allocation-free
+ * standard-format XSAVE extent derivation core.  Components 0 and 1 occupy
+ * the architectural legacy region; callers provide facts only for enabled
+ * components numbered 2 and above.
+ */
+struct hibernate_xsave_component_fact {
+	uint32_t hxcf_component;
+	uint32_t hxcf_size;
+	uint32_t hxcf_offset;
+};
+
+/*
+ * One immutable PT_LOAD input to the portable ABI 1 writer-plan assembler.
+ * hwr_file_offset is image-relative.  hwr_source identifies the backing
+ * source object; overlapping source intervals are aliases and are refused.
+ */
+struct hibernate_writer_run {
+	uint64_t hwr_destination;
+	uint64_t hwr_file_offset;
+	uint64_t hwr_length;
+	uint64_t hwr_source;
+	uint64_t hwr_source_offset;
+};
+
+
 struct hibernate_pcb {
 	uint32_t hp_version;
 	uint32_t hp_encoded_size;
@@ -382,6 +409,52 @@ struct hibernate_image_iterator {
 	enum hibernate_image_iterator_phase hii_phase;
 	int hii_error;
 };
+
+/*
+ * Allocation-free input and output for canonical ABI 1 prefix assembly.
+ * hwp_prefix is caller-owned bounded storage and remains immutable while
+ * hwp_image or hwp_iterator is used.
+ */
+struct hibernate_writer_plan {
+	uint8_t *hwp_prefix;
+	size_t hwp_prefix_capacity;
+	size_t hwp_prefix_length;
+	const struct hibernate_writer_run *hwp_runs;
+	size_t hwp_run_count;
+	struct hibernate_image hwp_image;
+	struct hibernate_image_iterator hwp_iterator;
+};
+
+#ifdef _KERNEL
+/*
+ * Preallocated K-6 save-side workspace.
+ *
+ * ACPI owns every pointed-to allocation and creates it before entering the
+ * K-5 no-allocation window.  The dump worker fills the immutable plan after
+ * reserve_all() has stabilised the FREE omission set.  Provider code borrows
+ * the completed workspace only for the ordered image transaction.
+ */
+struct hibernate_writer_workspace {
+	struct hibernate_writer_plan hww_plan;
+	struct hibernate_cb hww_cb;
+	struct hibernate_pcb hww_pcb;
+	struct hibernate_xsave_terminal *hww_xsave_terminal;
+	uint8_t *hww_prefix;
+	size_t hww_prefix_capacity;
+	void *hww_xsave;
+	size_t hww_xsave_capacity;
+	struct hibernate_writer_run *hww_runs;
+	size_t hww_runs_capacity;
+	vm_paddr_t *hww_free_scratch;
+	size_t hww_free_scratch_capacity;
+	vm_paddr_t *hww_destination_intervals;
+	size_t hww_destination_capacity;
+	uint8_t *hww_io_buffer;
+	size_t hww_io_capacity;
+	uint32_t hww_crc32c;
+	bool hww_image_committed;
+};
+#endif
 
 struct hibernate_provider_id {
 	char name[SPECNAMELEN];
@@ -720,6 +793,119 @@ void hibernate_probe_complete(void);
 bool hibernate_probe_active(void);
 #endif
 
+typedef int hibernate_image_write_t(void *);
+
+int hibernate_cb_encode(uint8_t *, size_t, const struct hibernate_cb *);
+int hibernate_pcb_encode(uint8_t *, size_t, const struct hibernate_pcb *);
+int hibernate_xsave_extent(uint64_t,
+    const struct hibernate_xsave_component_fact *, size_t, uint32_t *);
+int hibernate_writer_plan_assemble(struct hibernate_writer_plan *,
+    const struct hibernate_cb *, const struct hibernate_pcb *);
+int hibernate_writer_plan_interval_next(struct hibernate_writer_plan *,
+    struct hibernate_image_interval *);
+
+/*
+ * K-6 task-4: forward-stream callback contracts.
+ *
+ * hibernate_writer_write_t and hibernate_writer_zero_t are invoked exactly
+ * once per iterator interval, in the strictly increasing file-offset order
+ * produced by hibernate_writer_plan_interval_next().  Each callback must
+ * either (a) complete the full requested logical length and fold exactly
+ * those bytes into *crc via hibernate_crc32c_update(), returning 0; or
+ * (b) return a nonzero errno without any partial CRC credit.  A transport
+ * retry inside the callback is invisible to the caller: no byte is fed to
+ * *crc and no cursor advances until the callback itself reports complete
+ * logical success.
+ *
+ * hibernate_writer_rewrite_t is invoked exactly once, after complete
+ * iterator coverage of [0, hi_image_length), to perform the sole bounded
+ * four-byte provider rewrite of the low half of the encoded hc_crc32c
+ * field at image-relative offset cb_crc_offset.  final_crc is the fully
+ * finalized value (caller has already applied the closing XOR 0xffffffff).
+ * The high four bytes of the encoded field remain zero; no other image
+ * byte may change.
+ */
+typedef int hibernate_writer_write_t(void *arg, uint64_t file_offset,
+    uint64_t length, uint32_t *crc);
+typedef int hibernate_writer_zero_t(void *arg, uint64_t file_offset,
+    uint64_t length, uint32_t *crc);
+typedef int hibernate_writer_rewrite_t(void *arg, uint64_t cb_crc_offset,
+    uint32_t final_crc);
+
+/*
+ * hibernate_writer_plan_stream: drive the sole forward interval iterator
+ * over an already-assembled, already-self-decoded plan, dispatching each
+ * interval to write_stored or write_zero and folding the running CRC32C
+ * strictly in iterator order.  After complete coverage of
+ * [0, hi_image_length) (iterator ENOENT) with the iterator cursor exactly
+ * equal to hi_image_length, finalizes the CRC with XOR 0xffffffff and
+ * calls rewrite() exactly once with the image-relative offset of the low
+ * half of hc_crc32c.  Returns 0 only when the full forward stream and the
+ * bounded rewrite both succeed; any other return leaves the rewrite
+ * uncalled and the image incomplete.  Must be called at most once per
+ * plan (the plan's embedded iterator is forward-only).
+ */
+int hibernate_writer_plan_stream(struct hibernate_writer_plan *plan,
+    hibernate_writer_write_t *write_stored, hibernate_writer_zero_t *write_zero,
+    hibernate_writer_rewrite_t *rewrite, void *arg);
+
+/*
+ * hibernate_writer_payload_start: compute the exact page-aligned
+ * payload_start (and, incidentally, the cb/pcb offsets) that
+ * hibernate_writer_plan_assemble() will derive for a plan with exactly
+ * run_count PT_LOAD runs.  Pure arithmetic, no I/O, no allocation; callers
+ * (task-4/5 integration) use this to know where PT_LOAD payload begins
+ * before constructing the live run array, without duplicating or
+ * second-guessing the assembler's own geometry.  Returns 0 with
+ * *payload_start_out set, EINVAL for an out-of-range run_count, or
+ * EOVERFLOW/E2BIG propagated from the same checked arithmetic
+ * hibernate_writer_plan_assemble() performs.
+ */
+int hibernate_writer_payload_start(size_t run_count,
+    uint64_t *payload_start_out);
+
+#ifdef _KERNEL
+/*
+ * hibernate_writer_runs_build: construct the maximal SAVEABLE PT_LOAD run
+ * set directly from live kernel memory state (task-4 prerequisite).
+ *
+ * Universe: every page in every vm_phys_segs[] segment ("ingested RAM",
+ * the same universe the K-5 capacity check treats as physmem).  A page is
+ * omitted from the destination set when it is a member of the locked
+ * SAVE-side FREE reservation *res (the exact set captured by
+ * vm_phys_hibernate_reserve_all()), or when it falls inside
+ * [ha_arena_start, ha_arena_start + ha_arena_size).  Every other page is a
+ * destination.  Adjacent destination pages coalesce into maximal runs.
+ *
+ * free_scratch is caller-owned, preallocated storage of at least
+ * res->vr_count entries; this function sorts a copy of the reservation's
+ * physical addresses into it to merge-classify against vm_phys_segs in one
+ * forward pass.  No allocation occurs.
+ *
+ * payload_cursor is the image-relative offset immediately after the last
+ * fixed object before PT_LOAD payload (i.e. payload_start + xsave_length);
+ * it need not be page-aligned on entry.  File offsets are assigned
+ * sequentially starting at align_up(payload_cursor, HIB_PAGE_SIZE).  Each
+ * run's hwr_source is 0 and hwr_source_offset equals its own destination
+ * physical address: because destinations are constructed non-overlapping,
+ * this makes source ranges non-overlapping too, satisfying
+ * hibernate_writer_plan_assemble()'s alias check without a separate
+ * source-object registry.
+ *
+ * Returns 0 with *run_count_out set on success; EINVAL on a null/malformed
+ * argument; EOVERFLOW on checked-arithmetic failure; E2BIG if runs_capacity
+ * is insufficient for the live run count.
+ */
+int hibernate_writer_runs_build(struct hibernate_attempt *ha,
+    const struct vm_phys_reservation *res, vm_paddr_t *free_scratch,
+    size_t free_scratch_capacity, uint64_t payload_cursor,
+    struct hibernate_writer_run *runs, size_t runs_capacity,
+    size_t *run_count_out);
+#endif /* _KERNEL */
+
+int hibernate_commit_pending(struct hibernate_attempt *,
+    hibernate_image_write_t *, void *, const struct hibernate_marker *, bool *);
+bool hibernate_s4_commit_gate(bool);
 int hibernate_image_decode(const void *, size_t, struct hibernate_image *);
 int hibernate_image_interval_next(struct hibernate_image_iterator *,
     struct hibernate_image_interval *);
