@@ -141,6 +141,7 @@ void	initializecpu(void);
 void	initializecpucache(void);
 bool	fix_cpuid(void);
 void	fillw(int /*u_short*/ pat, void *base, size_t cnt);
+bool	x86_hibernate_mtrr_transition_required(void);
 int	isa_nmi(int cd);
 void	handle_ibrs_entry(void);
 void	handle_ibrs_exit(void);

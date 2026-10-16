@@ -300,3 +300,78 @@ hibernate_amd64_pcb_populate(const struct hibernate_save_pcb *hpcb,
 	pcb->hp_xsave_enabled_mask = xt->hxt_enabled_mask;
 	return (0);
 }
+
+/*
+ * Compare the decoded saved CPU state with the live restore CPU.  CR0_TS is
+ * excluded because normal lazy-FPU handling may legitimately change it.
+ * The EFER mask contains every bit currently defined by specialreg.h.  Each
+ * PAT entry has three architecturally defined memory-type bits.
+ */
+#define	HIBERNATE_CR0_MASK	(CR0_PE | CR0_MP | CR0_EM | \
+	    CR0_NE | CR0_WP | CR0_AM | CR0_NW | CR0_CD | CR0_PG)
+#define	HIBERNATE_CR4_MASK	(CR4_VME | CR4_PVI | CR4_TSD | CR4_DE | \
+	    CR4_PSE | CR4_PAE | CR4_MCE | CR4_PGE | CR4_PCE | CR4_FXSR | \
+	    CR4_XMM | CR4_UMIP | CR4_LA57 | CR4_VMXE | CR4_FSGSBASE | \
+	    CR4_PCIDE | CR4_XSAVE | CR4_SMEP | CR4_SMAP | CR4_PKE | \
+	    CR4_CET | CR4_PKS | CR4_UINTR | CR4_LASS | CR4_LAM_SUP | \
+	    CR4_FRED)
+#define	HIBERNATE_EFER_MASK	(EFER_SCE | EFER_LME | EFER_LMA | \
+	    EFER_NXE | EFER_SVM | EFER_LMSLE | EFER_FFXSR | EFER_TCE | \
+	    EFER_MCOMMIT | EFER_INTWB | EFER_UAIE | EFER_AIBRSE)
+#define	HIBERNATE_PAT_MASK	UINT64_C(0x0707070707070707)
+
+int
+hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb,
+    bool *refuse_la57, bool *refuse_mtrr)
+{
+	struct hibernate_xsave_component_fact facts[64];
+	uint64_t live_xcr0;
+	uint32_t extent;
+	size_t nfacts;
+	u_int cp[4];
+	int bit, error;
+
+	if (pcb == NULL || refuse_la57 == NULL || refuse_mtrr == NULL)
+		return (EINVAL);
+
+	*refuse_la57 = la57 != 0;
+	*refuse_mtrr = x86_hibernate_mtrr_transition_required();
+	if (*refuse_la57 || *refuse_mtrr)
+		return (EINVAL);
+
+	if (((uint64_t)rcr0() & HIBERNATE_CR0_MASK) !=
+	    (pcb->hp_cr0 & HIBERNATE_CR0_MASK) ||
+	    ((uint64_t)rcr4() & HIBERNATE_CR4_MASK) !=
+	    (pcb->hp_cr4 & HIBERNATE_CR4_MASK) ||
+	    (rdmsr(MSR_EFER) & HIBERNATE_EFER_MASK) !=
+	    (pcb->hp_efer & HIBERNATE_EFER_MASK) ||
+	    (rdmsr(MSR_PAT) & HIBERNATE_PAT_MASK) !=
+	    (pcb->hp_pat & HIBERNATE_PAT_MASK))
+		return (EINVAL);
+
+	live_xcr0 = rxcr(XCR0);
+	if (live_xcr0 != pcb->hp_xcr0 ||
+	    live_xcr0 != pcb->hp_xsave_enabled_mask)
+		return (EINVAL);
+
+	nfacts = 0;
+	for (bit = 2; bit < 64; bit++) {
+		if ((live_xcr0 & (UINT64_C(1) << bit)) == 0)
+			continue;
+		if (nfacts >= nitems(facts))
+			return (EINVAL);
+		cpuid_count(0xd, bit, cp);
+		facts[nfacts].hxcf_component = (uint32_t)bit;
+		facts[nfacts].hxcf_size = cp[0];
+		facts[nfacts].hxcf_offset = cp[1];
+		nfacts++;
+	}
+
+	error = hibernate_xsave_extent(live_xcr0, facts, nfacts, &extent);
+	if (error != 0)
+		return (error);
+	if (extent != pcb->hp_xsave_length ||
+	    pcb->hp_xsave_format != HIBERNATE_AMD64_XSAVE_FORMAT_STANDARD)
+		return (EINVAL);
+	return (0);
+}

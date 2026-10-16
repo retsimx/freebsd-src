@@ -123,6 +123,44 @@ g_hibernate_release_owner(struct g_hibernate_softc *sc)
 	return (true);
 }
 
+void
+hibernate_provider_release(struct hibernate_attempt *ha)
+{
+	struct g_hibernate_softc *sc;
+	bool extent_held;
+
+	if (ha == NULL)
+		return;
+
+	/*
+	 * Reuse the existing teardown primitives; clear each flag only
+	 * after its action completes.  Idempotent.
+	 */
+	sc = g_hibernate_owner;
+	if (ha->ha_has_extent && sc != NULL) {
+		mtx_lock(&sc->lock);
+		extent_held = sc->extent_held;
+		sc->extent_held = false;
+		mtx_unlock(&sc->lock);
+		if (extent_held)
+			hibernate_extent_release(&sc->id);
+		ha->ha_has_extent = false;
+	}
+	if (ha->ha_has_provider && sc != NULL &&
+	    g_hibernate_release_owner(sc)) {
+		(void)g_waitfor_event(g_hibernate_teardown_event, sc, M_WAITOK,
+		    NULL);
+		ha->ha_has_provider = false;
+	}
+	if (ha->ha_has_root_hold) {
+		if (g_hibernate_root_hold != NULL) {
+			root_mount_rel(g_hibernate_root_hold);
+			g_hibernate_root_hold = NULL;
+		}
+		ha->ha_has_root_hold = false;
+	}
+}
+
 static void
 g_hibernate_worker(void *arg)
 {
@@ -194,6 +232,13 @@ g_hibernate_worker(void *arg)
 	wakeup(sc);
 	mtx_unlock(&sc->lock);
 
+	if (admitted && error == 0 && result.class == HMC_PENDING) {
+		attempt.ha_has_root_hold = true;
+		attempt.ha_has_provider = true;
+		attempt.ha_has_extent = true;
+		hibernate_resume_attempt(&attempt);
+		result = attempt.ha_marker_result;
+	}
 	if (admitted)
 		g_hibernate_complete_probe(&result);
 

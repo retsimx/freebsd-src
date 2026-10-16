@@ -5060,6 +5060,13 @@ backout:
     return_ACPI_STATUS (status);
 }
 
+uint64_t
+acpi_hibernate_facs_signature(void)
+{
+
+	return (AcpiGbl_FACS != NULL ? AcpiGbl_FACS->HardwareSignature : 0);
+}
+
 static void
 acpi_resync_clock(struct acpi_softc *sc)
 {

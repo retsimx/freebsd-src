@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/_stdint.h>
+#include <sys/_cpuset.h>
 
 struct dumperinfo;
 struct hibernate_xsave_terminal;
@@ -476,6 +477,18 @@ struct hibernate_marker_result {
 	int error;
 };
 
+enum hibernate_marker_owned {
+	HM_OWNED_NONE,
+	HM_OWNED_PENDING,
+	HM_OWNED_CONSUMING
+};
+
+enum hibernate_owner_rollback_outcome {
+	HIBERNATE_OWNER_ROLLBACK_VERIFIED = 0,
+	HIBERNATE_OWNER_ROLLBACK_UNSAFE,
+	HIBERNATE_OWNER_ROLLBACK_UNKNOWN
+};
+
 struct cam_sim;		/* Forward declaration; full type in cam/cam_sim.h. */
 
 struct hibernate_attempt {
@@ -517,9 +530,29 @@ struct hibernate_attempt {
 	 * no pollable CAM sim is associated with the dump path.
 	 */
 	struct cam_sim *ha_cam_sim;	/* Dump-path CAM sim; NULL if none. */
+
+	/*
+	 * K-7: marker ownership, RESTORE-attempt resource ownership, and the
+	 * exact acknowledged-AP set.  Each flag changes only at its one stated
+	 * acquisition point and one stated release point.  ha_marker_owned is
+	 * the sole marker-ownership representation.
+	 */
+	enum hibernate_marker_owned ha_marker_owned;
+	bool ha_has_root_hold;		/* K-4 probe gate root_mount_hold(). */
+	bool ha_has_provider;		/* K-4 GEOM consumer access + dumper. */
+	bool ha_has_extent;		/* K-4 hibernate_extent_hold(). */
+	bool ha_has_metadata;		/* K-8 metadata/image ownership. */
+	bool ha_has_safe_pages;		/* K-8 source-page reservation. */
+	bool ha_has_arena;		/* K-9 hibernate_arena_claim(). */
+	bool ha_has_admission_closed;	/* K-12 coordinator admission closed. */
+	bool ha_has_quiesce;		/* K-12 hibernate_quiesce() success. */
+	bool ha_has_stopped_cpus;	/* K-12 stop_cpus() success. */
+	cpuset_t ha_acknowledged_cpus;	/* Exact acknowledged AP subset. */
+	struct hibernate_image ha_image;
+					/* K-7 decoded image (transient). */
 };
 
-#define	HIBERNATE_ATTEMPT_INIT							\
+#define	HIBERNATE_ATTEMPT_INIT                                  \
 	{                                                       \
 		.ha_marker_result = { .class = HMC_ABSENT,      \
 		    .error = 0 },                               \
@@ -529,6 +562,17 @@ struct hibernate_attempt {
 		.ha_arena_size = 0,                             \
 		.ha_dst_valid = false,                          \
 		.ha_cam_sim = NULL,                             \
+		.ha_marker_owned = HM_OWNED_NONE,               \
+		.ha_has_root_hold = false,                      \
+		.ha_has_provider = false,                       \
+		.ha_has_extent = false,                         \
+		.ha_has_metadata = false,                       \
+		.ha_has_safe_pages = false,                     \
+		.ha_has_arena = false,                          \
+		.ha_has_admission_closed = false,               \
+		.ha_has_quiesce = false,                        \
+		.ha_has_stopped_cpus = false,                   \
+		.ha_acknowledged_cpus = { { 0 } },              \
 	}
 
 /*
@@ -779,6 +823,21 @@ bool hibernate_provider_conflicts(const struct hibernate_provider_id *id);
 int hibernate_extent_hold(const struct hibernate_provider_id *id,
     uint64_t offset, uint64_t length);
 void hibernate_extent_release(const struct hibernate_provider_id *id);
+
+int hibernate_resume_attempt(struct hibernate_attempt *ha);
+int hibernate_image_validate(struct hibernate_attempt *ha);
+void hibernate_attempt_cleanup(struct hibernate_attempt *ha);
+
+int hibernate_quiesce(struct hibernate_attempt *ha);
+int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
+int hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged);
+int hibernate_restart_cpus(cpuset_t acknowledged);
+
+/* K-8-owned stage functions; K-7 provides temporary ENOTSUP bodies. */
+int hibernate_meta_read(struct hibernate_attempt *ha);
+int hibernate_safe_pages_alloc(struct hibernate_attempt *ha);
+int hibernate_payload_read(struct hibernate_attempt *ha);
+int hibernate_payload_verify(struct hibernate_attempt *ha);
 void hibernate_marker_decode_complete(const uint8_t *buf,
     struct hibernate_marker *marker, uint32_t *reserved);
 enum hibernate_marker_class hibernate_marker_classify(uint64_t marker_offset,
@@ -804,6 +863,10 @@ int hibernate_dumper_lookup(const struct hibernate_provider_id *id,
     struct dumperinfo **dip);
 int hibernate_owner_publish(const struct hibernate_provider_id *id);
 void hibernate_owner_deactivate(const struct hibernate_provider_id *id);
+
+/* Live FACS HardwareSignature; defined in sys/dev/acpica/acpi.c. */
+uint64_t acpi_hibernate_facs_signature(void);
+void hibernate_provider_release(struct hibernate_attempt *ha);
 void hibernate_probe_begin(void);
 void hibernate_probe_complete(void);
 bool hibernate_probe_active(void);
