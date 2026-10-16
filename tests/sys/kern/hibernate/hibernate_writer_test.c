@@ -38,6 +38,13 @@ struct transaction_mock {
 	unsigned int image_count;
 	unsigned int flush_attempt;
 	unsigned int fail_flush_attempt;
+	/*
+	 * When nonzero, the write_count'th call to tx_write() (1-based)
+	 * fails with EIO regardless of write_error, so a caller can target
+	 * exactly one write within a multi-write transaction (e.g. only the
+	 * PENDING write) rather than every write from the first one onward.
+	 */
+	unsigned int fail_write_call;
 	int read_error;
 	int write_error;
 	int image_error;
@@ -85,6 +92,9 @@ tx_write(void *priv, void *virtual, off_t offset, size_t length)
 	mock->write_count++;
 	if (offset != 0 || length != DEV_BSIZE)
 		return (EINVAL);
+	if (mock->fail_write_call != 0 &&
+	    mock->write_count == mock->fail_write_call)
+		return (EIO);
 	if (mock->write_error != 0)
 		return (mock->write_error);
 	memcpy(mock->sector, virtual, sizeof(mock->sector));
@@ -448,20 +458,22 @@ ATF_TC_BODY(transaction_pending_write_failure, tc)
 
 	tx_fixture_init(&f);
 	/*
-	 * The clear write is the first write.  The callback changes the
-	 * injected result immediately before the PENDING update.
+	 * Fail only the second write (the PENDING marker write) and leave
+	 * the first write (CLEAR) to succeed, so hibernate_commit_pending()
+	 * itself -- not a manual replay of its sub-steps -- is the unit
+	 * under test, exactly like its sibling transaction tests.
 	 */
-	f.mock.write_error = 0;
-	f.mock.image_error = 0;
-	f.mock.fail_flush_attempt = 0;
-	ATF_REQUIRE_EQ(0, hibernate_marker_clear(&f.ha));
-	ATF_REQUIRE_EQ(0, hibernate_marker_flush(&f.ha));
-	ATF_REQUIRE_EQ(0, tx_image(&f.mock));
-	ATF_REQUIRE_EQ(0, hibernate_marker_flush(&f.ha));
-	f.mock.write_error = EIO;
-	ATF_CHECK_EQ(EIO, hibernate_marker_write(&f.ha, &f.pending));
-	ATF_CHECK(!hibernate_s4_commit_gate(false));
+	f.mock.fail_write_call = 2;
+	ATF_CHECK_EQ(EIO,
+	    hibernate_commit_pending(&f.ha, tx_image, &f.mock, &f.pending,
+		&f.committed));
+
+	ATF_CHECK(!f.committed);
+	ATF_CHECK(!hibernate_s4_commit_gate(f.committed));
 	ATF_CHECK_STREQ("RWFIFRW", f.mock.events);
+	ATF_CHECK_EQ(2U, f.mock.write_count);
+	ATF_CHECK_EQ(1U, f.mock.image_count);
+	ATF_CHECK_EQ(2U, f.mock.flush_count);
 }
 
 ATF_TC_WITHOUT_HEAD(transaction_pending_flush_failure);
@@ -804,6 +816,91 @@ ATF_TC_BODY(writer_plan_bounds_refusals, tc)
 	    hibernate_writer_plan_assemble(&plan, &cb, &pcb));
 }
 
+/* Runs permitted at the maximal HIBERNATE_MAX_PHDRS (900) phdr budget. */
+#define WRITER_MAX_PHDR_RUN_COUNT (HIBERNATE_MAX_PHDRS - 3)
+
+ATF_TC_WITHOUT_HEAD(writer_plan_max_phdrs);
+ATF_TC_BODY(writer_plan_max_phdrs, tc)
+{
+	static uint8_t prefix[HIBERNATE_META_BUF_MAX];
+	static struct hibernate_writer_run runs[WRITER_MAX_PHDR_RUN_COUNT];
+	struct hibernate_writer_plan plan;
+	struct hibernate_image_interval interval;
+	struct hibernate_pcb pcb;
+	struct hibernate_cb cb;
+	uint64_t payload_start, file_offset, destination, cursor;
+	unsigned int stored, gaps;
+	size_t i;
+	int error;
+
+	/*
+	 * hibernate_writer_payload_start() shares the exact geometry
+	 * arithmetic hibernate_writer_plan_assemble() performs, so the two
+	 * must agree at the maximal run count the ABI permits.
+	 */
+	ATF_REQUIRE_EQ(0, hibernate_writer_payload_start(
+	    WRITER_MAX_PHDR_RUN_COUNT, &payload_start));
+	ATF_CHECK(payload_start <= HIBERNATE_META_BUF_MAX);
+
+	cb = valid_cb();
+	pcb = valid_pcb();
+	pcb.hp_xsave_offset = payload_start;
+
+	file_offset = payload_start + pcb.hp_xsave_length;
+	if ((file_offset % HIB_PAGE_SIZE) != 0)
+		file_offset += HIB_PAGE_SIZE - (file_offset % HIB_PAGE_SIZE);
+	destination = 0;
+	for (i = 0; i < WRITER_MAX_PHDR_RUN_COUNT; i++) {
+		runs[i].hwr_destination = destination;
+		runs[i].hwr_file_offset = file_offset;
+		runs[i].hwr_length = HIB_PAGE_SIZE;
+		runs[i].hwr_source = 1;
+		runs[i].hwr_source_offset = (uint64_t)i * HIB_PAGE_SIZE;
+		destination += HIB_PAGE_SIZE;
+		file_offset += HIB_PAGE_SIZE;
+	}
+
+	cb.hc_image_length = file_offset;
+	/* Arena collision is exercised elsewhere; disable it here. */
+	cb.hc_arena_start = 0;
+	cb.hc_arena_size = 0;
+	cb.hc_physmem_bytes = UINT64_C(0x1000000);
+	cb.hc_source_vector_bytes = 64;
+	cb.hc_restore_footprint_pages = WRITER_MAX_PHDR_RUN_COUNT;
+	cb.hc_copy_list_bound = WRITER_MAX_PHDR_RUN_COUNT;
+
+	memset(&plan, 0, sizeof(plan));
+	plan.hwp_prefix = prefix;
+	plan.hwp_prefix_capacity = sizeof(prefix);
+	plan.hwp_runs = runs;
+	plan.hwp_run_count = WRITER_MAX_PHDR_RUN_COUNT;
+
+	ATF_REQUIRE_EQ(0, hibernate_writer_plan_assemble(&plan, &cb, &pcb));
+	ATF_CHECK_EQ((uint32_t)HIBERNATE_MAX_PHDRS, plan.hwp_image.hi_phnum);
+	ATF_CHECK_EQ((uint32_t)WRITER_MAX_PHDR_RUN_COUNT,
+	    plan.hwp_image.hi_load_count);
+	ATF_CHECK_EQ(payload_start, plan.hwp_image.hi_payload_start);
+	ATF_CHECK(plan.hwp_prefix_length <= HIBERNATE_META_BUF_MAX);
+
+	cursor = 0;
+	stored = 0;
+	gaps = 0;
+	while ((error = hibernate_writer_plan_interval_next(&plan,
+		    &interval)) == 0) {
+		ATF_CHECK_EQ(cursor, interval.hii_offset);
+		ATF_CHECK(interval.hii_length != 0);
+		cursor += interval.hii_length;
+		if (interval.hii_class == HIIC_STORED)
+			stored++;
+		else
+			gaps++;
+	}
+	ATF_CHECK_EQ(ENOENT, error);
+	ATF_CHECK_EQ(cb.hc_image_length, cursor);
+	ATF_CHECK(stored >= WRITER_MAX_PHDR_RUN_COUNT);
+	ATF_CHECK(gaps >= 1);
+}
+
 
 struct stream_test_ctx {
 	struct hibernate_writer_plan *plan;
@@ -822,6 +919,24 @@ struct stream_test_ctx {
 	uint64_t rewrite_offset;
 	uint32_t rewrite_crc;
 	bool bad_offset;
+	/*
+	 * When nonzero, immediately after the corrupt_after_call'th call
+	 * completes successfully, the iterator's own cursor is nudged by
+	 * corrupt_delta bytes behind the forward streamer's back, so the
+	 * very next hibernate_writer_plan_interval_next() call hands back a
+	 * manually-crafted/injected slice at the wrong offset.
+	 */
+	unsigned int corrupt_after_call;
+	int64_t corrupt_delta;
+	/*
+	 * When nonzero, the short_write_call'th call simulates a provider
+	 * that transferred only part of the requested bytes before failing,
+	 * and (incorrectly, as a misbehaving provider might) still folds
+	 * those partial bytes into the running CRC before returning EIO.
+	 * hibernate_writer_plan_stream()'s own checkpoint/restore -- not
+	 * this callback's return value -- must discard the mutation.
+	 */
+	unsigned int short_write_call;
 };
 
 static int
@@ -832,6 +947,9 @@ stream_record(struct stream_test_ctx *ctx, uint64_t offset, uint64_t length,
 	const uint8_t *bytes;
 	uint64_t left;
 	size_t chunk;
+
+	static const uint8_t short_write_payload[256] = { 0x5a };
+	size_t partial;
 
 	if (ctx == NULL || crc == NULL || length == 0)
 		return (EINVAL);
@@ -846,6 +964,16 @@ stream_record(struct stream_test_ctx *ctx, uint64_t offset, uint64_t length,
 		 * does not advance the logical cursor.
 		 */
 		ctx->transport_attempts++;
+	}
+	if (ctx->short_write_call != 0 &&
+	    ctx->calls == ctx->short_write_call) {
+		partial = (size_t)(length / 2);
+		if (partial == 0)
+			partial = 1;
+		if (partial > sizeof(short_write_payload))
+			partial = sizeof(short_write_payload);
+		*crc = hibernate_crc32c_update(*crc, short_write_payload, partial);
+		return (EIO);
 	}
 	if (offset != ctx->cursor) {
 		ctx->bad_offset = true;
@@ -890,6 +1018,15 @@ stream_record(struct stream_test_ctx *ctx, uint64_t offset, uint64_t length,
 		}
 	}
 	ctx->cursor += length;
+	if (ctx->corrupt_after_call != 0 &&
+	    ctx->calls == ctx->corrupt_after_call) {
+		/*
+		 * Behind the forward streamer's back, move the iterator's own
+		 * cursor so the very next interval_next() call hands back a
+		 * manually-crafted/injected slice at the wrong offset.
+		 */
+		ctx->plan->hwp_iterator.hii_cursor += ctx->corrupt_delta;
+	}
 	return (0);
 }
 
@@ -1002,6 +1139,146 @@ ATF_TC_BODY(writer_stream_malformed_completion, tc)
 	ctx.cursor = plan.hwp_iterator.hii_cursor;
 	ATF_CHECK_EQ(EINVAL, hibernate_writer_plan_stream(&plan,
 	    stream_write_stored, stream_write_zero, stream_rewrite, &ctx));
+	ATF_CHECK_EQ(0U, ctx.rewrite_calls);
+}
+
+ATF_TC_WITHOUT_HEAD(writer_stream_duplicate_slice_refused);
+ATF_TC_BODY(writer_stream_duplicate_slice_refused, tc)
+{
+	static uint8_t prefix[WRITER_PREFIX_SIZE];
+	struct hibernate_writer_run runs[2];
+	struct hibernate_writer_plan plan, probe;
+	struct hibernate_image_interval interval;
+	struct hibernate_pcb pcb;
+	struct hibernate_cb cb;
+	struct stream_test_ctx ctx;
+	uint64_t first_interval_end;
+
+	stream_fixture(&plan, &cb, &pcb, runs, prefix, &ctx);
+
+	/*
+	 * Learn the real, production-decoded boundary of the first interval
+	 * from an independent probe copy of the plan, rather than hardcoding
+	 * a geometry constant.
+	 */
+	probe = plan;
+	probe.hwp_iterator.hii_image = &probe.hwp_image;
+	ATF_REQUIRE_EQ(0, hibernate_writer_plan_interval_next(&probe, &interval));
+	first_interval_end = interval.hii_offset + interval.hii_length;
+	ATF_REQUIRE(interval.hii_length > 1);
+
+	/*
+	 * After the first interval is legitimately consumed, rewind the real
+	 * iterator's cursor -- behind the forward streamer's back -- into
+	 * the middle of ground already sent.  The next
+	 * hibernate_writer_plan_interval_next() call then hands the streamer
+	 * a manually-crafted slice whose offset is BELOW the offset the
+	 * streamer has already consumed: a duplicate slice.
+	 */
+	ctx.corrupt_after_call = 1;
+	ctx.corrupt_delta = -(int64_t)(interval.hii_length / 2);
+
+	ATF_CHECK_EQ(EINVAL, hibernate_writer_plan_stream(&plan,
+	    stream_write_stored, stream_write_zero, stream_rewrite, &ctx));
+
+	ATF_CHECK(ctx.bad_offset);
+	/* The duplicate slice must not advance the cursor past call 1. */
+	ATF_CHECK_EQ(first_interval_end, ctx.cursor);
+	ATF_CHECK_EQ(1U, ctx.stored_calls + ctx.zero_calls);
+	ATF_CHECK_EQ(0U, ctx.rewrite_calls);
+}
+
+ATF_TC_WITHOUT_HEAD(writer_stream_interleave_refused);
+ATF_TC_BODY(writer_stream_interleave_refused, tc)
+{
+	static uint8_t prefix[WRITER_PREFIX_SIZE];
+	struct hibernate_writer_run runs[2];
+	struct hibernate_writer_plan plan, probe;
+	struct hibernate_image_interval interval;
+	struct hibernate_pcb pcb;
+	struct hibernate_cb cb;
+	struct stream_test_ctx ctx;
+	uint64_t first_interval_end;
+
+	stream_fixture(&plan, &cb, &pcb, runs, prefix, &ctx);
+
+	probe = plan;
+	probe.hwp_iterator.hii_image = &probe.hwp_image;
+	ATF_REQUIRE_EQ(0, hibernate_writer_plan_interval_next(&probe, &interval));
+	first_interval_end = interval.hii_offset + interval.hii_length;
+	ATF_REQUIRE(interval.hii_length > 1);
+
+	/*
+	 * After the first interval is legitimately consumed, jump the real
+	 * iterator's cursor forward -- behind the forward streamer's back --
+	 * past the next correct boundary without ever supplying the exact
+	 * intervening gap.  The next interval_next() call then hands the
+	 * streamer a manually-crafted slice whose offset is ABOVE the
+	 * expected next offset: an interleaved slice.
+	 */
+	ctx.corrupt_after_call = 1;
+	ctx.corrupt_delta = (int64_t)interval.hii_length;
+
+	ATF_CHECK_EQ(EINVAL, hibernate_writer_plan_stream(&plan,
+	    stream_write_stored, stream_write_zero, stream_rewrite, &ctx));
+
+	ATF_CHECK(ctx.bad_offset);
+	/* The interleaved slice must not advance the cursor past call 1. */
+	ATF_CHECK_EQ(first_interval_end, ctx.cursor);
+	ATF_CHECK_EQ(1U, ctx.stored_calls + ctx.zero_calls);
+	ATF_CHECK_EQ(0U, ctx.rewrite_calls);
+}
+
+ATF_TC_WITHOUT_HEAD(writer_stream_short_write_refused);
+ATF_TC_BODY(writer_stream_short_write_refused, tc)
+{
+	static uint8_t prefix[WRITER_PREFIX_SIZE];
+	struct hibernate_writer_run runs[2];
+	struct hibernate_writer_plan plan, probe;
+	struct hibernate_image_interval interval;
+	struct hibernate_pcb pcb;
+	struct hibernate_cb cb;
+	struct stream_test_ctx ctx;
+	uint64_t expect_cursor;
+	const unsigned int short_at = 3;
+	unsigned int i;
+
+	stream_fixture(&plan, &cb, &pcb, runs, prefix, &ctx);
+
+	/*
+	 * Learn, from an independent probe copy, the exact cursor position
+	 * after the first short_at - 1 intervals complete legitimately.
+	 */
+	probe = plan;
+	probe.hwp_iterator.hii_image = &probe.hwp_image;
+	expect_cursor = 0;
+	for (i = 0; i < short_at - 1; i++) {
+		ATF_REQUIRE_EQ(0,
+		    hibernate_writer_plan_interval_next(&probe, &interval));
+		expect_cursor += interval.hii_length;
+	}
+
+	/*
+	 * Inject a SHORT/partial-block provider-write failure on the
+	 * short_at'th logical interval: the mock transfers only half the
+	 * requested bytes and folds them into the running CRC before
+	 * returning EIO, distinct from the existing all-or-nothing failure
+	 * mocks (fail_call) which never touch *crc at all.
+	 */
+	ctx.short_write_call = short_at;
+
+	ATF_CHECK_EQ(EIO, hibernate_writer_plan_stream(&plan,
+	    stream_write_stored, stream_write_zero, stream_rewrite, &ctx));
+
+	ATF_CHECK(!ctx.bad_offset);
+	/*
+	 * No CRC advance: the forward streamer's checkpoint/restore discards
+	 * the mock's partial-write CRC mutation, so the logical cursor stays
+	 * exactly where the last fully-completed interval left it, and no
+	 * image is committed (rewrite() -- the sole commit signal -- is
+	 * never reached).
+	 */
+	ATF_CHECK_EQ(expect_cursor, ctx.cursor);
 	ATF_CHECK_EQ(0U, ctx.rewrite_calls);
 }
 
@@ -1153,9 +1430,13 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, writer_plan_destination_refusals);
 	ATF_TP_ADD_TC(tp, writer_plan_alias_refusals);
 	ATF_TP_ADD_TC(tp, writer_plan_bounds_refusals);
+	ATF_TP_ADD_TC(tp, writer_plan_max_phdrs);
 	ATF_TP_ADD_TC(tp, writer_stream_slices_and_zero_gaps);
 	ATF_TP_ADD_TC(tp, writer_stream_retry_no_double_count);
 	ATF_TP_ADD_TC(tp, writer_stream_malformed_completion);
+	ATF_TP_ADD_TC(tp, writer_stream_duplicate_slice_refused);
+	ATF_TP_ADD_TC(tp, writer_stream_interleave_refused);
+	ATF_TP_ADD_TC(tp, writer_stream_short_write_refused);
 	ATF_TP_ADD_TC(tp, writer_stream_one_four_byte_rewrite);
 	ATF_TP_ADD_TC(tp, writer_plan_arena_collision_edges);
 	ATF_TP_ADD_TC(tp, writer_dst_verify_agreement);
