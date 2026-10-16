@@ -90,6 +90,18 @@ static struct mem_range_ops x86_mrops = {
 /* XXX for AP startup hook */
 static u_int64_t mtrrcap, mtrrdef;
 
+/*
+ * Return true when restoring the saved kernel would require an MTRR
+ * transition.  Resume refuses this case rather than reconciling MTRRs.
+ */
+bool
+x86_hibernate_mtrr_transition_required(void)
+{
+
+	return (rdmsr(MSR_MTRRcap) != mtrrcap ||
+	    rdmsr(MSR_MTRRdefType) != mtrrdef);
+}
+
 /* The bitmask for the PhysBase and PhysMask fields of the variable MTRRs. */
 static u_int64_t mtrr_physmask;
 

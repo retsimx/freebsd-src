@@ -382,6 +382,7 @@ ACPI_STATUS	acpi_SetIntrModel(int model);
 int		acpi_ReqSleepState(struct acpi_softc *sc, enum power_stype stype);
 ACPI_STATUS	acpi_SetSleepState(struct acpi_softc *sc, int state);
 int		acpi_wake_set_enable(device_t dev, int enable);
+uint64_t	acpi_hibernate_facs_signature(void);
 int		acpi_parse_prw(ACPI_HANDLE h, struct acpi_prw_data *prw);
 ACPI_STATUS	acpi_Startup(void);
 void		acpi_UserNotify(const char *subsystem, ACPI_HANDLE h,

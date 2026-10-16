@@ -103,6 +103,45 @@ struct dumperinfo {
 /* ELFCLASS64 / ELFDATA2LSB / EV_CURRENT are always exposed. */
 /* ET_FREEBSD_HIBERNATE_IMAGE and PT_FREEBSD_HIBERNATE_* are in elf_common.h. */
 
+#include <sys/hibernate.h>
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY K-7 resume-stage names and injectable seams.  These declarations
+ * live in the force-included compatibility header so production-source host
+ * tests can drive kernel-only dependencies without adding a kernel ABI.
+ */
+enum hibernate_resume_stage {
+	HIB_RESUME_PROBE = 0,
+	HIB_RESUME_READ_METADATA,
+	HIB_RESUME_VALIDATE,
+	HIB_RESUME_ALLOCATE,
+	HIB_RESUME_READ_PAYLOAD,
+	HIB_RESUME_VERIFY,
+	HIB_RESUME_MD_PREPARE,
+	HIB_RESUME_CONSUMING,
+	HIB_RESUME_QUIESCE,
+	HIB_RESUME_STOP_CPUS,
+	HIB_RESUME_RESTORE,
+	HIB_RESUME_ENTER_SAVED,
+	HIB_RESUME_STAGE_COUNT
+};
+
+extern volatile enum hibernate_resume_stage
+    hibernate_resume_stage_log[HIB_RESUME_STAGE_COUNT];
+extern volatile size_t hibernate_resume_stage_log_length;
+extern int (*hibernate_test_probe_fn)(struct hibernate_attempt *);
+extern void (*hibernate_test_provider_release_fn)(struct hibernate_attempt *);
+extern int (*hibernate_test_quiesce_rollback_fn)(struct hibernate_attempt *);
+extern int (*hibernate_test_restart_cpus_fn)(cpuset_t);
+extern int (*hibernate_test_owner_rollback_fn)(struct hibernate_attempt *,
+    enum hibernate_owner_rollback_outcome *);
+extern int (*hibernate_test_amd64_cpu_validate)(
+    const struct hibernate_pcb *, bool *, bool *);
+extern uint64_t hibernate_test_facs_signature;
+extern uint64_t hibernate_test_physmem_bytes;
+#endif
+
 /*
  * __builtin_add_overflow, __builtin_mul_overflow, __builtin_memcpy,
  * __builtin_memset are GCC/Clang builtins available unconditionally.

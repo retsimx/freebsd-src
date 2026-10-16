@@ -40,6 +40,7 @@
 #include <sys/_maxphys.h>
 #include <sys/callout.h>
 #include <sys/conf.h>
+#include <sys/cpuset.h>
 #include <sys/elf64.h>
 #include <sys/elf_common.h>
 #include <sys/endian.h>
@@ -51,6 +52,7 @@
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sched.h>
+#include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/vmmeter.h>
 
@@ -3043,6 +3045,486 @@ hibernate_commit_pending(struct hibernate_attempt *ha,
 }
 
 /*
+ * K-7 resume coordinator landmarks.  The append-only trace is reset for each
+ * serial resume attempt and records every stage as it is entered.
+ */
+#ifndef _HIBERNATE_USERLAND_BUILD
+enum hibernate_resume_stage {
+	HIB_RESUME_PROBE = 0,
+	HIB_RESUME_READ_METADATA,
+	HIB_RESUME_VALIDATE,
+	HIB_RESUME_ALLOCATE,
+	HIB_RESUME_READ_PAYLOAD,
+	HIB_RESUME_VERIFY,
+	HIB_RESUME_MD_PREPARE,
+	HIB_RESUME_CONSUMING,
+	HIB_RESUME_QUIESCE,
+	HIB_RESUME_STOP_CPUS,
+	HIB_RESUME_RESTORE,
+	HIB_RESUME_ENTER_SAVED,
+	HIB_RESUME_STAGE_COUNT
+};
+#endif
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY stage trace seam.  External linkage lets the production-source
+ * host test verify coordinator ordering without changing the kernel ABI.
+ */
+volatile enum hibernate_resume_stage
+    hibernate_resume_stage_log[HIB_RESUME_STAGE_COUNT];
+volatile size_t hibernate_resume_stage_log_length;
+#else
+static volatile enum hibernate_resume_stage
+    hibernate_resume_stage_log[HIB_RESUME_STAGE_COUNT];
+static volatile size_t hibernate_resume_stage_log_length;
+#endif
+
+/*
+ * STOP_CPUS changes only the BSP interrupt-enable state.  Its saved value is
+ * coordinator-local because cleanup's public interface is fixed.  This path
+ * does not change APIC TPR state.
+ */
+static register_t hibernate_resume_intr_state;
+static bool hibernate_resume_intr_state_valid;
+
+static void
+hibernate_resume_stage_record(enum hibernate_resume_stage stage)
+{
+
+	if (hibernate_resume_stage_log_length < HIB_RESUME_STAGE_COUNT) {
+		hibernate_resume_stage_log[
+		    hibernate_resume_stage_log_length++] = stage;
+	}
+}
+
+int
+hibernate_meta_read(struct hibernate_attempt *ha)
+{
+
+	(void)ha;
+	return (ENOTSUP);
+}
+
+int
+hibernate_safe_pages_alloc(struct hibernate_attempt *ha)
+{
+
+	(void)ha;
+	return (ENOTSUP);
+}
+
+int
+hibernate_payload_read(struct hibernate_attempt *ha)
+{
+
+	(void)ha;
+	return (ENOTSUP);
+}
+
+int
+hibernate_payload_verify(struct hibernate_attempt *ha)
+{
+
+	(void)ha;
+	return (ENOTSUP);
+}
+
+int
+hibernate_quiesce(struct hibernate_attempt *ha)
+{
+
+	(void)ha;
+	return (ENOTSUP);
+}
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/* TEST-ONLY K-12 cleanup seam; NULL preserves the temporary ENOTSUP body. */
+int (*hibernate_test_quiesce_rollback_fn)(struct hibernate_attempt *);
+#endif
+
+int
+hibernate_quiesce_rollback(struct hibernate_attempt *ha)
+{
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+	if (hibernate_test_quiesce_rollback_fn != NULL)
+		return (hibernate_test_quiesce_rollback_fn(ha));
+#endif
+	(void)ha;
+	return (ENOTSUP);
+}
+
+int
+hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged)
+{
+
+	(void)target;
+	(void)acknowledged;
+	return (ENOTSUP);
+}
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/* TEST-ONLY K-12 AP-restart seam; NULL preserves temporary ENOTSUP. */
+int (*hibernate_test_restart_cpus_fn)(cpuset_t);
+#endif
+
+int
+hibernate_restart_cpus(cpuset_t acknowledged)
+{
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+	if (hibernate_test_restart_cpus_fn != NULL)
+		return (hibernate_test_restart_cpus_fn(acknowledged));
+#endif
+	(void)acknowledged;
+	return (ENOTSUP);
+}
+
+#ifdef _KERNEL
+static int
+hibernate_coordinator_probe(struct hibernate_attempt *ha)
+{
+
+	return (hibernate_probe(ha));
+}
+
+static void
+hibernate_coordinator_provider_release(struct hibernate_attempt *ha)
+{
+
+	hibernate_provider_release(ha);
+}
+#else
+/*
+ * TEST-ONLY injectable coordinator seams.  They have external linkage only
+ * in the userland build so the host test can drive and observe cleanup.
+ */
+int (*hibernate_test_probe_fn)(struct hibernate_attempt *) = NULL;
+void (*hibernate_test_provider_release_fn)(
+    struct hibernate_attempt *) = NULL;
+
+static int
+hibernate_coordinator_probe(struct hibernate_attempt *ha)
+{
+
+	if (hibernate_test_probe_fn != NULL)
+		return (hibernate_test_probe_fn(ha));
+	ha->ha_marker_result.class = HMC_ABSENT;
+	ha->ha_marker_result.error = 0;
+	return (0);
+}
+
+static void
+hibernate_coordinator_provider_release(struct hibernate_attempt *ha)
+{
+
+	if (hibernate_test_provider_release_fn != NULL)
+		hibernate_test_provider_release_fn(ha);
+}
+#endif
+
+/*
+ * K-8 replaces these inert release bodies in place when it starts acquiring
+ * metadata and safe pages.
+ */
+static void
+hibernate_safe_pages_free(struct hibernate_attempt *ha)
+{
+
+	ha->ha_has_safe_pages = false;
+}
+
+static void
+hibernate_metadata_free(struct hibernate_attempt *ha)
+{
+
+	ha->ha_has_metadata = false;
+}
+
+/*
+ * K-12 replaces this body when it implements admission closure.  Until then
+ * no K-7 path can acquire admission ownership.
+ */
+static int
+hibernate_admission_reopen(struct hibernate_attempt *ha)
+{
+
+	ha->ha_has_admission_closed = false;
+	return (0);
+}
+
+static void
+hibernate_cleanup_terminal(const char *reason)
+{
+
+#ifdef _KERNEL
+	panic("hibernate cleanup failed: %s", reason);
+#else
+	(void)reason;
+	__builtin_trap();
+#endif
+}
+
+static void
+hibernate_attempt_cleanup_marker(struct hibernate_attempt *ha)
+{
+	int error;
+
+	if (ha->ha_marker_owned == HM_OWNED_NONE)
+		return;
+	error = hibernate_marker_clear(ha);
+	if (error == 0)
+		error = hibernate_marker_flush(ha);
+	if (error == 0)
+		ha->ha_marker_owned = HM_OWNED_NONE;
+#ifdef _KERNEL
+	else
+		printf("hibernate: marker cleanup failed: %d\n", error);
+#endif
+}
+
+/*
+ * K-12/K-14 replace this verified no-owner default with selected transport
+ * rollback.  It does not reopen admission, perform marker I/O, or restore
+ * interrupts.
+ */
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY selected-owner rollback seam.  NULL retains the verified no-owner
+ * K-7 default while an injected function makes exact-once cleanup observable.
+ */
+int (*hibernate_test_owner_rollback_fn)(struct hibernate_attempt *,
+    enum hibernate_owner_rollback_outcome *);
+#endif
+
+static int
+hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
+    enum hibernate_owner_rollback_outcome *outcome)
+{
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+	if (hibernate_test_owner_rollback_fn != NULL)
+		return (hibernate_test_owner_rollback_fn(ha, outcome));
+#endif
+	(void)ha;
+	*outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+	return (0);
+}
+
+void
+hibernate_attempt_cleanup(struct hibernate_attempt *ha)
+{
+	enum hibernate_owner_rollback_outcome outcome;
+	cpuset_t empty_set;
+	int error;
+
+	if (ha == NULL)
+		return;
+
+	/* Step 1: admission remains closed if this attempt acquired it. */
+
+	/* Step 2: restart exactly the APs which acknowledged STOP_CPUS. */
+	__builtin_memset(&empty_set, 0, sizeof(empty_set));
+	if (ha->ha_has_stopped_cpus ||
+	    __builtin_memcmp(&ha->ha_acknowledged_cpus, &empty_set,
+	    sizeof(empty_set)) != 0) {
+		error = hibernate_restart_cpus(ha->ha_acknowledged_cpus);
+		if (error != 0)
+			hibernate_cleanup_terminal("AP restart");
+		ha->ha_has_stopped_cpus = false;
+	}
+
+	/* Step 3: roll back the selected owner unconditionally. */
+	outcome = HIBERNATE_OWNER_ROLLBACK_UNKNOWN;
+	error = hibernate_selected_owner_rollback(ha, &outcome);
+	if (error != 0 ||
+	    outcome != HIBERNATE_OWNER_ROLLBACK_VERIFIED)
+		hibernate_cleanup_terminal("owner rollback");
+
+	/* Step 4: roll back the coordinator while admission remains closed. */
+	if (ha->ha_has_quiesce) {
+		error = hibernate_quiesce_rollback(ha);
+		if (error != 0)
+			hibernate_cleanup_terminal("coordinator rollback");
+		ha->ha_has_quiesce = false;
+	}
+
+	/* Step 5: restore only the BSP IF state captured at STOP_CPUS. */
+	if (hibernate_resume_intr_state_valid) {
+#ifdef _KERNEL
+		intr_restore(hibernate_resume_intr_state);
+#endif
+		hibernate_resume_intr_state_valid = false;
+	}
+
+	/* Step 6: the sole owned-marker clear and flush action. */
+	hibernate_attempt_cleanup_marker(ha);
+
+	/* Step 7: release resources in reverse acquisition order. */
+	if (ha->ha_has_arena) {
+		hibernate_arena_release(ha);
+		ha->ha_has_arena = false;
+	}
+	if (ha->ha_has_safe_pages)
+		hibernate_safe_pages_free(ha);
+	if (ha->ha_has_metadata)
+		hibernate_metadata_free(ha);
+	if (ha->ha_has_provider || ha->ha_has_extent ||
+	    ha->ha_has_root_hold)
+		hibernate_coordinator_provider_release(ha);
+
+	/* Step 8: reopening and verification are the final action. */
+	if (ha->ha_has_admission_closed &&
+	    hibernate_admission_reopen(ha) != 0)
+		hibernate_cleanup_terminal("admission reopen");
+}
+
+int
+hibernate_resume_attempt(struct hibernate_attempt *ha)
+{
+	const void *meta;
+	size_t meta_len;
+	struct hibernate_marker consuming_marker;
+	cpuset_t target, empty_set;
+	enum hibernate_resume_stage stage;
+	int error;
+
+	if (ha == NULL)
+		return (EINVAL);
+
+	/*
+	 * K-8 wires the attempt metadata buffer here.  This is unreachable
+	 * while READ_METADATA is a temporary ENOTSUP body.
+	 */
+	meta = NULL;
+	meta_len = 0;
+
+	hibernate_resume_stage_log_length = 0;
+	stage = HIB_RESUME_PROBE;
+	error = hibernate_coordinator_probe(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0 || ha->ha_marker_result.class != HMC_PENDING)
+		goto classify_non_pending;
+	ha->ha_marker_owned = HM_OWNED_PENDING;
+
+	stage = HIB_RESUME_READ_METADATA;
+	error = hibernate_meta_read(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0)
+		goto cleanup;
+
+	stage = HIB_RESUME_VALIDATE;
+	error = hibernate_image_decode(meta, meta_len, &ha->ha_image);
+	if (error == 0)
+		error = hibernate_image_validate(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0)
+		goto cleanup;
+
+	stage = HIB_RESUME_ALLOCATE;
+	error = hibernate_safe_pages_alloc(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0)
+		goto cleanup;
+
+	stage = HIB_RESUME_READ_PAYLOAD;
+	error = hibernate_payload_read(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0)
+		goto cleanup;
+
+	stage = HIB_RESUME_VERIFY;
+	error = hibernate_payload_verify(ha);
+	hibernate_resume_stage_record(stage);
+	if (error != 0)
+		goto cleanup;
+
+	/*
+	 * MD_PREPARE: K-10 inserts hibernate_machdep_prepare() at this seam.
+	 */
+	stage = HIB_RESUME_MD_PREPARE;
+	hibernate_resume_stage_record(stage);
+
+	consuming_marker = ha->ha_marker_result.marker;
+	consuming_marker.hm_state = HIBERNATE_MARKER_STATE_CONSUMING;
+	stage = HIB_RESUME_CONSUMING;
+	hibernate_resume_stage_record(stage);
+	error = hibernate_marker_write(ha, &consuming_marker);
+	if (error == 0)
+		error = hibernate_marker_flush(ha);
+	if (error != 0)
+		goto cleanup;
+	ha->ha_marker_owned = HM_OWNED_CONSUMING;
+
+	stage = HIB_RESUME_QUIESCE;
+	hibernate_resume_stage_record(stage);
+	error = hibernate_quiesce(ha);
+	if (error == 0)
+		ha->ha_has_quiesce = true;
+	if (error != 0)
+		goto cleanup;
+
+	stage = HIB_RESUME_STOP_CPUS;
+	hibernate_resume_stage_record(stage);
+	hibernate_resume_intr_state_valid = false;
+#ifdef _KERNEL
+	hibernate_resume_intr_state = intr_disable();
+#else
+	hibernate_resume_intr_state = 0;
+#endif
+	hibernate_resume_intr_state_valid = true;
+	__builtin_memset(&empty_set, 0, sizeof(empty_set));
+	__builtin_memset(&ha->ha_acknowledged_cpus, 0,
+	    sizeof(ha->ha_acknowledged_cpus));
+#ifdef _KERNEL
+	target = all_cpus;
+	CPU_CLR(PCPU_GET(cpuid), &target);
+#else
+	target = empty_set;
+#endif
+	error = hibernate_stop_cpus(target, &ha->ha_acknowledged_cpus);
+	if (error == 0 && __builtin_memcmp(&ha->ha_acknowledged_cpus,
+	    &empty_set, sizeof(empty_set)) != 0)
+		ha->ha_has_stopped_cpus = true;
+	if (error != 0)
+		goto cleanup;
+
+	/*
+	 * RESTORE and ENTER_SAVED: K-10, K-11, and K-13 insert their
+	 * no-return destructive restore and saved-context entry here.
+	 */
+	stage = HIB_RESUME_RESTORE;
+	hibernate_resume_stage_record(stage);
+	stage = HIB_RESUME_ENTER_SAVED;
+	hibernate_resume_stage_record(stage);
+	return (0);
+
+classify_non_pending:
+	switch (ha->ha_marker_result.class) {
+	case HMC_STALE_CONSUMING:
+	case HMC_CONSUMED:
+	case HMC_MALFORMED:
+		if (ha->ha_has_provider && ha->ha_has_extent) {
+			error = hibernate_marker_clear(ha);
+			if (error == 0)
+				error = hibernate_marker_flush(ha);
+		}
+		break;
+	case HMC_ABSENT:
+	case HMC_IO_ERROR:
+	case HMC_PENDING:
+		break;
+	}
+	if (error == 0)
+		error = ENOENT;
+
+cleanup:
+	hibernate_attempt_cleanup(ha);
+	return (error);
+}
+
+/*
  * Pure fail-closed predicate shared by the ACPI gate and host fixtures.
  * Only a successfully flushed PENDING marker may supply true.
  */
@@ -3050,6 +3532,128 @@ bool
 hibernate_s4_commit_gate(bool image_committed)
 {
 	return (image_committed);
+}
+
+#ifdef _KERNEL
+static uint64_t
+hibernate_facs_signature(void)
+{
+
+	return (acpi_hibernate_facs_signature());
+}
+
+static uint64_t
+hibernate_live_physmem_bytes(void)
+{
+
+	return ((uint64_t)physmem * PAGE_SIZE);
+}
+#else
+/* TEST-ONLY deterministic live-platform values for host validation. */
+uint64_t hibernate_test_facs_signature;
+uint64_t hibernate_test_physmem_bytes;
+
+static uint64_t
+hibernate_facs_signature(void)
+{
+
+	return (hibernate_test_facs_signature);
+}
+
+static uint64_t
+hibernate_live_physmem_bytes(void)
+{
+
+	return (hibernate_test_physmem_bytes);
+}
+
+static int
+hibernate_test_amd64_cpu_validate_default(const struct hibernate_pcb *pcb,
+    bool *refuse_la57, bool *refuse_mtrr)
+{
+
+	(void)pcb;
+	*refuse_la57 = false;
+	*refuse_mtrr = false;
+	return (0);
+}
+
+int (*hibernate_test_amd64_cpu_validate)(
+    const struct hibernate_pcb *, bool *, bool *) =
+    hibernate_test_amd64_cpu_validate_default;
+
+static int
+hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb,
+    bool *refuse_la57, bool *refuse_mtrr)
+{
+
+	return (hibernate_test_amd64_cpu_validate(pcb, refuse_la57,
+	    refuse_mtrr));
+}
+#endif
+
+int
+hibernate_image_validate(struct hibernate_attempt *ha)
+{
+	const struct hibernate_image *image;
+	const struct hibernate_cb *cb;
+	vm_paddr_t arena_start, arena_end, start, end;
+	bool refuse_la57, refuse_mtrr;
+	uint64_t i, count;
+	int error;
+
+	if (ha == NULL)
+		return (EINVAL);
+	image = &ha->ha_image;
+	cb = &image->hi_cb;
+
+	/* 1. FACS hardware signature. */
+	if (hibernate_facs_signature() != cb->hc_facs_hardware_signature)
+		return (EINVAL);
+
+	/* 2. Saved physical-memory size. */
+	if (cb->hc_physmem_bytes != hibernate_live_physmem_bytes())
+		return (EINVAL);
+
+	/* 3. Arena tuple agreement (K-9). */
+	if (cb->hc_arena_start != ha->ha_arena_start ||
+	    cb->hc_arena_size != ha->ha_arena_size)
+		return (EINVAL);
+
+	/*
+	 * 4. Destination union: published K-5 view, checked arithmetic,
+	 * strictly increasing non-overlapping, disjoint from the arena.
+	 */
+	if (!ha->ha_dst_valid || ha->ha_dst_intervals == NULL ||
+	    ha->ha_dst_count == 0)
+		return (EINVAL);
+	arena_start = ha->ha_arena_start;
+	if (__builtin_add_overflow((uint64_t)arena_start,
+	    ha->ha_arena_size, &end))
+		return (EOVERFLOW);
+	arena_end = end;
+	count = ha->ha_dst_count;
+	for (i = 0; i < count; i++) {
+		start = ha->ha_dst_intervals[i * 2];
+		end = ha->ha_dst_intervals[i * 2 + 1];
+		if (end <= start)
+			return (EINVAL);
+		if (i > 0 &&
+		    start <= ha->ha_dst_intervals[(i - 1) * 2 + 1])
+			return (EINVAL);
+		if (start < arena_end && end > arena_start)
+			return (EINVAL);
+	}
+
+	/* 5-7. Live CPU/paging + LA57/MTRR refusal via the MD helper. */
+	error = hibernate_amd64_cpu_validate(&image->hi_pcb, &refuse_la57,
+	    &refuse_mtrr);
+	if (error != 0)
+		return (error);
+	if (refuse_la57 || refuse_mtrr)
+		return (EINVAL);
+
+	return (0);
 }
 
 /*
