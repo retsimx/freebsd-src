@@ -150,6 +150,41 @@ probe_io_error(struct hibernate_attempt *ha)
 	return (EIO);
 }
 
+static int
+probe_class(struct hibernate_attempt *ha, enum hibernate_marker_class cls)
+{
+
+	ha->ha_marker_result.class = cls;
+	ha->ha_marker_result.error = 0;
+	ha->ha_marker_result.marker.hm_magic = HIBERNATE_MARKER_MAGIC;
+	ha->ha_marker_result.marker.hm_version = HIBERNATE_MARKER_VERSION;
+	ha->ha_marker_result.marker.hm_state = HIBERNATE_MARKER_STATE_CONSUMING;
+	ha->ha_marker_result.marker.hm_image_offset = HIBERNATE_METADATA_SIZE;
+	ha->ha_marker_result.marker.hm_image_length = DEV_BSIZE;
+	return (0);
+}
+
+static int
+probe_stale(struct hibernate_attempt *ha)
+{
+
+	return (probe_class(ha, HMC_STALE_CONSUMING));
+}
+
+static int
+probe_consumed(struct hibernate_attempt *ha)
+{
+
+	return (probe_class(ha, HMC_CONSUMED));
+}
+
+static int
+probe_malformed(struct hibernate_attempt *ha)
+{
+
+	return (probe_class(ha, HMC_MALFORMED));
+}
+
 static void
 provider_release(struct hibernate_attempt *ha)
 {
@@ -255,6 +290,44 @@ ATF_TC_BODY(coordinator_order_and_marker_ownership, tc)
 	hibernate_test_probe_fn = probe_io_error;
 	ATF_CHECK_EQ(EIO, hibernate_resume_attempt(&f.ha));
 	ATF_CHECK_EQ(HM_OWNED_NONE, f.ha.ha_marker_owned);
+	ATF_CHECK_EQ(0U, f.mock.writes);
+	ATF_CHECK_EQ(0U, f.mock.flushes);
+
+	/*
+	 * Non-PENDING, non-ABSENT classes are the coordinator's sole
+	 * responsibility: with the exact provider held it must clear and
+	 * flush the marker exactly once, even without an image extent
+	 * (a malformed marker has no known extent).
+	 */
+	fixture_init(&f);
+	install_cleanup_seams();
+	f.ha.ha_has_provider = true;
+	hibernate_test_probe_fn = probe_stale;
+	ATF_CHECK_EQ(ENOENT, hibernate_resume_attempt(&f.ha));
+	ATF_CHECK_EQ(1U, f.mock.writes);
+	ATF_CHECK_EQ(1U, f.mock.flushes);
+
+	fixture_init(&f);
+	install_cleanup_seams();
+	f.ha.ha_has_provider = true;
+	hibernate_test_probe_fn = probe_consumed;
+	ATF_CHECK_EQ(ENOENT, hibernate_resume_attempt(&f.ha));
+	ATF_CHECK_EQ(1U, f.mock.writes);
+	ATF_CHECK_EQ(1U, f.mock.flushes);
+
+	fixture_init(&f);
+	install_cleanup_seams();
+	f.ha.ha_has_provider = true;
+	hibernate_test_probe_fn = probe_malformed;
+	ATF_CHECK_EQ(ENOENT, hibernate_resume_attempt(&f.ha));
+	ATF_CHECK_EQ(1U, f.mock.writes);
+	ATF_CHECK_EQ(1U, f.mock.flushes);
+
+	/* Without a held provider there is no safe clear. */
+	fixture_init(&f);
+	install_cleanup_seams();
+	hibernate_test_probe_fn = probe_stale;
+	ATF_CHECK_EQ(ENOENT, hibernate_resume_attempt(&f.ha));
 	ATF_CHECK_EQ(0U, f.mock.writes);
 	ATF_CHECK_EQ(0U, f.mock.flushes);
 	reset_seams();
@@ -367,12 +440,19 @@ validation_fixture(struct hibernate_attempt *ha, vm_paddr_t *intervals)
 	ha->ha_dst_intervals = intervals;
 	ha->ha_dst_count = 1;
 	ha->ha_dst_valid = true;
-	ha->ha_arena_start = VALID_ARENA_START;
-	ha->ha_arena_size = VALID_ARENA_SIZE;
+	/*
+	 * Claim the transition arena through the production K-9 path rather
+	 * than writing ha_arena_start/size directly, so the arena-agreement
+	 * check is exercised against a genuinely claimed tuple.
+	 */
+	hibernate_arena_reset();
+	ATF_REQUIRE_EQ(0, hibernate_arena_reserve(VALID_ARENA_START,
+	    VALID_ARENA_SIZE));
+	ATF_REQUIRE_EQ(0, hibernate_arena_claim(ha));
 	ha->ha_image.hi_cb.hc_facs_hardware_signature = VALID_FACS;
 	ha->ha_image.hi_cb.hc_physmem_bytes = VALID_PHYSMEM;
-	ha->ha_image.hi_cb.hc_arena_start = VALID_ARENA_START;
-	ha->ha_image.hi_cb.hc_arena_size = VALID_ARENA_SIZE;
+	ha->ha_image.hi_cb.hc_arena_start = ha->ha_arena_start;
+	ha->ha_image.hi_cb.hc_arena_size = ha->ha_arena_size;
 	hibernate_test_facs_signature = VALID_FACS;
 	hibernate_test_physmem_bytes = VALID_PHYSMEM;
 	hibernate_test_amd64_cpu_validate = cpu_validate;

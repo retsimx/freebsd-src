@@ -168,7 +168,7 @@ g_hibernate_worker(void *arg)
 	struct hibernate_attempt attempt;
 	struct hibernate_marker_result result;
 	uint64_t extent_end, extent_length;
-	bool admitted, teardown;
+	bool admitted, extent_held, teardown;
 	int error;
 
 	sc = arg;
@@ -228,19 +228,33 @@ g_hibernate_worker(void *arg)
 		teardown = sc->teardown_requested;
 		admitted = false;
 	}
-	sc->worker_done = true;
-	wakeup(sc);
+	extent_held = sc->extent_held;
 	mtx_unlock(&sc->lock);
 
-	if (admitted && error == 0 && result.class == HMC_PENDING) {
+	/*
+	 * Hand the classified attempt to the K-7 coordinator in the same kproc
+	 * before signalling worker completion.  The coordinator owns every
+	 * RESTORE-attempt marker clear/flush, including the narrow
+	 * classification clear for a stale, consumed, or malformed marker.
+	 */
+	if (admitted && error == 0 &&
+	    (result.class == HMC_PENDING ||
+	    result.class == HMC_STALE_CONSUMING ||
+	    result.class == HMC_CONSUMED ||
+	    result.class == HMC_MALFORMED)) {
 		attempt.ha_has_root_hold = true;
 		attempt.ha_has_provider = true;
-		attempt.ha_has_extent = true;
+		attempt.ha_has_extent = extent_held;
 		hibernate_resume_attempt(&attempt);
 		result = attempt.ha_marker_result;
 	}
 	if (admitted)
 		g_hibernate_complete_probe(&result);
+
+	mtx_lock(&sc->lock);
+	sc->worker_done = true;
+	wakeup(sc);
+	mtx_unlock(&sc->lock);
 
 	if (teardown && g_hibernate_release_owner(sc))
 		(void)g_waitfor_event(g_hibernate_teardown_event, sc, M_WAITOK,

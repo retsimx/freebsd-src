@@ -3416,6 +3416,18 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 
 	stage = HIB_RESUME_VALIDATE;
 	error = hibernate_image_decode(meta, meta_len, &ha->ha_image);
+	if (error == 0) {
+		/*
+		 * Claim the K-9 transition arena before validating its tuple
+		 * so ha_arena_start/size hold the restore boot's immutable
+		 * range, which hibernate_image_validate() cross-checks against
+		 * the decoded CB fields.  Cleanup step 7 releases the claim on
+		 * any failure.
+		 */
+		error = hibernate_arena_claim(ha);
+		if (error == 0)
+			ha->ha_has_arena = true;
+	}
 	if (error == 0)
 		error = hibernate_image_validate(ha);
 	hibernate_resume_stage_record(stage);
@@ -3467,13 +3479,6 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 
 	stage = HIB_RESUME_STOP_CPUS;
 	hibernate_resume_stage_record(stage);
-	hibernate_resume_intr_state_valid = false;
-#ifdef _KERNEL
-	hibernate_resume_intr_state = intr_disable();
-#else
-	hibernate_resume_intr_state = 0;
-#endif
-	hibernate_resume_intr_state_valid = true;
 	__builtin_memset(&empty_set, 0, sizeof(empty_set));
 	__builtin_memset(&ha->ha_acknowledged_cpus, 0,
 	    sizeof(ha->ha_acknowledged_cpus));
@@ -3489,6 +3494,17 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		ha->ha_has_stopped_cpus = true;
 	if (error != 0)
 		goto cleanup;
+	/*
+	 * BSP interrupt state is captured only after every targeted AP has
+	 * acknowledged the stop (the STOP_CPUS stage's required result).
+	 */
+	hibernate_resume_intr_state_valid = false;
+#ifdef _KERNEL
+	hibernate_resume_intr_state = intr_disable();
+#else
+	hibernate_resume_intr_state = 0;
+#endif
+	hibernate_resume_intr_state_valid = true;
 
 	/*
 	 * RESTORE and ENTER_SAVED: K-10, K-11, and K-13 insert their
@@ -3505,7 +3521,12 @@ classify_non_pending:
 	case HMC_STALE_CONSUMING:
 	case HMC_CONSUMED:
 	case HMC_MALFORMED:
-		if (ha->ha_has_provider && ha->ha_has_extent) {
+		/*
+		 * The issue gates this narrow classification clear on K-4
+		 * having acquired the exact safely writable provider, not on
+		 * an image extent (a malformed marker has no known extent).
+		 */
+		if (ha->ha_has_provider) {
 			error = hibernate_marker_clear(ha);
 			if (error == 0)
 				error = hibernate_marker_flush(ha);
