@@ -264,6 +264,14 @@ ATF_TC_BODY(coordinator_order_and_marker_ownership, tc)
 	fixture_init(&f);
 	install_cleanup_seams();
 	hibernate_test_probe_fn = probe_pending;
+	/*
+	 * K-8's hibernate_meta_read() requires ha_has_provider before
+	 * issuing any read; with no hibernate_test_provider_read_fn
+	 * installed, hibernate_stage_read() still reaches exactly
+	 * ENOTSUP (design 035 SS1.5's default-seam expectation), so this
+	 * coordinator test's READ_METADATA-stop expectation is unchanged.
+	 */
+	f.ha.ha_has_provider = true;
 
 	ATF_CHECK_EQ(ENOTSUP, hibernate_resume_attempt(&f.ha));
 	ATF_CHECK_EQ(2U, hibernate_resume_stage_log_length);
@@ -405,6 +413,14 @@ check_stub(stage_fn_t fn)
 	ATF_CHECK_EQ(0, memcmp(&before, &ha, sizeof(ha)));
 }
 
+/*
+ * temporary_stubs: K-12 stubs.  hibernate_meta_read(),
+ * hibernate_safe_pages_alloc(), hibernate_payload_read() and
+ * hibernate_image_crc32c_verify() (formerly hibernate_payload_verify())
+ * are landed K-8 bodies (design 035 SS1.5) and no longer compile
+ * against check_stub()'s unconditional-ENOTSUP contract; only the
+ * still-unimplemented K-12 quiesce/CPU-restart seams remain here.
+ */
 ATF_TC_WITHOUT_HEAD(temporary_stubs);
 ATF_TC_BODY(temporary_stubs, tc)
 {
@@ -412,10 +428,6 @@ ATF_TC_BODY(temporary_stubs, tc)
 	cpuset_t target, acknowledged;
 
 	reset_seams();
-	check_stub(hibernate_meta_read);
-	check_stub(hibernate_safe_pages_alloc);
-	check_stub(hibernate_payload_read);
-	check_stub(hibernate_payload_verify);
 	check_stub(hibernate_quiesce);
 	check_stub(hibernate_quiesce_rollback);
 
