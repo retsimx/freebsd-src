@@ -46,6 +46,8 @@
  *   - stdbool.h   : bool, true, false
  *   - stddef.h    : size_t, NULL
  *   - string.h    : memcpy/memset (for __builtin_memcpy/__builtin_memset)
+ *   - stdlib.h    : calloc/free (hib_malloc()/hib_free() K-8 userland
+ *                   branch) and qsort (hib_vm_paddr_cmp() consumers)
  *   - sys/endian.h: le64dec, le32dec, le16dec (available in userland)
  *   - errno.h     : EINVAL, EOVERFLOW, ENOENT, E2BIG, ENOTSUP
  */
@@ -53,6 +55,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <sys/endian.h>
 
@@ -140,6 +143,50 @@ extern int (*hibernate_test_amd64_cpu_validate)(
     const struct hibernate_pcb *, bool *, bool *);
 extern uint64_t hibernate_test_facs_signature;
 extern uint64_t hibernate_test_physmem_bytes;
+
+/*
+ * TEST-ONLY K-8 seams.  hibernate_test_provider_read_fn stands in for
+ * hibernate_provider_read() (geom_hibernate.c, kernel-only); NULL means
+ * "not wired", matching hibernate_test_probe_fn's convention.
+ * hibernate_test_alloc_fail_after is the hib_malloc() failure-injection
+ * counter (0 == never fail).
+ */
+extern int (*hibernate_test_provider_read_fn)(struct hibernate_attempt *,
+    uint64_t, void *, size_t);
+extern unsigned int hibernate_test_alloc_fail_after;
+
+/*
+ * TEST-ONLY K-8 ALLOCATE page-backend seams (H1).  struct hib_page_set's
+ * userland shape (no vm_phys_reservation field; that field is kernel-
+ * only) is defined here, force-included before kern_hibernate.c's own
+ * (identical, _HIBERNATE_USERLAND_BUILD-guarded) definition is reached,
+ * so both translation units -- kern_hibernate.c and the test file --
+ * see the same layout.  kern_hibernate.c skips its own copy under
+ * _HIBERNATE_USERLAND_BUILD so there is exactly one definition in each
+ * build.
+ */
+struct hib_page_set {
+	vm_paddr_t *hp_pa;
+	u_long hp_count;
+	u_long hp_wired;
+};
+
+extern int (*hibernate_test_pages_reserve_fn)(struct hibernate_attempt *,
+    size_t, struct hib_page_set *);
+extern void *(*hibernate_test_pages_map_fn)(vm_paddr_t);
+extern void (*hibernate_test_pages_release_fn)(struct hib_page_set *);
+
+/*
+ * TEST-ONLY K-8 task-4 coverage-refusal seam (H8).  NULL means "use
+ * the real hibernate_image_interval_next()" (hibernate_image_walk()
+ * remains the sole production caller); when installed, this seam
+ * replaces that one call site so malformed interval sequences the
+ * real K-2 iterator cannot produce (overlapping, backward, gapped,
+ * repeated, interleaved, zero-length, overshooting, short-of-end) can
+ * be injected directly.
+ */
+extern int (*hibernate_test_interval_next_fn)(
+    struct hibernate_image_iterator *, struct hibernate_image_interval *);
 #endif
 
 /*

@@ -48,7 +48,9 @@
 #include <sys/hibernate.h>
 #include <sys/kernel.h>
 #include <sys/kerneldump.h>
+#include <sys/libkern.h>
 #include <sys/lock.h>
+#include <sys/malloc.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sched.h>
@@ -58,6 +60,8 @@
 
 #include <machine/atomic.h>
 #include <machine/hibernate.h>
+#include <machine/md_var.h>
+#include <machine/vmparam.h>
 
 #include <cam/cam.h>
 #include <cam/cam_ccb.h>
@@ -3091,49 +3095,1136 @@ static bool hibernate_resume_intr_state_valid;
 static void
 hibernate_resume_stage_record(enum hibernate_resume_stage stage)
 {
-
 	if (hibernate_resume_stage_log_length < HIB_RESUME_STAGE_COUNT) {
-		hibernate_resume_stage_log[
-		    hibernate_resume_stage_log_length++] = stage;
+		hibernate_resume_stage_log
+		    [hibernate_resume_stage_log_length++] = stage;
 	}
 }
 
-int
-hibernate_meta_read(struct hibernate_attempt *ha)
-{
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY allocation-failure injection for hib_malloc().  Zero (the
+ * default) never fails.  A positive value counts down on every call and
+ * forces exactly one NULL return when it reaches zero; it then stays at
+ * zero (disabled) until a test resets it.
+ */
+unsigned int hibernate_test_alloc_fail_after;
+#endif
 
-	(void)ha;
-	return (ENOTSUP);
+/*
+ * hib_malloc / hib_free: the single K-8 allocation wrapper used for the
+ * metadata block (H5).  _KERNEL uses M_TEMP (already MALLOC_DECLARE()d
+ * elsewhere in the tree; no new malloc type).  The userland branch uses
+ * calloc()/free() with the injectable failure counter above.
+ */
+static void *
+hib_malloc(size_t size)
+{
+#ifdef _KERNEL
+	return (malloc(size, M_TEMP, M_NOWAIT | M_ZERO));
+#else
+	if (hibernate_test_alloc_fail_after != 0) {
+		if (--hibernate_test_alloc_fail_after == 0)
+			return (NULL);
+	}
+	return (calloc(1, size));
+#endif
 }
 
+static void
+hib_free(void *p)
+{
+#ifdef _KERNEL
+	free(p, M_TEMP);
+#else
+	free(p);
+#endif
+}
+
+/*
+ * hibernate_image_rel_offset: H2 -- translate an image-relative range
+ * [rel, rel+length) into a checked provider-relative byte offset.
+ *
+ * I = marker.hm_image_offset and L = marker.hm_image_length are in the
+ * dumper's address space (di->mediaoffset-based); hibernate_provider_
+ * read()'s offsets are provider-relative, so prov_off = (I - mediaoffset)
+ * + rel.  Resolves gap G5 (design 035 SS0.3); exercised with a non-zero
+ * mediaoffset (design 035 SS6.4, risk R1).
+ */
+static int
+hibernate_image_rel_offset(struct hibernate_attempt *ha, uint64_t rel,
+    uint64_t length, uint64_t *prov_off)
+{
+	struct dumperinfo *di;
+	uint64_t hm_offset, hm_length, mediaoffset, off, end;
+
+	if (ha == NULL || ha->ha_dumper == NULL || prov_off == NULL)
+		return (EINVAL);
+	di = ha->ha_dumper;
+	if (di->mediaoffset < 0)
+		return (EINVAL);
+	mediaoffset = (uint64_t)di->mediaoffset;
+	hm_offset = ha->ha_marker_result.marker.hm_image_offset;
+	hm_length = ha->ha_marker_result.marker.hm_image_length;
+	if (mediaoffset > hm_offset)
+		return (EINVAL);
+	if (__builtin_add_overflow(rel, length, &end))
+		return (EOVERFLOW);
+	if (end > hm_length)
+		return (EINVAL);
+	if (__builtin_sub_overflow(hm_offset, mediaoffset, &off))
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(off, rel, &off))
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(off, length, &end))
+		return (EOVERFLOW);
+	if (end > ha->ha_provider_size)
+		return (EINVAL);
+	*prov_off = off;
+	return (0);
+}
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY K-8 provider-read seam.  NULL means "not wired"; the
+ * production body below returns ENOTSUP in that case, matching the
+ * landed hibernate_test_probe_fn pattern.  The test seam records every
+ * (rel_offset, length) pair it is called with.
+ */
+int (*hibernate_test_provider_read_fn)(struct hibernate_attempt *, uint64_t,
+    void *, size_t);
+#endif
+
+/*
+ * hibernate_stage_read: the sole read primitive used by H6.  Translates
+ * an image-relative range to a provider offset (H2) and issues exactly
+ * one logical read through the dual-build backend: hibernate_provider_
+ * read() (geom_hibernate.c) in the kernel, the injectable TEST-ONLY seam
+ * in userland.
+ */
+static int
+hibernate_stage_read(struct hibernate_attempt *ha, uint64_t rel, void *buf,
+    size_t length)
+{
+	uint64_t prov_off;
+	int error;
+
+	error = hibernate_image_rel_offset(ha, rel, length, &prov_off);
+	if (error != 0)
+		return (error);
+#ifdef _KERNEL
+	return (hibernate_provider_read(ha, prov_off, buf, length));
+#else
+	if (hibernate_test_provider_read_fn == NULL)
+		return (ENOTSUP);
+	return (hibernate_test_provider_read_fn(ha, prov_off, buf, length));
+#endif
+}
+
+/*
+ * hibernate_meta_check_phdr_end: H3 -- pure bound on the ELF header plus
+ * program-header table length.  The 50,464-byte limit applies only to
+ * this length, never to total metadata.
+ */
+int
+hibernate_meta_check_phdr_end(uint64_t phdr_end)
+{
+	if (phdr_end > 50464)
+		return (E2BIG);
+	return (0);
+}
+
+/*
+ * hibernate_meta_check_total: H3 -- pure bound on the derived total
+ * metadata prefix length (payload_start).  Order matches the design:
+ * reject zero/above the 64029-byte prototype ceiling first, then the
+ * buffer-capacity bound, then the image-length bound.
+ */
+int
+hibernate_meta_check_total(uint64_t total, size_t buf_max,
+    uint64_t image_length)
+{
+	if (total == 0 || total > 64029)
+		return (EINVAL);
+	if (total > HIBERNATE_META_BUF_MAX || total > buf_max)
+		return (E2BIG);
+	if (total > image_length)
+		return (EINVAL);
+	return (0);
+}
+
+/*
+ * hibernate_dst_view_build: H4 -- build the restore-side destination view
+ * directly from the already-decoded, already-validated PT_LOAD headers
+ * (gap G1; no restore-side code otherwise publishes ha_dst_*).  Reads
+ * only p_type/p_paddr/p_filesz; hibernate_image_decode() has already
+ * proven every PT_LOAD page aligned, non-overlapping and strictly
+ * increasing.  Touching intervals (p_paddr == previous end) are
+ * coalesced because hibernate_image_validate() step 4 refuses
+ * start <= prev_end.  Intervals are written into the metadata block's
+ * tail (ha_meta_buf + HIBERNATE_META_BUF_MAX, capacity
+ * 2 * HIBERNATE_MAX_PHDRS vm_paddr_t entries == HIBERNATE_MAX_PHDRS
+ * pairs); no page queue is ever consulted.  ha_dst_valid is set last.
+ */
+static int
+hibernate_dst_view_build(struct hibernate_attempt *ha)
+{
+	const uint8_t *b;
+	vm_paddr_t *intervals;
+	uint64_t count, total_pages, i, phnum;
+
+	if (ha == NULL || ha->ha_meta_buf == NULL ||
+	    ha->ha_image.hi_prefix == NULL)
+		return (EINVAL);
+
+	b = ha->ha_image.hi_prefix;
+	phnum = ha->ha_image.hi_phnum;
+	intervals = (vm_paddr_t *)((uint8_t *)ha->ha_meta_buf +
+	    HIBERNATE_META_BUF_MAX);
+	count = 0;
+	total_pages = 0;
+
+	for (i = 0; i < phnum; i++) {
+		const uint8_t *ph;
+		uint32_t p_type;
+		uint64_t p_paddr, p_filesz, end, pages;
+
+		/* decode() already requires e_phoff == EHDR_SIZE. */
+		ph = b + EHDR_SIZE + i * PHDR_SIZE;
+		p_type = le32dec(ph + PHDR_OFF_P_TYPE);
+		if (p_type != PT_LOAD)
+			continue;
+
+		p_paddr = le64dec(ph + PHDR_OFF_P_PADDR);
+		p_filesz = le64dec(ph + PHDR_OFF_P_FILESZ);
+		if (p_filesz == 0 || (p_filesz & (HIB_PAGE_SIZE - 1)) != 0)
+			return (EINVAL);
+		if (__builtin_add_overflow(p_paddr, p_filesz, &end))
+			return (EOVERFLOW);
+		pages = p_filesz / HIB_PAGE_SIZE;
+		if (__builtin_add_overflow(total_pages, pages, &total_pages))
+			return (EOVERFLOW);
+
+		if (count > 0 && p_paddr == intervals[(count - 1) * 2 + 1]) {
+			/* Touching interval: extend the open one. */
+			intervals[(count - 1) * 2 + 1] = end;
+			continue;
+		}
+		if (count >= HIBERNATE_MAX_PHDRS)
+			return (E2BIG);
+		intervals[count * 2] = p_paddr;
+		intervals[count * 2 + 1] = end;
+		count++;
+	}
+
+	if (total_pages != ha->ha_image.hi_destination_pages)
+		return (EINVAL);
+
+	ha->ha_dst_intervals = intervals;
+	ha->ha_dst_count = count;
+	ha->ha_dst_valid = true;
+	return (0);
+}
+
+/*
+ * hibernate_resume_meta_acquire: H5 -- allocate the one metadata block
+ * (the HIBERNATE_META_BUF_MAX prefix plus its destination-interval tail)
+ * and populate it via hibernate_meta_read().  On any failure the block
+ * is freed locally and ha_has_metadata stays false; on success ownership
+ * transfers to the attempt.
+ */
+static int
+hibernate_resume_meta_acquire(struct hibernate_attempt *ha,
+    size_t *meta_len_out)
+{
+	void *blk;
+	size_t blk_size, meta_len;
+	int error;
+
+	if (ha == NULL || meta_len_out == NULL)
+		return (EINVAL);
+	*meta_len_out = 0;
+
+	blk_size = HIBERNATE_META_BUF_MAX +
+	    2 * HIBERNATE_MAX_PHDRS * sizeof(vm_paddr_t);
+	blk = hib_malloc(blk_size);
+	if (blk == NULL)
+		return (ENOMEM);
+
+	meta_len = 0;
+	error = hibernate_meta_read(ha, blk, HIBERNATE_META_BUF_MAX, &meta_len);
+	if (error != 0) {
+		hib_free(blk);
+		return (error);
+	}
+
+	ha->ha_meta_buf = blk;
+	ha->ha_meta_len = meta_len;
+	ha->ha_has_metadata = true;
+	*meta_len_out = meta_len;
+	return (0);
+}
+
+/*
+ * hibernate_meta_read: H6 -- the bounded two-step metadata read.
+ *
+ * Step 1 reads exactly 64 bytes at image-relative 0 and validates just
+ * enough (ELF identity/class/endianness/header sizes, checked e_phnum)
+ * to size the program-header table.  Step 2g derives the page-aligned
+ * CB/PCB/payload_start chain and bounds it with the exported predicates.
+ * Step 2 reads [64, payload_start) in one I/O, ending exactly at
+ * payload_start; no payload byte is ever requested.  Step 2v hands the
+ * complete prefix to hibernate_image_decode(), the single authority for
+ * padding, CB/PCB cross-checks and destination counts.
+ */
+int
+hibernate_meta_read(struct hibernate_attempt *ha, void *meta_buf,
+    size_t meta_buf_max, size_t *meta_len_out)
+{
+	uint8_t *mb;
+	struct hibernate_image scratch;
+	uint64_t hm_length, phdr_end, tmp;
+	uint64_t cb_offset, cb_end, pcb_offset, pcb_end, payload_start;
+	size_t limit;
+	uint16_t phnum;
+	int error;
+
+	if (ha == NULL || meta_buf == NULL || meta_len_out == NULL)
+		return (EINVAL);
+	*meta_len_out = 0;
+	if (!ha->ha_has_provider)
+		return (EINVAL);
+	if (ha->ha_marker_result.class != HMC_PENDING)
+		return (EINVAL);
+
+	hm_length = ha->ha_marker_result.marker.hm_image_length;
+	if (hm_length < DEV_BSIZE)
+		return (EINVAL);
+	limit = (meta_buf_max < (size_t)HIBERNATE_META_BUF_MAX) ?
+	    meta_buf_max :
+	    (size_t)HIBERNATE_META_BUF_MAX;
+
+	mb = meta_buf;
+
+	/* Step 1: exactly 64 bytes at image-relative 0. */
+	error = hibernate_stage_read(ha, 0, mb, EHDR_SIZE);
+	if (error != 0)
+		return (error);
+
+	/* Step 1v: minimal identity/size validation to size the phdr table. */
+	if (mb[EHDR_OFF_EI_MAG0] != ELFMAG0 ||
+	    mb[EHDR_OFF_EI_MAG1] != ELFMAG1 ||
+	    mb[EHDR_OFF_EI_MAG2] != ELFMAG2 || mb[EHDR_OFF_EI_MAG3] != ELFMAG3)
+		return (EINVAL);
+	if (mb[EHDR_OFF_EI_CLASS] != ELFCLASS64)
+		return (EINVAL);
+	if (mb[EHDR_OFF_EI_DATA] != ELFDATA2LSB)
+		return (EINVAL);
+	if (mb[EHDR_OFF_EI_VERSION] != EV_CURRENT)
+		return (EINVAL);
+	if (le16dec(mb + EHDR_OFF_E_EHSIZE) != EHDR_SIZE)
+		return (EINVAL);
+	if (le16dec(mb + EHDR_OFF_E_PHENTSIZE) != PHDR_SIZE)
+		return (EINVAL);
+	if (le64dec(mb + EHDR_OFF_E_PHOFF) != EHDR_SIZE)
+		return (EINVAL);
+
+	phnum = le16dec(mb + EHDR_OFF_E_PHNUM);
+	if (phnum < 1 || phnum > HIBERNATE_MAX_PHDRS)
+		return (EINVAL);
+
+	if (__builtin_mul_overflow((uint64_t)phnum, (uint64_t)PHDR_SIZE, &tmp))
+		return (EOVERFLOW);
+	if (__builtin_add_overflow((uint64_t)EHDR_SIZE, tmp, &phdr_end))
+		return (EOVERFLOW);
+	error = hibernate_meta_check_phdr_end(phdr_end);
+	if (error != 0)
+		return (error);
+
+	/* Step 2g: derive the page-aligned CB/PCB/payload_start chain. */
+	error = align_up_checked(phdr_end, HIB_PAGE_SIZE, &cb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(cb_offset,
+		(uint64_t)HIBERNATE_CB_ENCODED_SIZE, &cb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(cb_end, HIB_PAGE_SIZE, &pcb_offset);
+	if (error != 0)
+		return (error);
+	if (__builtin_add_overflow(pcb_offset,
+		(uint64_t)HIBERNATE_PCB_ENCODED_SIZE, &pcb_end))
+		return (EOVERFLOW);
+	error = align_up_checked(pcb_end, HIB_PAGE_SIZE, &payload_start);
+	if (error != 0)
+		return (error);
+
+	error = hibernate_meta_check_total(payload_start, limit, hm_length);
+	if (error != 0)
+		return (error);
+
+	/* Step 2: [I+64, I+payload_start) in one I/O; never beyond it. */
+	error = hibernate_stage_read(ha, EHDR_SIZE, mb + EHDR_SIZE,
+	    (size_t)(payload_start - EHDR_SIZE));
+	if (error != 0)
+		return (error);
+
+	/* Step 2v: the single decode authority for the whole prefix. */
+	__builtin_memset(&scratch, 0, sizeof(scratch));
+	error = hibernate_image_decode(mb, (size_t)payload_start, &scratch);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * The marker's hm_image_length is a separate scalar, never inferred
+	 * from the buffer; cross-check it against the CB's own encoded
+	 * image length here so any disagreement refuses READ_METADATA
+	 * directly rather than being deferred to VALIDATE.
+	 */
+	if (scratch.hi_image_length != hm_length)
+		return (EINVAL);
+
+	*meta_len_out = (size_t)payload_start;
+	return (0);
+}
+
+/*
+ * struct hib_page_set: K-8's page-backend record.  It operates on PA
+ * lists so the portable ALLOCATE logic (H7) never sees vm_page_t.
+ * hp_pa/hp_count/hp_wired are shared by both builds; hp_res (the K-5
+ * reservation record proper) is kernel-only.
+ *
+ * In the userland build, the portable fields (hp_pa/hp_count/hp_wired)
+ * are defined once in hibernate_compat.h (force-included before this
+ * point) so production-source host tests share the identical layout;
+ * only the _KERNEL extension is added here.
+ */
+#ifdef _KERNEL
+struct hib_page_set {
+	vm_paddr_t *hp_pa; /* hp_count checked 64-bit PAs (owned). */
+	u_long hp_count;   /* Number of PAs recorded. */
+	u_long hp_wired;   /* Number of PAs actually wired. */
+	struct vm_phys_reservation hp_res;
+};
+#endif
+
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY K-8 page-backend seams.  NULL means "not wired"; each
+ * production body below returns ENOTSUP in that case, matching the
+ * landed hibernate_test_probe_fn convention.
+ */
+int (*hibernate_test_pages_reserve_fn)(struct hibernate_attempt *, size_t,
+    struct hib_page_set *);
+void *(*hibernate_test_pages_map_fn)(vm_paddr_t);
+void (*hibernate_test_pages_release_fn)(struct hib_page_set *);
+#endif
+
+/*
+ * hib_pages_reserve: H1 -- reserve exactly count destination- and
+ * arena-disjoint pages from the fresh RESTORE boot's vm_phys free pool,
+ * wire each one, and collect its PA into set->hp_pa.
+ *
+ * The caller preallocates set->hp_res.vr_pages (_KERNEL) with capacity
+ * count before calling this function; hib_pages_reserve sets
+ * vr_capacity/vr_count and performs the literal
+ * vm_phys_hibernate_reserve_count(ha, count, &set->hp_res) call.  On
+ * any reservation failure the primitive has already rolled back
+ * (vr_count == 0); hib_pages_reserve adds no further release.  On a
+ * post-reservation hp_pa allocation failure, the already-reserved
+ * pages are released here before returning ENOMEM, so no caller ever
+ * observes a committed reservation without a matching hp_pa array.
+ */
+static int
+hib_pages_reserve(struct hibernate_attempt *ha, size_t count,
+    struct hib_page_set *set)
+{
+#ifdef _KERNEL
+	uint64_t vecbytes;
+	u_long i, want;
+	int error;
+
+	if (ha == NULL || set == NULL || count == 0)
+		return (EINVAL);
+	if (count > (size_t)(u_long)-1)
+		return (EOVERFLOW);
+	want = (u_long)count;
+	if (__builtin_mul_overflow((uint64_t)count,
+		(uint64_t)sizeof(vm_paddr_t), &vecbytes))
+		return (EOVERFLOW);
+
+	set->hp_res.vr_capacity = want;
+	set->hp_res.vr_count = 0;
+	error = vm_phys_hibernate_reserve_count(ha, count, &set->hp_res);
+	if (error != 0)
+		return (error);
+	/* Literal success predicate: 0 && vr_count == count. */
+	if (set->hp_res.vr_count != want) {
+		vm_phys_hibernate_release(&set->hp_res);
+		return (EINVAL);
+	}
+
+	set->hp_pa = hib_malloc((size_t)vecbytes);
+	if (set->hp_pa == NULL) {
+		vm_phys_hibernate_release(&set->hp_res);
+		return (ENOMEM);
+	}
+
+	set->hp_count = 0;
+	set->hp_wired = 0;
+	for (i = 0; i < want; i++) {
+		vm_page_t m;
+
+		m = set->hp_res.vr_pages[i].vrp_page;
+		set->hp_pa[i] = VM_PAGE_TO_PHYS(m);
+		vm_page_wire(m);
+		set->hp_wired++;
+	}
+	set->hp_count = want;
+	return (0);
+#else
+	if (hibernate_test_pages_reserve_fn == NULL)
+		return (ENOTSUP);
+	return (hibernate_test_pages_reserve_fn(ha, count, set));
+#endif
+}
+
+/*
+ * hib_pages_map: H1 -- the one temporary-mapping primitive.  amd64 has
+ * a direct map at ALLOCATE time (design 035 A5), so no mapping is
+ * created and hib_pages_release() removes none.
+ */
+static void *
+hib_pages_map(vm_paddr_t pa)
+{
+#ifdef _KERNEL
+	return (PHYS_TO_DMAP(pa));
+#else
+	if (hibernate_test_pages_map_fn == NULL)
+		return (NULL);
+	return (hibernate_test_pages_map_fn(pa));
+#endif
+}
+
+/*
+ * hib_pages_release: H1 -- wipe every recorded page through the direct
+ * map, unwire exactly hp_wired of them, then release the K-5 record.
+ * Safe on an all-zero (never-reserved) set.  Does not free hp_pa or
+ * hp_res.vr_pages; the owning hibernate_safe_pages_free() does that.
+ */
+static void
+hib_pages_release(struct hib_page_set *set)
+{
+#ifdef _KERNEL
+	u_long i;
+
+	if (set == NULL)
+		return;
+	for (i = 0; i < set->hp_count; i++)
+		pagezero(PHYS_TO_DMAP(set->hp_pa[i]));
+	for (i = 0; i < set->hp_wired; i++)
+		vm_page_unwire_noq(PHYS_TO_VM_PAGE(set->hp_pa[i]));
+	vm_phys_hibernate_release(&set->hp_res);
+	set->hp_count = 0;
+	set->hp_wired = 0;
+#else
+	if (hibernate_test_pages_release_fn != NULL)
+		hibernate_test_pages_release_fn(set);
+#endif
+}
+
+/*
+ * struct hibernate_staging: H7's private ALLOCATE-stage record, owned
+ * through ha_staging.  hs_src is the P-page accepted source-page
+ * reservation (S); hs_aux is the second, distinct A-page reservation
+ * (V vector pages + X XSAVE pages + 1 bounce page).
+ */
+struct hibernate_staging {
+	struct hib_page_set hs_src;
+	struct hib_page_set hs_aux;
+	u_long hs_vector_pages; /* V */
+	u_long hs_xsave_pages;	/* X (always 1; X > 1 refuses E2BIG). */
+};
+
+/*
+ * hib_pa_in_dst: binary search over the sorted, strictly increasing,
+ * non-adjacent ha_dst_intervals pairs.  False when no view is
+ * published (mirrors vm_phys.c's hib_page_is_destination()).
+ */
+static bool
+hib_pa_in_dst(const struct hibernate_attempt *ha, vm_paddr_t pa)
+{
+	uint64_t lo, hi, mid, start, end;
+
+	if (!ha->ha_dst_valid || ha->ha_dst_intervals == NULL ||
+	    ha->ha_dst_count == 0)
+		return (false);
+
+	lo = 0;
+	hi = ha->ha_dst_count;
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		start = ha->ha_dst_intervals[mid * 2];
+		end = ha->ha_dst_intervals[mid * 2 + 1];
+		if (pa < start)
+			hi = mid;
+		else if (pa >= end)
+			lo = mid + 1;
+		else
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * hib_pa_in_arena: membership test against the validated transition
+ * arena.  Wrap-safe, mirroring vm_phys.c's hib_page_in_arena().
+ */
+static bool
+hib_pa_in_arena(const struct hibernate_attempt *ha, vm_paddr_t pa)
+{
+	vm_paddr_t end;
+
+	if (ha->ha_arena_size == 0)
+		return (false);
+	if (pa < ha->ha_arena_start)
+		return (false);
+	end = ha->ha_arena_start + ha->ha_arena_size;
+	if (end < ha->ha_arena_start)
+		return (true);
+	return (pa < end);
+}
+
+/*
+ * hib_pages_verify: H7 steps 6 and 8 -- direct verification of an
+ * accepted page set (no page-queue traversal; only vm_page_wire()/
+ * PHYS_TO_VM_PAGE()/VM_PAGE_TO_PHYS()).  Checks
+ * cardinality, page alignment, PHYS_TO_VM_PAGE(pa) == the recorded
+ * vrp_page (_KERNEL only), disjointness from the destination union and
+ * the arena, and uniqueness via a transient sorted copy, freed before
+ * return.  When other != NULL (the aux call), the transient copy
+ * covers both sets, so one adjacent-duplicate scan proves aux's own
+ * uniqueness and aux-intersect-src == empty together.
+ */
+static int
+hib_staging_pa_cmp(const void *a, const void *b)
+{
+	vm_paddr_t pa, pb;
+
+	pa = *(const vm_paddr_t *)a;
+	pb = *(const vm_paddr_t *)b;
+	if (pa < pb)
+		return (-1);
+	if (pa > pb)
+		return (1);
+	return (0);
+}
+
+static int
+hib_pages_verify(const struct hibernate_attempt *ha,
+    const struct hib_page_set *set, const struct hib_page_set *other,
+    uint64_t expect)
+{
+	vm_paddr_t *sorted;
+	size_t total, n, i;
+	int error;
+
+	if (set->hp_count != expect)
+		return (EINVAL);
+
+	for (i = 0; i < set->hp_count; i++) {
+		vm_paddr_t pa = set->hp_pa[i];
+
+		if ((pa & (HIB_PAGE_SIZE - 1)) != 0)
+			return (EINVAL);
+#ifdef _KERNEL
+		if (PHYS_TO_VM_PAGE(pa) != set->hp_res.vr_pages[i].vrp_page)
+			return (EINVAL);
+#endif
+		if (hib_pa_in_dst(ha, pa))
+			return (EINVAL);
+		if (hib_pa_in_arena(ha, pa))
+			return (EINVAL);
+	}
+
+	total = set->hp_count + (other != NULL ? other->hp_count : 0);
+	if (total == 0)
+		return (0);
+	sorted = hib_malloc(total * sizeof(vm_paddr_t));
+	if (sorted == NULL)
+		return (ENOMEM);
+
+	n = 0;
+	for (i = 0; i < set->hp_count; i++)
+		sorted[n++] = set->hp_pa[i];
+	if (other != NULL)
+		for (i = 0; i < other->hp_count; i++)
+			sorted[n++] = other->hp_pa[i];
+
+	qsort(sorted, total, sizeof(vm_paddr_t), hib_staging_pa_cmp);
+	error = 0;
+	for (i = 1; i < total; i++) {
+		if (sorted[i] == sorted[i - 1]) {
+			error = EINVAL;
+			break;
+		}
+	}
+	hib_free(sorted);
+	return (error);
+}
+
+/*
+ * hibernate_safe_pages_alloc: H7 -- the measured-capacity,
+ * reserve-as-measured ALLOCATE stage.  See design 035 SS4.2 for the ten
+ * ordered steps.  Every return before step 3 leaves ha_has_safe_pages
+ * false (nothing was published); every return at or after step 3
+ * leaves it true, so K-7's hibernate_safe_pages_free() owns the rest
+ * regardless of where ALLOCATE stopped.
+ */
 int
 hibernate_safe_pages_alloc(struct hibernate_attempt *ha)
 {
+	struct hibernate_staging *st;
+	uint64_t P, pbytes, src16, aux16, v_aligned, V, x_aligned, X, A;
+	size_t i;
+	int error;
 
-	(void)ha;
-	return (ENOTSUP);
+	/* Step 1: preconditions. */
+	if (ha == NULL || !ha->ha_has_metadata || !ha->ha_dst_valid ||
+	    ha->ha_image.hi_prefix == NULL || ha->ha_has_safe_pages ||
+	    ha->ha_staging != NULL || ha->ha_image.hi_destination_pages == 0)
+		return (EINVAL);
+
+	/*
+	 * Step 2: size P, checked P*8 / P*16, V = ceil(P*8/4096),
+	 * X = ceil(hi_xsave_length/4096), A = V + X + 1 checked.  X > 1
+	 * refuses E2BIG here, before any allocation or reservation.
+	 */
+	P = ha->ha_image.hi_destination_pages;
+
+	if (__builtin_mul_overflow(P, (uint64_t)8, &pbytes))
+		return (EOVERFLOW);
+	if (__builtin_mul_overflow(P, (uint64_t)HIB_RESERVATION_RECORD_BYTES,
+		&src16))
+		return (EOVERFLOW);
+
+	error = align_up_checked(pbytes, HIB_PAGE_SIZE, &v_aligned);
+	if (error != 0)
+		return (error);
+	V = v_aligned / HIB_PAGE_SIZE;
+
+	error = align_up_checked(ha->ha_image.hi_xsave_length, HIB_PAGE_SIZE,
+	    &x_aligned);
+	if (error != 0)
+		return (error);
+	X = x_aligned / HIB_PAGE_SIZE;
+	if (X > 1)
+		return (E2BIG);
+
+	if (__builtin_add_overflow(V, X, &A))
+		return (EOVERFLOW);
+	if (__builtin_add_overflow(A, (uint64_t)1, &A))
+		return (EOVERFLOW);
+	if (__builtin_mul_overflow(A, (uint64_t)HIB_RESERVATION_RECORD_BYTES,
+		&aux16))
+		return (EOVERFLOW);
+
+	/*
+	 * Step 3: hib_malloc the staging struct; publish
+	 * ha_has_safe_pages as soon as it exists.
+	 */
+	st = hib_malloc(sizeof(*st));
+	if (st == NULL)
+		return (ENOMEM);
+	ha->ha_staging = st;
+	ha->ha_has_safe_pages = true;
+	st->hs_vector_pages = V;
+	st->hs_xsave_pages = X;
+
+	/* Step 4: hib_malloc the two vr_pages arrays (sizes checked above). */
+#ifdef _KERNEL
+	st->hs_src.hp_res.vr_pages = hib_malloc((size_t)src16);
+	if (st->hs_src.hp_res.vr_pages == NULL)
+		return (ENOMEM);
+	st->hs_aux.hp_res.vr_pages = hib_malloc((size_t)aux16);
+	if (st->hs_aux.hp_res.vr_pages == NULL)
+		return (ENOMEM);
+#endif
+
+	/* Step 5: reserve exactly P source pages (and wire them). */
+	error = hib_pages_reserve(ha, (size_t)P, &st->hs_src);
+	if (error != 0)
+		return (error);
+
+	/* Step 6: direct verification of S. */
+	error = hib_pages_verify(ha, &st->hs_src, NULL, P);
+	if (error != 0)
+		return (error);
+
+	/* Step 7: wiring is performed inside hib_pages_reserve (step 5). */
+
+	/*
+	 * Step 8: a second distinct reserve_count() instance for aux,
+	 * plus the same verification, plus aux-intersect-src == empty.
+	 */
+	error = hib_pages_reserve(ha, (size_t)A, &st->hs_aux);
+	if (error != 0)
+		return (error);
+	error = hib_pages_verify(ha, &st->hs_aux, &st->hs_src, A);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * Step 9: zero every aux page, then fill the source-PA vector
+	 * (one checked 64-bit PA per destination page) across the
+	 * vector sub-range of aux, in i = 0..P-1 order.
+	 */
+	for (i = 0; i < (size_t)A; i++) {
+		void *va;
+
+		va = hib_pages_map(st->hs_aux.hp_pa[i]);
+		if (va == NULL)
+			return (EINVAL);
+		__builtin_memset(va, 0, HIB_PAGE_SIZE);
+	}
+	for (i = 0; i < (size_t)P; i++) {
+		size_t per_page, page_idx, off;
+		vm_paddr_t *vec;
+
+		per_page = HIB_PAGE_SIZE / sizeof(vm_paddr_t);
+		page_idx = i / per_page;
+		off = i % per_page;
+		vec = hib_pages_map(st->hs_aux.hp_pa[page_idx]);
+		if (vec == NULL)
+			return (EINVAL);
+		vec[off] = st->hs_src.hp_pa[i];
+	}
+	if (i != (size_t)P)
+		return (EINVAL);
+
+	/* Step 10. */
+	return (0);
 }
 
-int
-hibernate_payload_read(struct hibernate_attempt *ha)
-{
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY K-8 coverage-refusal seam.  NULL means "use the real
+ * iterator" (hibernate_image_walk() remains the sole production
+ * caller of hibernate_image_interval_next()); when set, this seam
+ * replaces that one call site so malformed interval sequences
+ * (overlapping, backward, gapped, repeated, interleaved, zero-length,
+ * overshooting, short-of-end) can be injected directly, since the real
+ * iterator cannot produce them.
+ */
+int (*hibernate_test_interval_next_fn)(struct hibernate_image_iterator *,
+    struct hibernate_image_interval *);
+#endif
 
-	(void)ha;
-	return (ENOTSUP);
+/*
+ * hib_image_interval_next: the walker's one call site.  Dual-build:
+ * the kernel body always calls the real K-2 iterator; the userland
+ * body calls the TEST-ONLY seam when installed, else the real
+ * iterator, matching every other K-8 seam's NULL convention.
+ */
+static int
+hib_image_interval_next(struct hibernate_image_iterator *it,
+    struct hibernate_image_interval *out)
+{
+#ifdef _HIBERNATE_USERLAND_BUILD
+	if (hibernate_test_interval_next_fn != NULL)
+		return (hibernate_test_interval_next_fn(it, out));
+#endif
+	return (hibernate_image_interval_next(it, out));
 }
 
-int
-hibernate_payload_verify(struct hibernate_attempt *ha)
-{
+/*
+ * hib_zero_page: the static all-zero buffer used both to feed the one
+ * 8-byte virtual-zero hc_crc32c run (hib_crc_feed()) and to fold
+ * payload ZERO_GAP bytes into the CRC without touching the image
+ * (design 035 SS5.2).  File-scope static with no initializer is
+ * zero-filled by the C standard.
+ */
+static const uint8_t hib_zero_page[HIB_PAGE_SIZE];
 
-	(void)ha;
-	return (ENOTSUP);
+/*
+ * hib_crc_feed: fold [off, off+len) into *crc, splitting any piece
+ * that overlaps the one 8-byte virtual-zero range [zo, zo+zl) into up
+ * to three updates: before, a zero run supplied from hib_zero_page
+ * rather than buf, after.  Only the CB interval can ever overlap;
+ * every other call degenerates to a single plain update.
+ */
+static void
+hib_crc_feed(uint32_t *crc, uint64_t off, const uint8_t *buf, uint64_t len,
+    uint64_t zo, uint64_t zl)
+{
+	uint64_t piece_end, zend, ov_start, ov_end, pre_len, post_off, post_len;
+
+	piece_end = off + len;
+	if (zl == 0 || piece_end <= zo || off >= zo + zl) {
+		*crc = hibernate_crc32c_update(*crc, buf, (size_t)len);
+		return;
+	}
+
+	zend = zo + zl;
+
+	pre_len = (off < zo) ? zo - off : 0;
+	if (pre_len != 0)
+		*crc = hibernate_crc32c_update(*crc, buf, (size_t)pre_len);
+
+	ov_start = (off > zo) ? off : zo;
+	ov_end = (piece_end < zend) ? piece_end : zend;
+	*crc = hibernate_crc32c_update(*crc, hib_zero_page,
+	    (size_t)(ov_end - ov_start));
+
+	if (piece_end > zend) {
+		post_off = zend - off;
+		post_len = piece_end - zend;
+		*crc = hibernate_crc32c_update(*crc, buf + post_off,
+		    (size_t)post_len);
+	}
+}
+
+/*
+ * hibernate_image_walk: H8 -- the sole caller of
+ * hib_image_interval_next() (and therefore, in the production kernel
+ * body, of hibernate_image_interval_next() itself) in K-8.  Drives one
+ * forward pass over [0, hi_image_length) and folds every covered byte
+ * into a running CRC32C with the one 8-byte hc_crc32c field virtually
+ * zeroed (design 035 SS5).  do_read selects READ_PAYLOAD (true: each
+ * payload byte is fetched through hibernate_stage_read() before being
+ * CRC'd) or VERIFY (false: every payload byte is read from the
+ * already-staged source/XSAVE pages, zero provider reads).  Never
+ * reparses a program header; file ranges and classes come exclusively
+ * from the iterator and from ha_image scalars.
+ *
+ * *crc_out is zeroed on entry and is written only on success.
+ */
+static int
+hibernate_image_walk(struct hibernate_attempt *ha, bool do_read,
+    uint32_t *crc_out)
+{
+	struct hibernate_image_iterator it;
+	struct hibernate_image_interval iv;
+	struct hibernate_image *img;
+	struct hibernate_staging *st;
+	uint64_t cursor, end, vec, P;
+	uint32_t crc;
+	int error;
+
+	if (crc_out != NULL)
+		*crc_out = 0;
+	if (ha == NULL || crc_out == NULL || ha->ha_meta_buf == NULL ||
+	    ha->ha_staging == NULL) {
+		return (EINVAL);
+	}
+
+	img = &ha->ha_image;
+	st = ha->ha_staging;
+	P = img->hi_destination_pages;
+
+	__builtin_memset(&it, 0, sizeof(it));
+	it.hii_image = img;
+	it.hii_phase = HIIP_METADATA;
+
+	crc = 0xffffffffU;
+	cursor = 0;
+	vec = 0;
+
+	for (;;) {
+		error = hib_image_interval_next(&it, &iv);
+		if (error == ENOENT)
+			break;
+		if (error != 0) {
+			return (EINVAL);
+		}
+		if (iv.hii_length == 0 || iv.hii_offset != cursor) {
+			return (EINVAL);
+		}
+		if (__builtin_add_overflow(cursor, iv.hii_length, &end) ||
+		    end > img->hi_image_length) {
+			return (EINVAL);
+		}
+
+		if (end <= img->hi_payload_start) {
+			/* Metadata: STORED or ZERO_GAP bytes from ha_meta_buf.
+			 */
+			hib_crc_feed(&crc, cursor,
+			    (const uint8_t *)ha->ha_meta_buf + cursor,
+			    iv.hii_length, img->hi_crc_zero_offset,
+			    img->hi_crc_zero_length);
+		} else if (iv.hii_class == HIIC_STORED &&
+		    iv.hii_offset == img->hi_xsave_offset) {
+			/* The sole XSAVE object -> the single aux XSAVE page.
+			 */
+			void *xva;
+
+			if (iv.hii_length > HIB_PAGE_SIZE) {
+				return (EINVAL);
+			}
+			xva = hib_pages_map(
+			    st->hs_aux.hp_pa[st->hs_vector_pages]);
+			if (xva == NULL) {
+				return (EINVAL);
+			}
+			if (do_read) {
+				error = hibernate_stage_read(ha, cursor, xva,
+				    (size_t)iv.hii_length);
+				if (error != 0) {
+					return (error);
+				}
+			}
+			hib_crc_feed(&crc, cursor, xva, iv.hii_length,
+			    img->hi_crc_zero_offset, img->hi_crc_zero_length);
+		} else if (iv.hii_class == HIIC_STORED) {
+			/* PT_LOAD: page-by-page into the source-PA vector. */
+			uint64_t pages, pg;
+
+			if ((iv.hii_length & (HIB_PAGE_SIZE - 1)) != 0) {
+				return (EINVAL);
+			}
+			pages = iv.hii_length / HIB_PAGE_SIZE;
+			for (pg = 0; pg < pages; pg++) {
+				void *pva;
+				uint64_t poff;
+
+				if (vec >= P) {
+					return (EINVAL);
+				}
+				pva = hib_pages_map(st->hs_src.hp_pa[vec]);
+				if (pva == NULL) {
+					return (EINVAL);
+				}
+				poff = cursor + pg * HIB_PAGE_SIZE;
+				if (do_read) {
+					error = hibernate_stage_read(ha, poff,
+					    pva, HIB_PAGE_SIZE);
+					if (error != 0) {
+						return (error);
+					}
+				}
+				hib_crc_feed(&crc, poff, pva, HIB_PAGE_SIZE,
+				    img->hi_crc_zero_offset,
+				    img->hi_crc_zero_length);
+				vec++;
+			}
+		} else {
+			/* Payload ZERO_GAP: routed through the bounce page. */
+			uint64_t remaining, coff, bidx;
+			void *bva;
+
+			bidx = st->hs_vector_pages + st->hs_xsave_pages;
+			bva = hib_pages_map(st->hs_aux.hp_pa[bidx]);
+			if (bva == NULL)
+				return (EINVAL);
+			remaining = iv.hii_length;
+			coff = 0;
+			while (remaining > 0) {
+				uint64_t chunk;
+
+				chunk = (remaining < HIB_PAGE_SIZE) ?
+				    remaining :
+				    HIB_PAGE_SIZE;
+				if (do_read) {
+					error = hibernate_stage_read(ha,
+					    cursor + coff, bva, (size_t)chunk);
+					if (error != 0) {
+						return (error);
+					}
+					if (!is_all_zero(bva, (size_t)chunk)) {
+						return (EINVAL);
+					}
+				}
+				hib_crc_feed(&crc, cursor + coff, hib_zero_page,
+				    chunk, img->hi_crc_zero_offset,
+				    img->hi_crc_zero_length);
+				coff += chunk;
+				remaining -= chunk;
+			}
+		}
+
+		cursor = end;
+	}
+
+	if (cursor != img->hi_image_length || vec != P) {
+		return (EINVAL);
+	}
+
+	*crc_out = crc ^ 0xffffffffU;
+	return (0);
+}
+
+/*
+ * hibernate_payload_read: H9 -- preconditions, then one forward
+ * hibernate_image_walk() pass that streams every payload byte directly
+ * into its accepted source/XSAVE page through hibernate_stage_read();
+ * no full-image buffer is allocated.  The XSAVE bound is re-checked
+ * here, before any provider read, independent of whether ALLOCATE
+ * published a staging record (design 035 SS6.4 "XSAVE bound" row).
+ */
+int
+hibernate_payload_read(struct hibernate_attempt *ha, uint32_t *crc_out)
+{
+	uint64_t x_aligned;
+	int error;
+
+	if (crc_out != NULL)
+		*crc_out = 0;
+	if (ha == NULL || crc_out == NULL)
+		return (EINVAL);
+
+	error = align_up_checked(ha->ha_image.hi_xsave_length, HIB_PAGE_SIZE,
+	    &x_aligned);
+	if (error != 0) {
+		*crc_out = 0;
+		return (error);
+	}
+	if (x_aligned / HIB_PAGE_SIZE > 1) {
+		*crc_out = 0;
+		return (E2BIG);
+	}
+
+	if (!ha->ha_has_safe_pages || ha->ha_staging == NULL) {
+		*crc_out = 0;
+		return (EINVAL);
+	}
+
+	error = hibernate_image_walk(ha, true, crc_out);
+	if (error != 0) {
+		*crc_out = 0;
+		return (error);
+	}
+	return (0);
+}
+
+/*
+ * hibernate_image_crc32c_verify: H10 -- an independent recomputation
+ * of the whole-image CRC32C from staged memory (zero provider reads),
+ * compared against both the decoded CB hc_crc32c and the streamed crc
+ * argument.  No state is changed on any path.
+ */
+int
+hibernate_image_crc32c_verify(struct hibernate_attempt *ha, uint32_t crc)
+{
+	uint32_t recomputed;
+	int error;
+
+	if (ha == NULL)
+		return (EINVAL);
+
+	error = hibernate_image_walk(ha, false, &recomputed);
+	if (error != 0)
+		return (error);
+
+	if (recomputed != ha->ha_image.hi_cb.hc_crc32c)
+		return (EINVAL);
+	if (recomputed != crc)
+		return (EINVAL);
+
+	return (0);
 }
 
 int
 hibernate_quiesce(struct hibernate_attempt *ha)
 {
-
 	(void)ha;
 	return (ENOTSUP);
 }
@@ -3146,7 +4237,6 @@ int (*hibernate_test_quiesce_rollback_fn)(struct hibernate_attempt *);
 int
 hibernate_quiesce_rollback(struct hibernate_attempt *ha)
 {
-
 #ifdef _HIBERNATE_USERLAND_BUILD
 	if (hibernate_test_quiesce_rollback_fn != NULL)
 		return (hibernate_test_quiesce_rollback_fn(ha));
@@ -3158,7 +4248,6 @@ hibernate_quiesce_rollback(struct hibernate_attempt *ha)
 int
 hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged)
 {
-
 	(void)target;
 	(void)acknowledged;
 	return (ENOTSUP);
@@ -3172,7 +4261,6 @@ int (*hibernate_test_restart_cpus_fn)(cpuset_t);
 int
 hibernate_restart_cpus(cpuset_t acknowledged)
 {
-
 #ifdef _HIBERNATE_USERLAND_BUILD
 	if (hibernate_test_restart_cpus_fn != NULL)
 		return (hibernate_test_restart_cpus_fn(acknowledged));
@@ -3185,14 +4273,12 @@ hibernate_restart_cpus(cpuset_t acknowledged)
 static int
 hibernate_coordinator_probe(struct hibernate_attempt *ha)
 {
-
 	return (hibernate_probe(ha));
 }
 
 static void
 hibernate_coordinator_provider_release(struct hibernate_attempt *ha)
 {
-
 	hibernate_provider_release(ha);
 }
 #else
@@ -3207,7 +4293,6 @@ void (*hibernate_test_provider_release_fn)(
 static int
 hibernate_coordinator_probe(struct hibernate_attempt *ha)
 {
-
 	if (hibernate_test_probe_fn != NULL)
 		return (hibernate_test_probe_fn(ha));
 	ha->ha_marker_result.class = HMC_ABSENT;
@@ -3218,27 +4303,62 @@ hibernate_coordinator_probe(struct hibernate_attempt *ha)
 static void
 hibernate_coordinator_provider_release(struct hibernate_attempt *ha)
 {
-
 	if (hibernate_test_provider_release_fn != NULL)
 		hibernate_test_provider_release_fn(ha);
 }
 #endif
 
 /*
- * K-8 replaces these inert release bodies in place when it starts acquiring
- * metadata and safe pages.
+ * hibernate_safe_pages_free: H11 -- owner-local release of ALLOCATE's
+ * staging.  External, idempotent, and ha == NULL tolerant.  Releases
+ * aux then src (reverse acquisition order): wipe, unwire exactly
+ * hp_wired, vm_phys_hibernate_release().  Performs no marker operation,
+ * provider release, arena release, or destination write.  Only K-7's
+ * hibernate_attempt_cleanup() step 7 calls this.
  */
-static void
+void
 hibernate_safe_pages_free(struct hibernate_attempt *ha)
 {
+	struct hibernate_staging *st;
 
+	if (ha == NULL)
+		return;
+	st = ha->ha_staging;
+	if (st == NULL) {
+		ha->ha_has_safe_pages = false;
+		return;
+	}
+
+	hib_pages_release(&st->hs_aux);
+	hib_pages_release(&st->hs_src);
+
+#ifdef _KERNEL
+	hib_free(st->hs_aux.hp_res.vr_pages);
+	hib_free(st->hs_src.hp_res.vr_pages);
+#endif
+	hib_free(st->hs_aux.hp_pa);
+	hib_free(st->hs_src.hp_pa);
+	hib_free(st);
+
+	ha->ha_staging = NULL;
 	ha->ha_has_safe_pages = false;
 }
 
+/*
+ * hibernate_metadata_free: H11 -- static, idempotent.  Invalidates the
+ * decoded image and the destination view it backs (ha_dst_intervals
+ * points into the metadata block's tail), then frees the block.
+ */
 static void
 hibernate_metadata_free(struct hibernate_attempt *ha)
 {
-
+	__builtin_memset(&ha->ha_image, 0, sizeof(ha->ha_image));
+	ha->ha_dst_valid = false;
+	ha->ha_dst_intervals = NULL;
+	ha->ha_dst_count = 0;
+	hib_free(ha->ha_meta_buf);
+	ha->ha_meta_buf = NULL;
+	ha->ha_meta_len = 0;
 	ha->ha_has_metadata = false;
 }
 
@@ -3249,7 +4369,6 @@ hibernate_metadata_free(struct hibernate_attempt *ha)
 static int
 hibernate_admission_reopen(struct hibernate_attempt *ha)
 {
-
 	ha->ha_has_admission_closed = false;
 	return (0);
 }
@@ -3257,7 +4376,6 @@ hibernate_admission_reopen(struct hibernate_attempt *ha)
 static void
 hibernate_cleanup_terminal(const char *reason)
 {
-
 #ifdef _KERNEL
 	panic("hibernate cleanup failed: %s", reason);
 #else
@@ -3302,7 +4420,6 @@ static int
 hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
     enum hibernate_owner_rollback_outcome *outcome)
 {
-
 #ifdef _HIBERNATE_USERLAND_BUILD
 	if (hibernate_test_owner_rollback_fn != NULL)
 		return (hibernate_test_owner_rollback_fn(ha, outcome));
@@ -3385,6 +4502,7 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 {
 	const void *meta;
 	size_t meta_len;
+	uint32_t crc;
 	struct hibernate_marker consuming_marker;
 	cpuset_t target, empty_set;
 	enum hibernate_resume_stage stage;
@@ -3393,12 +4511,7 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	if (ha == NULL)
 		return (EINVAL);
 
-	/*
-	 * K-8 wires the attempt metadata buffer here.  This is unreachable
-	 * while READ_METADATA is a temporary ENOTSUP body.
-	 */
-	meta = NULL;
-	meta_len = 0;
+	crc = 0;
 
 	hibernate_resume_stage_log_length = 0;
 	stage = HIB_RESUME_PROBE;
@@ -3409,13 +4522,16 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	ha->ha_marker_owned = HM_OWNED_PENDING;
 
 	stage = HIB_RESUME_READ_METADATA;
-	error = hibernate_meta_read(ha);
+	error = hibernate_resume_meta_acquire(ha, &meta_len);
 	hibernate_resume_stage_record(stage);
 	if (error != 0)
 		goto cleanup;
+	meta = ha->ha_meta_buf;
 
 	stage = HIB_RESUME_VALIDATE;
 	error = hibernate_image_decode(meta, meta_len, &ha->ha_image);
+	if (error == 0)
+		error = hibernate_dst_view_build(ha);
 	if (error == 0) {
 		/*
 		 * Claim the K-9 transition arena before validating its tuple
@@ -3441,13 +4557,13 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		goto cleanup;
 
 	stage = HIB_RESUME_READ_PAYLOAD;
-	error = hibernate_payload_read(ha);
+	error = hibernate_payload_read(ha, &crc);
 	hibernate_resume_stage_record(stage);
 	if (error != 0)
 		goto cleanup;
 
 	stage = HIB_RESUME_VERIFY;
-	error = hibernate_payload_verify(ha);
+	error = hibernate_image_crc32c_verify(ha, crc);
 	hibernate_resume_stage_record(stage);
 	if (error != 0)
 		goto cleanup;
@@ -3559,14 +4675,12 @@ hibernate_s4_commit_gate(bool image_committed)
 static uint64_t
 hibernate_facs_signature(void)
 {
-
 	return (acpi_hibernate_facs_signature());
 }
 
 static uint64_t
 hibernate_live_physmem_bytes(void)
 {
-
 	return ((uint64_t)physmem * PAGE_SIZE);
 }
 #else
@@ -3577,14 +4691,12 @@ uint64_t hibernate_test_physmem_bytes;
 static uint64_t
 hibernate_facs_signature(void)
 {
-
 	return (hibernate_test_facs_signature);
 }
 
 static uint64_t
 hibernate_live_physmem_bytes(void)
 {
-
 	return (hibernate_test_physmem_bytes);
 }
 
@@ -3592,7 +4704,6 @@ static int
 hibernate_test_amd64_cpu_validate_default(const struct hibernate_pcb *pcb,
     bool *refuse_la57, bool *refuse_mtrr)
 {
-
 	(void)pcb;
 	*refuse_la57 = false;
 	*refuse_mtrr = false;
@@ -3607,7 +4718,6 @@ static int
 hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb,
     bool *refuse_la57, bool *refuse_mtrr)
 {
-
 	return (hibernate_test_amd64_cpu_validate(pcb, refuse_la57,
 	    refuse_mtrr));
 }

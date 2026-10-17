@@ -110,6 +110,45 @@ static struct fx_queue fx_queues[FX_NDOMAINS][FX_NFREELIST][FX_NFREEPOOL]
 static uint64_t fx_arena_pa;
 static uint64_t fx_arena_size;
 
+/*
+ * Destination set: a small list of [start, end) PA ranges, mirroring
+ * hib_page_is_destination()'s interval-membership test.  Empty by
+ * default (fx_dst_count == 0), so callers that never populate it see
+ * unchanged pre-existing behaviour.
+ */
+#define	FX_DST_MAX	16
+static uint64_t fx_dst_start[FX_DST_MAX];
+static uint64_t fx_dst_end[FX_DST_MAX];
+static int      fx_dst_count;
+
+static void
+fx_dst_reset(void)
+{
+	fx_dst_count = 0;
+}
+
+static void
+fx_dst_add(uint64_t start, uint64_t end)
+{
+	if (fx_dst_count < FX_DST_MAX) {
+		fx_dst_start[fx_dst_count] = start;
+		fx_dst_end[fx_dst_count] = end;
+		fx_dst_count++;
+	}
+}
+
+static bool
+fx_in_destination(uint64_t pa)
+{
+	int i;
+
+	for (i = 0; i < fx_dst_count; i++) {
+		if (pa >= fx_dst_start[i] && pa < fx_dst_end[i])
+			return (true);
+	}
+	return (false);
+}
+
 /* ------------------------------------------------------------------ */
 /* Reservation record                                                   */
 /* ------------------------------------------------------------------ */
@@ -147,6 +186,7 @@ fx_reset(void)
 					fxq_init(&fx_queues[d][f][p][o]);
 	fx_arena_pa   = 0;
 	fx_arena_size = 0;
+	fx_dst_reset();
 }
 
 static int
@@ -357,9 +397,25 @@ fx_reserve_count(struct fx_res *res, int want)
 							break;
 						m_block->order = FX_ORDER_NONE;
 						/*
-						 * Simple append only; no dst
-						 * filtering in this fixture.
+						 * Destination-colliding pages
+						 * are ineligible; re-enqueue
+						 * at TAIL (order 0), matching
+						 * hib_process_block_count()'s
+						 * return-run behaviour.  Not
+						 * revisited this call: i < snap
+						 * is a pre-entry snapshot
+						 * (monotonic-cursor
+						 * discipline).
 						 */
+						if (fx_in_destination(
+						    m_block->pa)) {
+							m_block->order = 0;
+							fxq_enqueue_tail(
+							    &fx_queues[dom][0]
+							    [pool][0],
+							    m_block);
+							continue;
+						}
 						if (fx_append(res, m_block,
 						    pool, dom) != 0) {
 							fx_rollback(res);
@@ -595,6 +651,185 @@ ATF_TC_BODY(fault_after_nth_append, tc)
 	}
 }
 
+/*
+ * shortage_reserve_count_zero_eligible: reserve_count(want=N>0) against
+ * zero eligible pages -> ENOMEM, count==0, free set unchanged (design
+ * 035 SS6.3 "Shortage at 0").
+ */
+ATF_TC_WITHOUT_HEAD(shortage_reserve_count_zero_eligible);
+ATF_TC_BODY(shortage_reserve_count_zero_eligible, tc)
+{
+	struct fx_res res;
+
+	fx_reset();	/* no pages allocated at all */
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 3));
+	ATF_CHECK_EQ(0, res.count);
+	ATF_CHECK_EQ(0, fx_total_queued());
+}
+
+/*
+ * exact_count_reserve_count: reserve_count(want=P) against exactly P
+ * eligible pages succeeds with count==P (design 035 SS6.3 "Exactly P").
+ */
+ATF_TC_WITHOUT_HEAD(exact_count_reserve_count);
+ATF_TC_BODY(exact_count_reserve_count, tc)
+{
+	struct fx_res res;
+	int i;
+
+	fx_reset();
+	for (i = 0; i < 4; i++)
+		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
+		    0, 0, 0, true);
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	ATF_CHECK_EQ(0, fx_reserve_count(&res, 4));
+	ATF_CHECK_EQ(4, res.count);
+	ATF_CHECK_EQ(0, fx_total_queued());
+}
+
+/*
+ * multi_domain_ascending_order: eligible pages split across domain 0
+ * and domain 1; reserve_count(want) drains domain 0 before domain 1
+ * ever contributes, matching the mandated ascending-domain order
+ * (design 035 SS6.3 "Multi-domain / pools / orders").
+ */
+ATF_TC_WITHOUT_HEAD(multi_domain_ascending_order);
+ATF_TC_BODY(multi_domain_ascending_order, tc)
+{
+	struct fx_res res;
+
+	fx_reset();
+	/* Domain 0: 2 pages.  Domain 1: 2 pages. */
+	fx_alloc_page(0, FX_PA_BASE + 0 * FX_PAGE_SIZE, 0, 0, 0, true);
+	fx_alloc_page(1, FX_PA_BASE + 1 * FX_PAGE_SIZE, 0, 0, 0, true);
+	fx_alloc_page(2, FX_PA_BASE + 2 * FX_PAGE_SIZE, 1, 1, 0, true);
+	fx_alloc_page(3, FX_PA_BASE + 3 * FX_PAGE_SIZE, 1, 1, 0, true);
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	/* want=3: both domain-0 pages plus exactly one from domain 1. */
+	ATF_CHECK_EQ(0, fx_reserve_count(&res, 3));
+	ATF_CHECK_EQ(3, res.count);
+	ATF_CHECK_EQ(0, res.entries[0].domain);
+	ATF_CHECK_EQ(0, res.entries[1].domain);
+	ATF_CHECK_EQ(1, res.entries[2].domain);
+	/* One domain-1 page remains queued; domain 0 is fully drained. */
+	ATF_CHECK_EQ(1, fx_total_queued());
+
+	/* Rollback on shortage spans both domains in reverse order. */
+	fx_reset();
+	fx_alloc_page(0, FX_PA_BASE + 0 * FX_PAGE_SIZE, 0, 0, 0, true);
+	fx_alloc_page(1, FX_PA_BASE + 1 * FX_PAGE_SIZE, 1, 0, 0, true);
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 5));
+	ATF_CHECK_EQ(0, res.count);
+	ATF_CHECK_EQ(2, fx_total_queued());
+}
+
+/*
+ * reserve_count_destination_run_precedes_eligible: a long run of
+ * destination-colliding pages precedes P eligible pages in queue order;
+ * reserve_count(want=P) still succeeds because |E| >= P (no horizon),
+ * and the accepted set is disjoint from D (design 035 SS6.3 "Long
+ * destination-colliding run first").
+ */
+ATF_TC_WITHOUT_HEAD(reserve_count_destination_run_precedes_eligible);
+ATF_TC_BODY(reserve_count_destination_run_precedes_eligible, tc)
+{
+	struct fx_res res;
+	int i, idx;
+
+	fx_reset();
+	idx = 0;
+	/* 10 destination-colliding pages, enqueued first. */
+	for (i = 0; i < 10; i++, idx++)
+		fx_alloc_page(idx, FX_PA_BASE + idx * FX_PAGE_SIZE,
+		    0, 0, 0, true);
+	fx_dst_add(FX_PA_BASE, FX_PA_BASE + 10 * FX_PAGE_SIZE);
+	/* 4 eligible pages follow. */
+	for (i = 0; i < 4; i++, idx++)
+		fx_alloc_page(idx, FX_PA_BASE + idx * FX_PAGE_SIZE,
+		    0, 0, 0, true);
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	ATF_CHECK_EQ(0, fx_reserve_count(&res, 4));
+	ATF_CHECK_EQ(4, res.count);
+	for (i = 0; i < res.count; i++) {
+		struct fx_page *m = &fx_pages[res.entries[i].page_idx];
+
+		ATF_CHECK(!fx_in_destination(m->pa));
+	}
+	/* All 10 destination pages remain queued (re-enqueued at tail). */
+	ATF_CHECK_EQ(10, fx_total_queued());
+}
+
+/*
+ * reserve_count_adversarial_destination_interleave: destination and
+ * eligible pages interleaved at every order 0..3; the accepted set is
+ * exactly the eligible pages, disjoint from D, and count==want (design
+ * 035 SS6.3 "Adversarial overlap").
+ */
+ATF_TC_WITHOUT_HEAD(reserve_count_adversarial_destination_interleave);
+ATF_TC_BODY(reserve_count_adversarial_destination_interleave, tc)
+{
+	struct fx_res res;
+	int i;
+
+	fx_reset();
+	/*
+	 * idx : pa offset : order : role
+	 *  0  : 0          : 0     : destination
+	 *  1  : 1          : 0     : eligible
+	 *  2  : 2          : 1     : destination
+	 *  3  : 3          : 1     : eligible
+	 *  4  : 4          : 2     : destination
+	 *  5  : 5          : 2     : eligible
+	 *  6  : 6          : 3     : destination
+	 *  7  : 7          : 3     : eligible
+	 */
+	fx_alloc_page(0, FX_PA_BASE + 0 * FX_PAGE_SIZE, 0, 0, 0, true);
+	fx_alloc_page(1, FX_PA_BASE + 1 * FX_PAGE_SIZE, 0, 0, 0, true);
+	fx_alloc_page(2, FX_PA_BASE + 2 * FX_PAGE_SIZE, 0, 0, 1, true);
+	fx_alloc_page(3, FX_PA_BASE + 3 * FX_PAGE_SIZE, 0, 0, 1, true);
+	fx_alloc_page(4, FX_PA_BASE + 4 * FX_PAGE_SIZE, 0, 0, 2, true);
+	fx_alloc_page(5, FX_PA_BASE + 5 * FX_PAGE_SIZE, 0, 0, 2, true);
+	fx_alloc_page(6, FX_PA_BASE + 6 * FX_PAGE_SIZE, 0, 0, 3, true);
+	fx_alloc_page(7, FX_PA_BASE + 7 * FX_PAGE_SIZE, 0, 0, 3, true);
+
+	fx_dst_add(FX_PA_BASE + 0 * FX_PAGE_SIZE,
+	    FX_PA_BASE + 1 * FX_PAGE_SIZE);
+	fx_dst_add(FX_PA_BASE + 2 * FX_PAGE_SIZE,
+	    FX_PA_BASE + 3 * FX_PAGE_SIZE);
+	fx_dst_add(FX_PA_BASE + 4 * FX_PAGE_SIZE,
+	    FX_PA_BASE + 5 * FX_PAGE_SIZE);
+	fx_dst_add(FX_PA_BASE + 6 * FX_PAGE_SIZE,
+	    FX_PA_BASE + 7 * FX_PAGE_SIZE);
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	ATF_CHECK_EQ(0, fx_reserve_count(&res, 4));
+	ATF_CHECK_EQ(4, res.count);
+	for (i = 0; i < res.count; i++) {
+		struct fx_page *m = &fx_pages[res.entries[i].page_idx];
+
+		ATF_CHECK(!fx_in_destination(m->pa));
+	}
+	/* The 4 destination pages remain queued (re-enqueued at tail). */
+	ATF_CHECK_EQ(4, fx_total_queued());
+}
+
 /* ------------------------------------------------------------------ */
 /* ATF_TP registration                                                  */
 /* ------------------------------------------------------------------ */
@@ -606,6 +841,10 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, enospc_reserve_all);
 	ATF_TP_ADD_TC(tp, shortage_reserve);
 	ATF_TP_ADD_TC(tp, fault_after_nth_append);
+	ATF_TP_ADD_TC(tp, shortage_reserve_count_zero_eligible);
+	ATF_TP_ADD_TC(tp, exact_count_reserve_count);
+	ATF_TP_ADD_TC(tp, multi_domain_ascending_order);
+	ATF_TP_ADD_TC(tp, reserve_count_destination_run_precedes_eligible);
+	ATF_TP_ADD_TC(tp, reserve_count_adversarial_destination_interleave);
 	return (atf_no_error());
 }
-```

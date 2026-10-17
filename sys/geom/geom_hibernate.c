@@ -6,6 +6,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bio.h>
 #include <sys/callout.h>
 #include <sys/conf.h>
 #include <sys/hibernate.h>
@@ -159,6 +160,104 @@ hibernate_provider_release(struct hibernate_attempt *ha)
 		}
 		ha->ha_has_root_hold = false;
 	}
+}
+
+/*
+ * hibernate_provider_read() streams bytes through the K-4 access-held
+ * consumer with the topology lock absent.  It performs no write, no
+ * marker operation, and no extent/topology change; it adds no access
+ * count beyond the one g_hibernate_taste() already holds.
+ *
+ * Every BIO is waited on (biowait()) before the next is submitted, so
+ * no I/O is outstanding when this function returns, on either the
+ * success or the failure path.
+ */
+int
+hibernate_provider_read(struct hibernate_attempt *ha, uint64_t offset,
+    void *buf, size_t length)
+{
+	uint8_t bounce[DEV_BSIZE];
+	struct g_hibernate_softc *sc;
+	struct g_consumer *cp;
+	struct bio *bp;
+	uint8_t *dst;
+	uint64_t end, sector_off;
+	size_t n, copy_off, copy_len;
+	int error;
+
+	g_topology_assert_not();
+
+	sc = g_hibernate_owner;
+	if (ha == NULL || buf == NULL || length == 0 || sc == NULL ||
+	    !ha->ha_has_provider)
+		return (EINVAL);
+
+	if (__builtin_add_overflow(offset, length, &end))
+		return (EOVERFLOW);
+	if (end > sc->id.media_size)
+		return (EINVAL);
+
+	mtx_lock(&sc->lock);
+	cp = sc->consumer;
+	if (cp == NULL || cp->provider == NULL || sc->teardown_done) {
+		mtx_unlock(&sc->lock);
+		return (ENXIO);
+	}
+	sc->io_inflight++;
+	mtx_unlock(&sc->lock);
+
+	dst = buf;
+	error = 0;
+	while (length > 0) {
+		if ((offset % DEV_BSIZE) != 0 || length < DEV_BSIZE) {
+			sector_off = rounddown(offset, DEV_BSIZE);
+			copy_off = (size_t)(offset - sector_off);
+			copy_len = MIN(length, DEV_BSIZE - copy_off);
+
+			bp = g_alloc_bio();
+			bp->bio_cmd = BIO_READ;
+			bp->bio_offset = sector_off;
+			bp->bio_data = bounce;
+			bp->bio_length = DEV_BSIZE;
+			bp->bio_done = NULL;
+			g_io_request(bp, cp);
+			error = biowait(bp, "hibrd");
+			if (error == 0 && bp->bio_completed != bp->bio_length)
+				error = EIO;
+			g_destroy_bio(bp);
+			if (error != 0)
+				break;
+
+			memcpy(dst, bounce + copy_off, copy_len);
+			n = copy_len;
+		} else {
+			n = rounddown(MIN(length, maxphys), DEV_BSIZE);
+
+			bp = g_alloc_bio();
+			bp->bio_cmd = BIO_READ;
+			bp->bio_offset = offset;
+			bp->bio_data = dst;
+			bp->bio_length = n;
+			bp->bio_done = NULL;
+			g_io_request(bp, cp);
+			error = biowait(bp, "hibrd");
+			if (error == 0 && bp->bio_completed != bp->bio_length)
+				error = EIO;
+			g_destroy_bio(bp);
+			if (error != 0)
+				break;
+		}
+
+		dst += n;
+		offset += n;
+		length -= n;
+	}
+
+	mtx_lock(&sc->lock);
+	sc->io_inflight--;
+	mtx_unlock(&sc->lock);
+
+	return (error);
 }
 
 static void

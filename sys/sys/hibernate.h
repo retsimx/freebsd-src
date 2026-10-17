@@ -15,6 +15,7 @@
 
 struct dumperinfo;
 struct hibernate_xsave_terminal;
+struct hibernate_staging;
 
 enum hibernate_arena_interval_class {
 	HAIC_ELIGIBLE,
@@ -550,6 +551,16 @@ struct hibernate_attempt {
 	cpuset_t ha_acknowledged_cpus;	/* Exact acknowledged AP subset. */
 	struct hibernate_image ha_image;
 					/* K-7 decoded image (transient). */
+	/*
+	 * K-8: metadata buffer and safe-page staging ownership.
+	 *
+	 * ha_meta_buf is valid iff ha_has_metadata.  ha_staging is
+	 * non-NULL iff any K-8 reservation is owned.
+	 */
+	void *ha_meta_buf;		/* K-8 metadata block (owned). */
+	size_t ha_meta_len;		/* Valid metadata prefix length. */
+	struct hibernate_staging *ha_staging;
+					/* K-8 safe-page staging (owned). */
 };
 
 #define	HIBERNATE_ATTEMPT_INIT                                  \
@@ -573,6 +584,9 @@ struct hibernate_attempt {
 		.ha_has_quiesce = false,                        \
 		.ha_has_stopped_cpus = false,                   \
 		.ha_acknowledged_cpus = { { 0 } },              \
+		.ha_meta_buf = NULL,                             \
+		.ha_meta_len = 0,                               \
+		.ha_staging = NULL,                             \
 	}
 
 /*
@@ -833,11 +847,16 @@ int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
 int hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged);
 int hibernate_restart_cpus(cpuset_t acknowledged);
 
-/* K-8-owned stage functions; K-7 provides temporary ENOTSUP bodies. */
-int hibernate_meta_read(struct hibernate_attempt *ha);
+/* K-8-owned stage functions (bodies in kern/kern_hibernate.c). */
+int hibernate_meta_read(struct hibernate_attempt *ha, void *meta_buf,
+    size_t meta_buf_max, size_t *meta_len_out);
 int hibernate_safe_pages_alloc(struct hibernate_attempt *ha);
-int hibernate_payload_read(struct hibernate_attempt *ha);
-int hibernate_payload_verify(struct hibernate_attempt *ha);
+void hibernate_safe_pages_free(struct hibernate_attempt *ha);
+int hibernate_payload_read(struct hibernate_attempt *ha, uint32_t *crc_out);
+int hibernate_image_crc32c_verify(struct hibernate_attempt *ha, uint32_t crc);
+int hibernate_meta_check_phdr_end(uint64_t phdr_end);
+int hibernate_meta_check_total(uint64_t total, size_t buf_max,
+    uint64_t image_length);
 void hibernate_marker_decode_complete(const uint8_t *buf,
     struct hibernate_marker *marker, uint32_t *reserved);
 enum hibernate_marker_class hibernate_marker_classify(uint64_t marker_offset,
@@ -867,6 +886,8 @@ void hibernate_owner_deactivate(const struct hibernate_provider_id *id);
 /* Live FACS HardwareSignature; defined in sys/dev/acpica/acpi.c. */
 uint64_t acpi_hibernate_facs_signature(void);
 void hibernate_provider_release(struct hibernate_attempt *ha);
+int hibernate_provider_read(struct hibernate_attempt *ha, uint64_t offset,
+    void *buf, size_t length);
 void hibernate_probe_begin(void);
 void hibernate_probe_complete(void);
 bool hibernate_probe_active(void);
