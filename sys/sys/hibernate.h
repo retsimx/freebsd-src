@@ -47,6 +47,68 @@ struct hibernate_arena_sizing {
 	uint64_t has_required;
 };
 
+struct hibernate_arena_packed_dtr {
+	uint16_t hap_limit;
+	uint64_t hap_base;
+} __packed;
+
+_Static_assert(sizeof(struct hibernate_arena_packed_dtr) == 10,
+    "packed DTR must be 10 bytes");
+
+struct hibernate_arena_header {
+	uint64_t hah_magic;
+	uint32_t hah_version;
+	uint32_t hah_header_size;
+	uint64_t hah_arena_pa;
+	uint64_t hah_arena_size;
+	uint64_t hah_private_cr3_pa;
+	uint64_t hah_saved_cr3_pa;
+	uint64_t hah_trampoline_pa;
+	uint64_t hah_trampoline_identity_va;
+	uint64_t hah_trampoline_saved_va;
+	uint64_t hah_arena_stack_pa;
+	uint64_t hah_arena_stack_size;
+	uint64_t hah_source_vector_pa;
+	uint64_t hah_first_destination_pa;
+	uint64_t hah_destination_page_count;
+	uint64_t hah_iterator_pa;
+	uint64_t hah_handoff_record_pa;
+	uint64_t hah_saved_handoff_va;
+	uint64_t hah_saved_pcb_va;
+	uint64_t hah_restore_kernel_va;
+	uint64_t hah_saved_cr0;
+	uint64_t hah_saved_cr4;
+	uint64_t hah_saved_efer;
+	uint64_t hah_saved_pat;
+	uint64_t hah_saved_xcr0;
+	struct hibernate_arena_packed_dtr hah_gdtr;
+	struct hibernate_arena_packed_dtr hah_idtr;
+	uint32_t hah_handoff_length;
+	uint64_t hah_instruction_page_pa;
+	uint64_t hah_terminal_flags;
+	uint64_t hah_saved_entry_rsp;
+	uint8_t hah_reserved_0f0[16];
+} __aligned(64);
+
+struct hibernate_handoff_record {
+	uint64_t hhr_magic;
+	uint32_t hhr_version;
+	uint32_t hhr_encoded_size;
+	char hhr_provider_name[SPECNAMELEN];
+	uint64_t hhr_provider_media_size;
+	uint8_t hhr_provider_writable;
+	uint64_t hhr_marker_offset;
+	uint64_t hhr_image_offset;
+	uint64_t hhr_image_length;
+	uint32_t hhr_marker_sequence;
+	uint32_t hhr_marker_state;
+	uint8_t hhr_completion_provider_acquired;
+	uint8_t hhr_completion_consumer_attached;
+	uint8_t hhr_reserved[6];
+};
+
+extern struct hibernate_handoff_record hibernate_saved_handoff;
+
 
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536
@@ -56,7 +118,19 @@ struct hibernate_arena_sizing {
 #define HIBERNATE_ARENA_RULE_VERSION	     1U
 #define HIBERNATE_ARENA_ALIGNMENT	     UINT64_C(4096)
 #define HIBERNATE_ARENA_HEADER_BYTES	     UINT64_C(256)
-#define HIBERNATE_ARENA_TRAMPOLINE_BYTES     UINT64_C(4096)
+/*
+ * Reserved arena span for the copied, position-independent trampoline.
+ * hibernate_tramp_entry contains two page-aligned pages (the both-domain
+ * CR3-load/jump page and the saved-domain stub), so the object spans three
+ * pages: the entry page, the both-domain page, and the stub page.
+ * hibernate_machdep_prepare() sizes its copy from the exported
+ * [hibernate_tramp_entry, hibernate_tramp_end) extent and refuses with E2BIG
+ * if that extent ever exceeds this reservation; the ATF suite asserts the
+ * same relationship against the built object.
+ */
+#define HIBERNATE_ARENA_TRAMPOLINE_PAGES     UINT64_C(3)
+#define HIBERNATE_ARENA_TRAMPOLINE_BYTES \
+	(HIBERNATE_ARENA_TRAMPOLINE_PAGES * HIBERNATE_ARENA_ALIGNMENT)
 #define HIBERNATE_ARENA_STACK_BYTES	     UINT64_C(65536)
 #define HIBERNATE_ARENA_HANDOFF_BYTES	     UINT64_C(4096)
 #define HIBERNATE_ARENA_COPY_RUN_MAX	     UINT64_C(900)
@@ -72,6 +146,85 @@ struct hibernate_arena_sizing {
 #define HIBERNATE_ARENA_POLICY_DEFAULT_BYTES (UINT64_C(4) * 1024 * 1024)
 #define HIBERNATE_ARENA_PHYS_LIMIT	     UINT64_C(0x100000000)
 #define HIBERNATE_ARENA_INTERVAL_MAX	     128
+
+#define HIBERNATE_ARENA_HEADER_MAGIC UINT64_C(0x4852454e41454241)
+#define HIBERNATE_ARENA_HEADER_VERSION 1
+#define HIBERNATE_ARENA_HEADER_ENCODED_SIZE 256
+#define HIBERNATE_ARENA_HEADER_ALIGNMENT 64
+/*
+ * Defined bits of the terminal-flags word.  No flag is defined yet, so any
+ * nonzero value is an encoding error and the decoder rejects it.
+ */
+#define HIBERNATE_ARENA_HEADER_TERMINAL_FLAGS_DEFINED UINT64_C(0)
+
+#define HIBERNATE_ARENA_HEADER_OFF_MAGIC		   0x00
+#define HIBERNATE_ARENA_HEADER_WIDTH_MAGIC		   8
+#define HIBERNATE_ARENA_HEADER_OFF_VERSION		   0x08
+#define HIBERNATE_ARENA_HEADER_WIDTH_VERSION		   4
+#define HIBERNATE_ARENA_HEADER_OFF_HEADER_SIZE		   0x0c
+#define HIBERNATE_ARENA_HEADER_WIDTH_HEADER_SIZE	   4
+#define HIBERNATE_ARENA_HEADER_OFF_ARENA_PA		   0x10
+#define HIBERNATE_ARENA_HEADER_WIDTH_ARENA_PA		   8
+#define HIBERNATE_ARENA_HEADER_OFF_ARENA_SIZE		   0x18
+#define HIBERNATE_ARENA_HEADER_WIDTH_ARENA_SIZE		   8
+#define HIBERNATE_ARENA_HEADER_OFF_PRIVATE_CR3_PA	   0x20
+#define HIBERNATE_ARENA_HEADER_WIDTH_PRIVATE_CR3_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_CR3_PA		   0x28
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR3_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_PA	   0x30
+#define HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_IDENTITY_VA 0x38
+#define HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_IDENTITY_VA 8
+#define HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_SAVED_VA   0x40
+#define HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_SAVED_VA 8
+#define HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_PA	   0x48
+#define HIBERNATE_ARENA_HEADER_WIDTH_ARENA_STACK_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_SIZE	   0x50
+#define HIBERNATE_ARENA_HEADER_WIDTH_ARENA_STACK_SIZE	   8
+#define HIBERNATE_ARENA_HEADER_OFF_SOURCE_VECTOR_PA	   0x58
+#define HIBERNATE_ARENA_HEADER_WIDTH_SOURCE_VECTOR_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_FIRST_DESTINATION_PA  0x60
+#define HIBERNATE_ARENA_HEADER_WIDTH_FIRST_DESTINATION_PA 8
+#define HIBERNATE_ARENA_HEADER_OFF_DESTINATION_PAGE_COUNT 0x68
+#define HIBERNATE_ARENA_HEADER_WIDTH_DESTINATION_PAGE_COUNT 8
+#define HIBERNATE_ARENA_HEADER_OFF_ITERATOR_PA		   0x70
+#define HIBERNATE_ARENA_HEADER_WIDTH_ITERATOR_PA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_HANDOFF_RECORD_PA	   0x78
+#define HIBERNATE_ARENA_HEADER_WIDTH_HANDOFF_RECORD_PA   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_HANDOFF_VA	   0x80
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_HANDOFF_VA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_PCB_VA		   0x88
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_PCB_VA	   8
+#define HIBERNATE_ARENA_HEADER_OFF_RESTORE_KERNEL_VA	   0x90
+#define HIBERNATE_ARENA_HEADER_WIDTH_RESTORE_KERNEL_VA   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_CR0		   0x98
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR0		   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_CR4		   0xa0
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR4		   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_EFER		   0xa8
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_EFER		   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_PAT		   0xb0
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_PAT		   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_XCR0		   0xb8
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_XCR0		   8
+#define HIBERNATE_ARENA_HEADER_OFF_GDTR			   0xc0
+#define HIBERNATE_ARENA_HEADER_WIDTH_GDTR		   10
+#define HIBERNATE_ARENA_HEADER_OFF_IDTR			   0xca
+#define HIBERNATE_ARENA_HEADER_WIDTH_IDTR		   10
+#define HIBERNATE_ARENA_HEADER_OFF_HANDOFF_LENGTH	   0xd4
+#define HIBERNATE_ARENA_HEADER_WIDTH_HANDOFF_LENGTH	   4
+#define HIBERNATE_ARENA_HEADER_OFF_INSTRUCTION_PAGE_PA   0xd8
+#define HIBERNATE_ARENA_HEADER_WIDTH_INSTRUCTION_PAGE_PA 8
+#define HIBERNATE_ARENA_HEADER_OFF_TERMINAL_FLAGS	   0xe0
+#define HIBERNATE_ARENA_HEADER_WIDTH_TERMINAL_FLAGS	   8
+#define HIBERNATE_ARENA_HEADER_OFF_SAVED_ENTRY_RSP	   0xe8
+#define HIBERNATE_ARENA_HEADER_WIDTH_SAVED_ENTRY_RSP	   8
+#define HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0		   0xf0
+#define HIBERNATE_ARENA_HEADER_WIDTH_RESERVED_0F0	   16
+
+#define HIBERNATE_HANDOFF_MAGIC UINT64_C(0x484f444e4148424e)
+#define HIBERNATE_HANDOFF_VERSION 1
+#define HIBERNATE_HANDOFF_ENCODED_SIZE (SPECNAMELEN + 65)
 
 #define HIBERNATE_ARENA_PRIVATE_PT_PAGES                                 \
 	(HIBERNATE_ARENA_PT_PML4_PAGES + HIBERNATE_ARENA_PT_PDPT_PAGES + \
@@ -842,6 +995,16 @@ int hibernate_resume_attempt(struct hibernate_attempt *ha);
 int hibernate_image_validate(struct hibernate_attempt *ha);
 void hibernate_attempt_cleanup(struct hibernate_attempt *ha);
 
+#ifndef __noreturn
+#define __noreturn __dead2
+#endif
+
+int hibernate_machdep_prepare(struct hibernate_attempt *ha);
+void hibernate_machdep_enter(void) __noreturn;
+int hibernate_staging_source_pages(struct hibernate_attempt *ha,
+    vm_paddr_t *vector_pa, const vm_paddr_t **vector_va, size_t *vector_pages,
+    vm_paddr_t *xsave_pa);
+
 int hibernate_quiesce(struct hibernate_attempt *ha);
 int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
 int hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged);
@@ -897,6 +1060,15 @@ typedef int hibernate_image_write_t(void *);
 
 int hibernate_cb_encode(uint8_t *, size_t, const struct hibernate_cb *);
 int hibernate_pcb_encode(uint8_t *, size_t, const struct hibernate_pcb *);
+
+int hibernate_arena_header_encode(uint8_t *, size_t,
+    const struct hibernate_arena_header *);
+int hibernate_arena_header_decode(const uint8_t *, size_t,
+    struct hibernate_arena_header *);
+int hibernate_handoff_record_encode(uint8_t *, size_t,
+    const struct hibernate_handoff_record *);
+int hibernate_handoff_record_decode(const uint8_t *, size_t,
+    struct hibernate_handoff_record *);
 int hibernate_xsave_extent(uint64_t,
     const struct hibernate_xsave_component_fact *, size_t, uint32_t *);
 int hibernate_writer_plan_assemble(struct hibernate_writer_plan *,
@@ -1070,6 +1242,54 @@ uint32_t hibernate_crc32c_update(uint32_t crc, const void *buf, size_t len);
  * Private byte-only declarations prove the wire tables.  They are layout
  * witnesses, not codec or persistent scalar structures.
  */
+
+struct __hibernate_arena_header_layout {
+	uint8_t magic[HIBERNATE_ARENA_HEADER_WIDTH_MAGIC];
+	uint8_t version[HIBERNATE_ARENA_HEADER_WIDTH_VERSION];
+	uint8_t header_size[HIBERNATE_ARENA_HEADER_WIDTH_HEADER_SIZE];
+	uint8_t arena_pa[HIBERNATE_ARENA_HEADER_WIDTH_ARENA_PA];
+	uint8_t arena_size[HIBERNATE_ARENA_HEADER_WIDTH_ARENA_SIZE];
+	uint8_t private_cr3_pa[HIBERNATE_ARENA_HEADER_WIDTH_PRIVATE_CR3_PA];
+	uint8_t saved_cr3_pa[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR3_PA];
+	uint8_t trampoline_pa[HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_PA];
+	uint8_t
+	    trampoline_identity_va[
+		HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_IDENTITY_VA];
+	uint8_t
+	    trampoline_saved_va[
+		HIBERNATE_ARENA_HEADER_WIDTH_TRAMPOLINE_SAVED_VA];
+	uint8_t arena_stack_pa[HIBERNATE_ARENA_HEADER_WIDTH_ARENA_STACK_PA];
+	uint8_t arena_stack_size[HIBERNATE_ARENA_HEADER_WIDTH_ARENA_STACK_SIZE];
+	uint8_t source_vector_pa[HIBERNATE_ARENA_HEADER_WIDTH_SOURCE_VECTOR_PA];
+	uint8_t
+	    first_destination_pa[
+		HIBERNATE_ARENA_HEADER_WIDTH_FIRST_DESTINATION_PA];
+	uint8_t
+	    destination_page_count[
+		HIBERNATE_ARENA_HEADER_WIDTH_DESTINATION_PAGE_COUNT];
+	uint8_t iterator_pa[HIBERNATE_ARENA_HEADER_WIDTH_ITERATOR_PA];
+	uint8_t
+	    handoff_record_pa[HIBERNATE_ARENA_HEADER_WIDTH_HANDOFF_RECORD_PA];
+	uint8_t saved_handoff_va[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_HANDOFF_VA];
+	uint8_t saved_pcb_va[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_PCB_VA];
+	uint8_t
+	    restore_kernel_va[HIBERNATE_ARENA_HEADER_WIDTH_RESTORE_KERNEL_VA];
+	uint8_t saved_cr0[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR0];
+	uint8_t saved_cr4[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_CR4];
+	uint8_t saved_efer[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_EFER];
+	uint8_t saved_pat[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_PAT];
+	uint8_t saved_xcr0[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_XCR0];
+	uint8_t gdtr[HIBERNATE_ARENA_HEADER_WIDTH_GDTR];
+	uint8_t idtr[HIBERNATE_ARENA_HEADER_WIDTH_IDTR];
+	uint8_t handoff_length[HIBERNATE_ARENA_HEADER_WIDTH_HANDOFF_LENGTH];
+	uint8_t
+	    instruction_page_pa[
+		HIBERNATE_ARENA_HEADER_WIDTH_INSTRUCTION_PAGE_PA];
+	uint8_t terminal_flags[HIBERNATE_ARENA_HEADER_WIDTH_TERMINAL_FLAGS];
+	uint8_t saved_entry_rsp[HIBERNATE_ARENA_HEADER_WIDTH_SAVED_ENTRY_RSP];
+	uint8_t reserved_0f0[HIBERNATE_ARENA_HEADER_WIDTH_RESERVED_0F0];
+} __aligned(HIBERNATE_ARENA_HEADER_ALIGNMENT);
+
 struct __hibernate_marker_layout {
 	uint8_t magic[HIBERNATE_MARKER_WIDTH_MAGIC];
 	uint8_t version[HIBERNATE_MARKER_WIDTH_VERSION];
@@ -1149,6 +1369,72 @@ struct __hibernate_pcb_layout {
 	_Static_assert(sizeof(((struct type *)0)->member) == \
 		prefix##_WIDTH_##field,                      \
 	    #type "." #member " width")
+
+
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, magic,
+    HIBERNATE_ARENA_HEADER, MAGIC);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, version,
+    HIBERNATE_ARENA_HEADER, VERSION);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, header_size,
+    HIBERNATE_ARENA_HEADER, HEADER_SIZE);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, arena_pa,
+    HIBERNATE_ARENA_HEADER, ARENA_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, arena_size,
+    HIBERNATE_ARENA_HEADER, ARENA_SIZE);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, private_cr3_pa,
+    HIBERNATE_ARENA_HEADER, PRIVATE_CR3_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_cr3_pa,
+    HIBERNATE_ARENA_HEADER, SAVED_CR3_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, trampoline_pa,
+    HIBERNATE_ARENA_HEADER, TRAMPOLINE_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout,
+    trampoline_identity_va, HIBERNATE_ARENA_HEADER, TRAMPOLINE_IDENTITY_VA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, trampoline_saved_va,
+    HIBERNATE_ARENA_HEADER, TRAMPOLINE_SAVED_VA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, arena_stack_pa,
+    HIBERNATE_ARENA_HEADER, ARENA_STACK_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, arena_stack_size,
+    HIBERNATE_ARENA_HEADER, ARENA_STACK_SIZE);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, source_vector_pa,
+    HIBERNATE_ARENA_HEADER, SOURCE_VECTOR_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, first_destination_pa,
+    HIBERNATE_ARENA_HEADER, FIRST_DESTINATION_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout,
+    destination_page_count, HIBERNATE_ARENA_HEADER, DESTINATION_PAGE_COUNT);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, iterator_pa,
+    HIBERNATE_ARENA_HEADER, ITERATOR_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, handoff_record_pa,
+    HIBERNATE_ARENA_HEADER, HANDOFF_RECORD_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_handoff_va,
+    HIBERNATE_ARENA_HEADER, SAVED_HANDOFF_VA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_pcb_va,
+    HIBERNATE_ARENA_HEADER, SAVED_PCB_VA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, restore_kernel_va,
+    HIBERNATE_ARENA_HEADER, RESTORE_KERNEL_VA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_cr0,
+    HIBERNATE_ARENA_HEADER, SAVED_CR0);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_cr4,
+    HIBERNATE_ARENA_HEADER, SAVED_CR4);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_efer,
+    HIBERNATE_ARENA_HEADER, SAVED_EFER);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_pat,
+    HIBERNATE_ARENA_HEADER, SAVED_PAT);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_xcr0,
+    HIBERNATE_ARENA_HEADER, SAVED_XCR0);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, gdtr,
+    HIBERNATE_ARENA_HEADER, GDTR);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, idtr,
+    HIBERNATE_ARENA_HEADER, IDTR);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, handoff_length,
+    HIBERNATE_ARENA_HEADER, HANDOFF_LENGTH);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, instruction_page_pa,
+    HIBERNATE_ARENA_HEADER, INSTRUCTION_PAGE_PA);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, terminal_flags,
+    HIBERNATE_ARENA_HEADER, TERMINAL_FLAGS);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, saved_entry_rsp,
+    HIBERNATE_ARENA_HEADER, SAVED_ENTRY_RSP);
+HIBERNATE_LAYOUT_ASSERT(__hibernate_arena_header_layout, reserved_0f0,
+    HIBERNATE_ARENA_HEADER, RESERVED_0F0);
 
 HIBERNATE_LAYOUT_ASSERT(__hibernate_marker_layout, magic, HIBERNATE_MARKER,
     MAGIC);
@@ -1257,6 +1543,23 @@ HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, xsave_enabled_mask,
 HIBERNATE_LAYOUT_ASSERT(__hibernate_pcb_layout, reserved_0d0, HIBERNATE_PCB,
     RESERVED_0D0);
 
+
+_Static_assert(sizeof(struct __hibernate_arena_header_layout) ==
+	HIBERNATE_ARENA_HEADER_ENCODED_SIZE,
+    "arena header complete coverage");
+_Static_assert(_Alignof(struct __hibernate_arena_header_layout) ==
+	HIBERNATE_ARENA_HEADER_ALIGNMENT,
+    "arena header alignment");
+_Static_assert(sizeof(struct hibernate_arena_header) ==
+	HIBERNATE_ARENA_HEADER_ENCODED_SIZE,
+    "arena header size");
+_Static_assert(_Alignof(struct hibernate_arena_header) ==
+	HIBERNATE_ARENA_HEADER_ALIGNMENT,
+    "arena header native alignment");
+_Static_assert(HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0 +
+	    HIBERNATE_ARENA_HEADER_WIDTH_RESERVED_0F0 ==
+	HIBERNATE_ARENA_HEADER_ENCODED_SIZE,
+    "arena header collision-free complete coverage");
 _Static_assert(sizeof(struct __hibernate_marker_layout) ==
 	HIBERNATE_MARKER_ENCODED_SIZE,
     "marker complete coverage");

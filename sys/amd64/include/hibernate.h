@@ -100,6 +100,18 @@ extern uint32_t hibernate_resume_tramp_size;
 extern uint64_t hibernate_tramp_cr3;
 
 /*
+ * K-10 arena-resident transition object (sys/amd64/amd64/hibernate_tramp.S).
+ * hibernate_machdep_prepare() sizes its arena copy from
+ * [hibernate_tramp_entry, hibernate_tramp_end) and derives the arena offsets
+ * of the two interior pages from these labels, so the copy geometry is bound
+ * to the real linked object rather than assumed.
+ */
+void hibernate_tramp_entry(void) __dead2;
+extern char hibernate_tramp_end[];
+extern char hibernate_tramp_both_domain_page[];
+extern char hibernate_tramp_saved_domain_stub[];
+
+/*
  * K-6: live amd64 XSAVE fact collection and canonical PCB population.
  *
  * hibernate_amd64_xsave_collect() validates the live XCR0 against
