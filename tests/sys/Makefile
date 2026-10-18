@@ -5,6 +5,7 @@ TESTSDIR=		${TESTSBASE}/sys
 TESTS_SUBDIRS+=		acl
 TESTS_SUBDIRS+=		aio
 TESTS_SUBDIRS+=		arch
+TESTS_SUBDIRS+=		${_amd64}
 TESTS_SUBDIRS+=		${_audit}
 TESTS_SUBDIRS+=		auditpipe
 TESTS_SUBDIRS+=		cam
@@ -45,6 +46,10 @@ _audit=	audit
 
 .if ${MK_CDDL} != "no"
 _cddl=	cddl
+.endif
+
+.if ${MACHINE_ARCH} == "amd64"
+_amd64=	amd64
 .endif
 
 .if ${MK_NETGRAPH} != "no"

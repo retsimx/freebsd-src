@@ -133,6 +133,13 @@ static struct hibernate_early_arena g_hibernate_early_arena;
 static struct hibernate_attempt *g_hibernate_arena_owner;
 
 /*
+ * Fixed saved-kernel destination for the scalar handoff record.  The
+ * terminal assembly copies the encoded record here by value before entering
+ * hibernate_restore_kernel.
+ */
+struct hibernate_handoff_record hibernate_saved_handoff;
+
+/*
  * These buffers are used only by serial early-boot arena derivation.
  * Each active range is fully written before it is read.
  */
@@ -917,7 +924,8 @@ hibernate_marker_result_from_transfer(int error, size_t transferred,
  *   3. Source-vector: destination_union_pages * 8 bytes.
  *   4. One maximum BIO/backend transfer buffer: HIB_MAXPHYS_BYTES.
  *   5. Arena-external MD workspace: HIB_SCRATCH_STACK_BYTES.
- *   6. Reservation-record bytes: destination_union_pages * record_size + 1 page.
+ *   6. Reservation-record bytes: destination_union_pages * record_size + 1
+ * page.
  *   7. 25% fragmentation margin (checked ceiling division).
  *
  * Returns 0 with *derived_pages_out set on success, EOVERFLOW on
@@ -955,7 +963,9 @@ hibernate_restore_footprint_compute(uint64_t destination_union_pages,
 
 	total = 0;
 
-	/* 1. Wired kernel pages (caller-supplied; kernel passes vm_wire_count()). */
+	/*
+	 * 1. Wired kernel pages.  The kernel passes vm_wire_count().
+	 */
 	if (__builtin_add_overflow(total, wired_pages, &total))
 		return (EOVERFLOW);
 
@@ -1048,8 +1058,8 @@ hibernate_dst_interval_contains(const struct hibernate_attempt *ha,
 {
 	uint64_t i;
 
-	if (ha == NULL || !ha->ha_dst_valid ||
-	    ha->ha_dst_intervals == NULL || ha->ha_dst_count == 0)
+	if (ha == NULL || !ha->ha_dst_valid || ha->ha_dst_intervals == NULL ||
+	    ha->ha_dst_count == 0)
 		return (false);
 
 	/*
@@ -1108,8 +1118,7 @@ hibernate_dst_page_agrees(const struct hibernate_attempt *ha,
 	excluded = (*free_idx < free_count && sorted_free[*free_idx] == pa);
 	if (excluded)
 		(*free_idx)++;
-	if (!excluded && arena_end != 0 &&
-	    pa >= arena_start && pa < arena_end)
+	if (!excluded && arena_end != 0 && pa >= arena_start && pa < arena_end)
 		excluded = true;
 
 	expected_dst = !excluded;
@@ -1443,20 +1452,23 @@ hibernate_probe(struct hibernate_attempt *ha)
  * The maximum is 16777216 pages (64 GiB at 4 KiB/page).
  */
 
-/* HIB_FOOTPRINT_*, HIB_METADATA_MAX_BYTES, HIB_FRAG_*, HIB_MAXPHYS_BYTES,
- * HIB_SCRATCH_STACK_BYTES, HIB_RESERVATION_RECORD_BYTES, HIB_PAGE_SIZE
- * are defined in sys/sys/hibernate.h for dual-build (kernel + userland). */
+/*
+ * HIB_FOOTPRINT_*, HIB_METADATA_MAX_BYTES, HIB_FRAG_*,
+ * HIB_MAXPHYS_BYTES, HIB_SCRATCH_STACK_BYTES,
+ * HIB_RESERVATION_RECORD_BYTES, and HIB_PAGE_SIZE are defined in
+ * sys/sys/hibernate.h for dual-build use by the kernel and userland.
+ */
 
-static SYSCTL_NODE(_kern, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE,
-    0, "Hibernate parameters");
+static SYSCTL_NODE(_kern, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "Hibernate parameters");
 
 /*
  * Configured restore-footprint floor.  Read once at boot; protected by
  * CTLFLAG_RDTUN so it cannot be changed at runtime.
  */
 static u_long hibernate_restore_footprint_pages = HIB_FOOTPRINT_DEFAULT;
-SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_pages,
-    CTLFLAG_RDTUN, &hibernate_restore_footprint_pages, 0,
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_pages, CTLFLAG_RDTUN,
+    &hibernate_restore_footprint_pages, 0,
     "Restore-kernel footprint floor in pages (default 262144, max 16777216)");
 
 /*
@@ -1464,16 +1476,16 @@ SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_pages,
  * Exposed read-only for diagnostics.
  */
 static u_long hibernate_restore_footprint_derived;
-SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_derived,
-    CTLFLAG_RD, &hibernate_restore_footprint_derived, 0,
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_derived, CTLFLAG_RD,
+    &hibernate_restore_footprint_derived, 0,
     "Derived minimum restore-kernel footprint in pages (computed at boot)");
 
 /*
  * Effective footprint budget (max of configured floor and derived minimum).
  */
 static u_long hibernate_restore_footprint_effective;
-SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_effective,
-    CTLFLAG_RD, &hibernate_restore_footprint_effective, 0,
+SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_effective, CTLFLAG_RD,
+    &hibernate_restore_footprint_effective, 0,
     "Effective restore-kernel footprint budget in pages");
 
 /*
@@ -1548,10 +1560,11 @@ hibernate_capacity_check(const struct hibernate_capacity_budget *b,
 
 	/*
 	 * The restore footprint is a valid capacity requirement, not a PFN set
-	 * whose standalone size must fit physmem for the input to be meaningful.
-	 * A representable configured footprint larger than available physical
-	 * memory is therefore an ordinary capacity shortage.  Populate the result
-	 * consistently and return ENOMEM rather than classifying it as EINVAL.
+	 * whose standalone size must fit physmem for the input to be
+	 * meaningful. A representable configured footprint larger than
+	 * available physical memory is therefore an ordinary capacity shortage.
+	 * Populate the result consistently and return ENOMEM rather than
+	 * classifying it as EINVAL.
 	 */
 	if (b->restore_kernel_footprint_budget > b->physmem_pages) {
 		r->eligible_source_pages = 0;
@@ -1638,12 +1651,12 @@ MTX_SYSINIT(hibernate_coordinator, &hibernate_coordinator_mtx,
 static struct hibernate_attempt *hibernate_current_attempt;
 
 /*
- * Footprint derivation/configuration status, set by hibernate_footprint_sysinit.
- * 0 = valid (hibernate_restore_footprint_effective is usable).
- * EOVERFLOW = arithmetic overflow during derivation.
- * ENOMEM    = derived minimum exceeded HIB_FOOTPRINT_MAX.
- * EINVAL    = configured floor was invalid (already corrected to default,
- *             but save attempts must still re-validate).
+ * Footprint derivation/configuration status, set by
+ * hibernate_footprint_sysinit. 0 = valid (hibernate_restore_footprint_effective
+ * is usable). EOVERFLOW = arithmetic overflow during derivation. ENOMEM    =
+ * derived minimum exceeded HIB_FOOTPRINT_MAX. EINVAL    = configured floor was
+ * invalid (already corrected to default, but save attempts must still
+ * re-validate).
  */
 static int hibernate_footprint_status;
 
@@ -1731,12 +1744,15 @@ hibernate_footprint_sysinit(void *unused __unused)
 		    configured, HIB_FOOTPRINT_MAX, HIB_FOOTPRINT_DEFAULT);
 		/*
 		 * Record EINVAL so the save path can refuse; reset to the
-		 * default so the effective value remains useful for diagnostics.
+		 * default so the effective value remains useful for
+		 * diagnostics.
 		 */
 		hibernate_footprint_status = EINVAL;
 		configured = HIB_FOOTPRINT_DEFAULT;
 		hibernate_restore_footprint_pages = configured;
-		/* Fall through to derive with the default so effective is set. */
+		/*
+		 * Fall through so derivation sets the effective default.
+		 */
 	}
 
 	/*
@@ -1744,15 +1760,14 @@ hibernate_footprint_sysinit(void *unused __unused)
 	 * destination_union_pages argument (worst case: all pages are
 	 * destinations).
 	 */
-	error = hibernate_restore_footprint_derive((uint64_t)physmem,
-	    &derived);
+	error = hibernate_restore_footprint_derive((uint64_t)physmem, &derived);
 	if (error == EOVERFLOW) {
 		printf("hibernate: footprint derivation overflow; "
 		    "save attempts will be refused\n");
 		hibernate_footprint_status = EOVERFLOW;
 		hibernate_restore_footprint_derived = 0;
-		hibernate_restore_footprint_effective =
-		    (u_long)HIB_FOOTPRINT_MAX;
+		hibernate_restore_footprint_effective = (u_long)
+		    HIB_FOOTPRINT_MAX;
 		return;
 	}
 	if (error == ENOMEM) {
@@ -1761,8 +1776,8 @@ hibernate_footprint_sysinit(void *unused __unused)
 		    HIB_FOOTPRINT_MAX);
 		hibernate_footprint_status = ENOMEM;
 		hibernate_restore_footprint_derived = (u_long)HIB_FOOTPRINT_MAX;
-		hibernate_restore_footprint_effective =
-		    (u_long)HIB_FOOTPRINT_MAX;
+		hibernate_restore_footprint_effective = (u_long)
+		    HIB_FOOTPRINT_MAX;
 		return;
 	}
 
@@ -1904,7 +1919,7 @@ hibernate_barrier_unwind(struct hibernate_attempt *ha,
 	 */
 	if (s & HIB_STAGE_CAM) {
 		if (ha->ha_cam_sim != NULL)
-			xpt_release_simq(ha->ha_cam_sim, /*run_queue*/0);
+			xpt_release_simq(ha->ha_cam_sim, 0);
 		s &= ~HIB_STAGE_CAM;
 	}
 
@@ -1926,8 +1941,9 @@ hibernate_barrier_unwind(struct hibernate_attempt *ha,
 	/*
 	 * Stage 4b: clear BSP preemption bit.  The caller calls sched_unpin()
 	 * AFTER intr_restore() to preserve the strict reverse order of
-	 * barrier_prepare (sched_pin then intr_disable → reverse: intr_restore
-	 * then sched_unpin).  Calling sched_unpin() here with interrupts still
+	 * barrier_prepare: sched_pin() then intr_disable(), reversed as
+	 * intr_restore() then sched_unpin().  Calling sched_unpin() here with
+	 * interrupts still
 	 * disabled would allow a timer interrupt to fire and call mi_switch()
 	 * in a critical section immediately after intr_restore().
 	 */
@@ -2066,7 +2082,7 @@ hibernate_barrier_prepare(struct hibernate_attempt *ha,
 		hibernate_barrier_unwind(ha, res, stages);
 		return (ENXIO);
 	}
-	xpt_freeze_simq(ha->ha_cam_sim, /*count*/1);
+	xpt_freeze_simq(ha->ha_cam_sim, 1);
 	*stages |= HIB_STAGE_CAM;
 	/*
 	 * H3: drain in-flight CAM work using the real quiescence predicate:
@@ -2184,8 +2200,7 @@ hibernate_writer_runs_build(struct hibernate_attempt *ha,
 	 * array before a second, storing pass.  payload_cursor is ignored
 	 * in dry-run mode (file offsets are not meaningful without it).
 	 */
-	if (ha == NULL || res == NULL ||
-	    (runs == NULL) != (runs_capacity == 0))
+	if (ha == NULL || res == NULL || (runs == NULL) != (runs_capacity == 0))
 		return (EINVAL);
 	if (res->vr_count != 0 && free_scratch == NULL)
 		return (EINVAL);
@@ -2217,8 +2232,8 @@ hibernate_writer_runs_build(struct hibernate_attempt *ha,
 
 #define HIB_RUN_CLOSE()							\
 	do {								\
-		if (__builtin_mul_overflow(run_pages,			\
-			(uint64_t)HIB_PAGE_SIZE, &run_bytes))		\
+		if (__builtin_mul_overflow(run_pages, (uint64_t)HIB_PAGE_SIZE, \
+			&run_bytes))                                           \
 			return (EOVERFLOW);				\
 		if (runs != NULL) {					\
 			if (count >= runs_capacity)			\
@@ -2267,8 +2282,7 @@ hibernate_writer_runs_build(struct hibernate_attempt *ha,
 				continue;
 			}
 
-			if (run_open &&
-			    pa == prev_dest_pa + HIB_PAGE_SIZE) {
+			if (run_open && pa == prev_dest_pa + HIB_PAGE_SIZE) {
 				run_pages++;
 			} else {
 				if (run_open)
@@ -2415,11 +2429,9 @@ hibernate_cb_encode(uint8_t *buf, size_t len, const struct hibernate_cb *cb)
 		return (EINVAL);
 	if (cb->hc_version != HCB_VERSION ||
 	    cb->hc_encoded_size != HIBERNATE_CB_ENCODED_SIZE ||
-	    cb->hc_page_size != HIB_PAGE_SIZE ||
-	    cb->hc_machine_flags != 0 ||
+	    cb->hc_page_size != HIB_PAGE_SIZE || cb->hc_machine_flags != 0 ||
 	    cb->hc_saved_pcb_size != HIBERNATE_PCB_ENCODED_SIZE ||
-	    cb->hc_payload_start == 0 ||
-	    cb->hc_payload_start > 64029 ||
+	    cb->hc_payload_start == 0 || cb->hc_payload_start > 64029 ||
 	    cb->hc_payload_start > HIBERNATE_META_BUF_MAX ||
 	    cb->hc_metadata_length != cb->hc_payload_start ||
 	    cb->hc_payload_start > cb->hc_image_length)
@@ -2430,12 +2442,9 @@ hibernate_cb_encode(uint8_t *buf, size_t len, const struct hibernate_cb *cb)
 	le32enc(buf + HIBERNATE_CB_OFF_VERSION, cb->hc_version);
 	le32enc(buf + HIBERNATE_CB_OFF_ENCODED_SIZE, cb->hc_encoded_size);
 	le64enc(buf + HIBERNATE_CB_OFF_PAGE_SIZE, cb->hc_page_size);
-	le64enc(buf + HIBERNATE_CB_OFF_PHYSMEM_BYTES,
-	    cb->hc_physmem_bytes);
-	le64enc(buf + HIBERNATE_CB_OFF_IMAGE_LENGTH,
-	    cb->hc_image_length);
-	le64enc(buf + HIBERNATE_CB_OFF_PAYLOAD_START,
-	    cb->hc_payload_start);
+	le64enc(buf + HIBERNATE_CB_OFF_PHYSMEM_BYTES, cb->hc_physmem_bytes);
+	le64enc(buf + HIBERNATE_CB_OFF_IMAGE_LENGTH, cb->hc_image_length);
+	le64enc(buf + HIBERNATE_CB_OFF_PAYLOAD_START, cb->hc_payload_start);
 	le64enc(buf + HIBERNATE_CB_OFF_DESTINATION_PAGES,
 	    cb->hc_destination_pages);
 	le64enc(buf + HIBERNATE_CB_OFF_SOURCE_VECTOR_BYTES,
@@ -2446,25 +2455,306 @@ hibernate_cb_encode(uint8_t *buf, size_t len, const struct hibernate_cb *cb)
 	    cb->hc_facs_hardware_signature);
 	le64enc(buf + HIBERNATE_CB_OFF_SAVED_PCB_OFFSET,
 	    cb->hc_saved_pcb_offset);
-	le64enc(buf + HIBERNATE_CB_OFF_SAVED_PCB_SIZE,
-	    cb->hc_saved_pcb_size);
+	le64enc(buf + HIBERNATE_CB_OFF_SAVED_PCB_SIZE, cb->hc_saved_pcb_size);
 	le64enc(buf + HIBERNATE_CB_OFF_ELF_PHNUM, cb->hc_elf_phnum);
-	le64enc(buf + HIBERNATE_CB_OFF_METADATA_LENGTH,
-	    cb->hc_metadata_length);
+	le64enc(buf + HIBERNATE_CB_OFF_METADATA_LENGTH, cb->hc_metadata_length);
 	/*
 	 * HIBERNATE_CB_WIDTH_CRC32C is eight bytes.  Both halves stay zero
 	 * during the forward stream, irrespective of the host-order field.
 	 */
 	le64enc(buf + HIBERNATE_CB_OFF_RESTORE_FOOTPRINT_PAGES,
 	    cb->hc_restore_footprint_pages);
-	le64enc(buf + HIBERNATE_CB_OFF_MACHINE_FLAGS,
-	    cb->hc_machine_flags);
+	le64enc(buf + HIBERNATE_CB_OFF_MACHINE_FLAGS, cb->hc_machine_flags);
 	le64enc(buf + HIBERNATE_CB_OFF_DESTINATION_BYTES,
 	    cb->hc_destination_bytes);
-	le64enc(buf + HIBERNATE_CB_OFF_COPY_LIST_BOUND,
-	    cb->hc_copy_list_bound);
+	le64enc(buf + HIBERNATE_CB_OFF_COPY_LIST_BOUND, cb->hc_copy_list_bound);
 	return (0);
 }
+
+/*
+ * Encode and decode the K-10 transition-arena header.  The native structure
+ * is only a host-order staging object; every wire field is accessed
+ * explicitly so the representation is independent of native padding.
+ */
+int
+hibernate_arena_header_encode(uint8_t *buf, size_t len,
+    const struct hibernate_arena_header *hah)
+{
+	uint8_t *gdtr, *idtr;
+
+	if (buf == NULL || hah == NULL ||
+	    len != HIBERNATE_ARENA_HEADER_ENCODED_SIZE)
+		return (EINVAL);
+	if (hah->hah_magic != HIBERNATE_ARENA_HEADER_MAGIC ||
+	    hah->hah_version != HIBERNATE_ARENA_HEADER_VERSION ||
+	    hah->hah_header_size != HIBERNATE_ARENA_HEADER_ENCODED_SIZE)
+		return (EINVAL);
+	if ((hah->hah_terminal_flags &
+		~HIBERNATE_ARENA_HEADER_TERMINAL_FLAGS_DEFINED) != 0)
+		return (EINVAL);
+
+	__builtin_memset(buf, 0, HIBERNATE_ARENA_HEADER_ENCODED_SIZE);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_MAGIC, hah->hah_magic);
+	le32enc(buf + HIBERNATE_ARENA_HEADER_OFF_VERSION, hah->hah_version);
+	le32enc(buf + HIBERNATE_ARENA_HEADER_OFF_HEADER_SIZE,
+	    hah->hah_header_size);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_PA, hah->hah_arena_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_SIZE,
+	    hah->hah_arena_size);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_PRIVATE_CR3_PA,
+	    hah->hah_private_cr3_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR3_PA,
+	    hah->hah_saved_cr3_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_PA,
+	    hah->hah_trampoline_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_IDENTITY_VA,
+	    hah->hah_trampoline_identity_va);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_SAVED_VA,
+	    hah->hah_trampoline_saved_va);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_PA,
+	    hah->hah_arena_stack_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_SIZE,
+	    hah->hah_arena_stack_size);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SOURCE_VECTOR_PA,
+	    hah->hah_source_vector_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_FIRST_DESTINATION_PA,
+	    hah->hah_first_destination_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_DESTINATION_PAGE_COUNT,
+	    hah->hah_destination_page_count);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_ITERATOR_PA,
+	    hah->hah_iterator_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_HANDOFF_RECORD_PA,
+	    hah->hah_handoff_record_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_HANDOFF_VA,
+	    hah->hah_saved_handoff_va);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_PCB_VA,
+	    hah->hah_saved_pcb_va);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_RESTORE_KERNEL_VA,
+	    hah->hah_restore_kernel_va);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR0, hah->hah_saved_cr0);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR4, hah->hah_saved_cr4);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_EFER,
+	    hah->hah_saved_efer);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_PAT, hah->hah_saved_pat);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_XCR0,
+	    hah->hah_saved_xcr0);
+	gdtr = buf + HIBERNATE_ARENA_HEADER_OFF_GDTR;
+	le16enc(gdtr, hah->hah_gdtr.hap_limit);
+	le64enc(gdtr + 2, hah->hah_gdtr.hap_base);
+	idtr = buf + HIBERNATE_ARENA_HEADER_OFF_IDTR;
+	le16enc(idtr, hah->hah_idtr.hap_limit);
+	le64enc(idtr + 2, hah->hah_idtr.hap_base);
+	le32enc(buf + HIBERNATE_ARENA_HEADER_OFF_HANDOFF_LENGTH,
+	    hah->hah_handoff_length);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_INSTRUCTION_PAGE_PA,
+	    hah->hah_instruction_page_pa);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_TERMINAL_FLAGS,
+	    hah->hah_terminal_flags);
+	le64enc(buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_ENTRY_RSP,
+	    hah->hah_saved_entry_rsp);
+	return (0);
+}
+
+int
+hibernate_arena_header_decode(const uint8_t *buf, size_t len,
+    struct hibernate_arena_header *hah)
+{
+	const uint8_t *gdtr, *idtr;
+	size_t i;
+
+	if (buf == NULL || hah == NULL ||
+	    len != HIBERNATE_ARENA_HEADER_ENCODED_SIZE)
+		return (EINVAL);
+	for (i = 0; i < HIBERNATE_ARENA_HEADER_WIDTH_RESERVED_0F0; i++) {
+		if (buf[HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0 + i] != 0)
+			return (EINVAL);
+	}
+
+	__builtin_memset(hah, 0, sizeof(*hah));
+	hah->hah_magic = le64dec(buf + HIBERNATE_ARENA_HEADER_OFF_MAGIC);
+	hah->hah_version = le32dec(buf + HIBERNATE_ARENA_HEADER_OFF_VERSION);
+	hah->hah_header_size = le32dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_HEADER_SIZE);
+	if (hah->hah_magic != HIBERNATE_ARENA_HEADER_MAGIC ||
+	    hah->hah_version != HIBERNATE_ARENA_HEADER_VERSION ||
+	    hah->hah_header_size != HIBERNATE_ARENA_HEADER_ENCODED_SIZE)
+		return (EINVAL);
+	hah->hah_arena_pa = le64dec(buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_PA);
+	hah->hah_arena_size = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_SIZE);
+	hah->hah_private_cr3_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_PRIVATE_CR3_PA);
+	hah->hah_saved_cr3_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR3_PA);
+	hah->hah_trampoline_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_PA);
+	hah->hah_trampoline_identity_va = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_IDENTITY_VA);
+	hah->hah_trampoline_saved_va = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_TRAMPOLINE_SAVED_VA);
+	hah->hah_arena_stack_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_PA);
+	hah->hah_arena_stack_size = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_ARENA_STACK_SIZE);
+	hah->hah_source_vector_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SOURCE_VECTOR_PA);
+	hah->hah_first_destination_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_FIRST_DESTINATION_PA);
+	hah->hah_destination_page_count = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_DESTINATION_PAGE_COUNT);
+	hah->hah_iterator_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_ITERATOR_PA);
+	hah->hah_handoff_record_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_HANDOFF_RECORD_PA);
+	hah->hah_saved_handoff_va = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_HANDOFF_VA);
+	hah->hah_saved_pcb_va = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_PCB_VA);
+	hah->hah_restore_kernel_va = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_RESTORE_KERNEL_VA);
+	hah->hah_saved_cr0 = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR0);
+	hah->hah_saved_cr4 = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_CR4);
+	hah->hah_saved_efer = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_EFER);
+	hah->hah_saved_pat = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_PAT);
+	hah->hah_saved_xcr0 = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_XCR0);
+	gdtr = buf + HIBERNATE_ARENA_HEADER_OFF_GDTR;
+	hah->hah_gdtr.hap_limit = le16dec(gdtr);
+	hah->hah_gdtr.hap_base = le64dec(gdtr + 2);
+	idtr = buf + HIBERNATE_ARENA_HEADER_OFF_IDTR;
+	hah->hah_idtr.hap_limit = le16dec(idtr);
+	hah->hah_idtr.hap_base = le64dec(idtr + 2);
+	hah->hah_handoff_length = le32dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_HANDOFF_LENGTH);
+	hah->hah_instruction_page_pa = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_INSTRUCTION_PAGE_PA);
+	hah->hah_terminal_flags = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_TERMINAL_FLAGS);
+	if ((hah->hah_terminal_flags &
+		~HIBERNATE_ARENA_HEADER_TERMINAL_FLAGS_DEFINED) != 0)
+		return (EINVAL);
+	hah->hah_saved_entry_rsp = le64dec(
+	    buf + HIBERNATE_ARENA_HEADER_OFF_SAVED_ENTRY_RSP);
+	return (0);
+}
+
+/*
+ * The handoff wire form is packed field-by-field.  Keep these offsets local
+ * because the record is an internal cross-kernel transition object, not an
+ * image ABI object.
+ */
+#define HANDOFF_OFF_MAGIC	  0
+#define HANDOFF_OFF_VERSION	  8
+#define HANDOFF_OFF_ENCODED_SIZE  12
+#define HANDOFF_OFF_PROVIDER_NAME 16
+#define HANDOFF_OFF_PROVIDER_MEDIA_SIZE \
+	(HANDOFF_OFF_PROVIDER_NAME + SPECNAMELEN)
+#define HANDOFF_OFF_PROVIDER_WRITABLE (HANDOFF_OFF_PROVIDER_MEDIA_SIZE + 8)
+#define HANDOFF_OFF_MARKER_OFFSET     (HANDOFF_OFF_PROVIDER_WRITABLE + 1)
+#define HANDOFF_OFF_IMAGE_OFFSET      (HANDOFF_OFF_MARKER_OFFSET + 8)
+#define HANDOFF_OFF_IMAGE_LENGTH      (HANDOFF_OFF_IMAGE_OFFSET + 8)
+#define HANDOFF_OFF_MARKER_SEQUENCE   (HANDOFF_OFF_IMAGE_LENGTH + 8)
+#define HANDOFF_OFF_MARKER_STATE      (HANDOFF_OFF_MARKER_SEQUENCE + 4)
+#define HANDOFF_OFF_PROVIDER_ACQUIRED (HANDOFF_OFF_MARKER_STATE + 4)
+#define HANDOFF_OFF_CONSUMER_ATTACHED (HANDOFF_OFF_PROVIDER_ACQUIRED + 1)
+#define HANDOFF_OFF_RESERVED	      (HANDOFF_OFF_CONSUMER_ATTACHED + 1)
+#define HANDOFF_RESERVED_SIZE	      6
+#define HANDOFF_ENCODED_SIZE (HANDOFF_OFF_RESERVED + HANDOFF_RESERVED_SIZE)
+_Static_assert(HANDOFF_ENCODED_SIZE == HIBERNATE_HANDOFF_ENCODED_SIZE,
+    "HANDOFF_ENCODED_SIZE must match the public HIBERNATE_HANDOFF_ENCODED_SIZE "
+    "(sys/sys/hibernate.h), which hibernate_machdep_prepare() uses to size "
+    "its encode buffer without re-deriving this private wire layout");
+
+int
+hibernate_handoff_record_encode(uint8_t *buf, size_t len,
+    const struct hibernate_handoff_record *hhr)
+{
+	if (buf == NULL || hhr == NULL || len != HANDOFF_ENCODED_SIZE)
+		return (EINVAL);
+	if (hhr->hhr_magic != HIBERNATE_HANDOFF_MAGIC ||
+	    hhr->hhr_version != HIBERNATE_HANDOFF_VERSION ||
+	    hhr->hhr_encoded_size != HANDOFF_ENCODED_SIZE)
+		return (EINVAL);
+
+	__builtin_memset(buf, 0, HANDOFF_ENCODED_SIZE);
+	le64enc(buf + HANDOFF_OFF_MAGIC, hhr->hhr_magic);
+	le32enc(buf + HANDOFF_OFF_VERSION, hhr->hhr_version);
+	le32enc(buf + HANDOFF_OFF_ENCODED_SIZE, hhr->hhr_encoded_size);
+	__builtin_memcpy(buf + HANDOFF_OFF_PROVIDER_NAME,
+	    hhr->hhr_provider_name, SPECNAMELEN);
+	le64enc(buf + HANDOFF_OFF_PROVIDER_MEDIA_SIZE,
+	    hhr->hhr_provider_media_size);
+	buf[HANDOFF_OFF_PROVIDER_WRITABLE] = hhr->hhr_provider_writable;
+	le64enc(buf + HANDOFF_OFF_MARKER_OFFSET, hhr->hhr_marker_offset);
+	le64enc(buf + HANDOFF_OFF_IMAGE_OFFSET, hhr->hhr_image_offset);
+	le64enc(buf + HANDOFF_OFF_IMAGE_LENGTH, hhr->hhr_image_length);
+	le32enc(buf + HANDOFF_OFF_MARKER_SEQUENCE, hhr->hhr_marker_sequence);
+	le32enc(buf + HANDOFF_OFF_MARKER_STATE, hhr->hhr_marker_state);
+	buf[HANDOFF_OFF_PROVIDER_ACQUIRED] =
+	    hhr->hhr_completion_provider_acquired;
+	buf[HANDOFF_OFF_CONSUMER_ATTACHED] =
+	    hhr->hhr_completion_consumer_attached;
+	return (0);
+}
+
+int
+hibernate_handoff_record_decode(const uint8_t *buf, size_t len,
+    struct hibernate_handoff_record *hhr)
+{
+	size_t i;
+
+	if (buf == NULL || hhr == NULL || len != HANDOFF_ENCODED_SIZE)
+		return (EINVAL);
+	for (i = 0; i < HANDOFF_RESERVED_SIZE; i++) {
+		if (buf[HANDOFF_OFF_RESERVED + i] != 0)
+			return (EINVAL);
+	}
+
+	__builtin_memset(hhr, 0, sizeof(*hhr));
+	hhr->hhr_magic = le64dec(buf + HANDOFF_OFF_MAGIC);
+	hhr->hhr_version = le32dec(buf + HANDOFF_OFF_VERSION);
+	hhr->hhr_encoded_size = le32dec(buf + HANDOFF_OFF_ENCODED_SIZE);
+	if (hhr->hhr_magic != HIBERNATE_HANDOFF_MAGIC ||
+	    hhr->hhr_version != HIBERNATE_HANDOFF_VERSION ||
+	    hhr->hhr_encoded_size != HANDOFF_ENCODED_SIZE)
+		return (EINVAL);
+	__builtin_memcpy(hhr->hhr_provider_name,
+	    buf + HANDOFF_OFF_PROVIDER_NAME, SPECNAMELEN);
+	hhr->hhr_provider_media_size = le64dec(
+	    buf + HANDOFF_OFF_PROVIDER_MEDIA_SIZE);
+	hhr->hhr_provider_writable = buf[HANDOFF_OFF_PROVIDER_WRITABLE];
+	hhr->hhr_marker_offset = le64dec(buf + HANDOFF_OFF_MARKER_OFFSET);
+	hhr->hhr_image_offset = le64dec(buf + HANDOFF_OFF_IMAGE_OFFSET);
+	hhr->hhr_image_length = le64dec(buf + HANDOFF_OFF_IMAGE_LENGTH);
+	hhr->hhr_marker_sequence = le32dec(buf + HANDOFF_OFF_MARKER_SEQUENCE);
+	hhr->hhr_marker_state = le32dec(buf + HANDOFF_OFF_MARKER_STATE);
+	hhr->hhr_completion_provider_acquired =
+	    buf[HANDOFF_OFF_PROVIDER_ACQUIRED];
+	hhr->hhr_completion_consumer_attached =
+	    buf[HANDOFF_OFF_CONSUMER_ATTACHED];
+	return (0);
+}
+
+#undef HANDOFF_OFF_MAGIC
+#undef HANDOFF_OFF_VERSION
+#undef HANDOFF_OFF_ENCODED_SIZE
+#undef HANDOFF_OFF_PROVIDER_NAME
+#undef HANDOFF_OFF_PROVIDER_MEDIA_SIZE
+#undef HANDOFF_OFF_PROVIDER_WRITABLE
+#undef HANDOFF_OFF_MARKER_OFFSET
+#undef HANDOFF_OFF_IMAGE_OFFSET
+#undef HANDOFF_OFF_IMAGE_LENGTH
+#undef HANDOFF_OFF_MARKER_SEQUENCE
+#undef HANDOFF_OFF_MARKER_STATE
+#undef HANDOFF_OFF_PROVIDER_ACQUIRED
+#undef HANDOFF_OFF_CONSUMER_ATTACHED
+#undef HANDOFF_OFF_RESERVED
+#undef HANDOFF_RESERVED_SIZE
+#undef HANDOFF_ENCODED_SIZE
 
 /*
  * Derive the exact standard-format XSAVE extent from an enabled XCR0 mask and
@@ -2500,8 +2790,7 @@ hibernate_xsave_extent(uint64_t enabled_mask,
 	seen = 0;
 	for (i = 0; i < fact_count; i++) {
 		fact = &facts[i];
-		if (fact->hxcf_component < 2 ||
-		    fact->hxcf_component >= 64 ||
+		if (fact->hxcf_component < 2 || fact->hxcf_component >= 64 ||
 		    fact->hxcf_size == 0)
 			return (EINVAL);
 
@@ -2510,8 +2799,8 @@ hibernate_xsave_extent(uint64_t enabled_mask,
 			return (EINVAL);
 		if (fact->hxcf_offset < HIBERNATE_PCB_XSAVE_MIN)
 			return (EINVAL);
-		if (__builtin_add_overflow(fact->hxcf_offset,
-			fact->hxcf_size, &end))
+		if (__builtin_add_overflow(fact->hxcf_offset, fact->hxcf_size,
+			&end))
 			return (EOVERFLOW);
 
 		seen |= bit;
@@ -2523,8 +2812,7 @@ hibernate_xsave_extent(uint64_t enabled_mask,
 	 * Components 0 and 1 are represented by the fixed legacy region.
 	 * Every other enabled component must have exactly one supplied fact.
 	 */
-	if (seen !=
-	    (enabled_mask & ~HIBERNATE_XCR0_REQUIRED_MASK))
+	if (seen != (enabled_mask & ~HIBERNATE_XCR0_REQUIRED_MASK))
 		return (EINVAL);
 
 	*extentp = extent;
@@ -2537,13 +2825,11 @@ hibernate_xsave_extent(uint64_t enabled_mask,
  * emitted separately by the portable writer.
  */
 int
-hibernate_pcb_encode(uint8_t *buf, size_t len,
-    const struct hibernate_pcb *pcb)
+hibernate_pcb_encode(uint8_t *buf, size_t len, const struct hibernate_pcb *pcb)
 {
 	uint64_t required;
 
-	if (buf == NULL || pcb == NULL ||
-	    len != HIBERNATE_PCB_ENCODED_SIZE)
+	if (buf == NULL || pcb == NULL || len != HIBERNATE_PCB_ENCODED_SIZE)
 		return (EINVAL);
 	if (pcb->hp_version != 1 ||
 	    pcb->hp_encoded_size != HIBERNATE_PCB_ENCODED_SIZE)
@@ -2557,14 +2843,12 @@ hibernate_pcb_encode(uint8_t *buf, size_t len,
 	if (pcb->hp_xsave_format != HIBERNATE_XSAVE_FORMAT ||
 	    pcb->hp_xsave_length < HIBERNATE_PCB_XSAVE_MIN ||
 	    pcb->hp_xsave_offset == 0 ||
-	    (pcb->hp_xsave_offset &
-		(HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
+	    (pcb->hp_xsave_offset & (HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
 		return (EINVAL);
 
 	__builtin_memset(buf, 0, HIBERNATE_PCB_ENCODED_SIZE);
 	le32enc(buf + HIBERNATE_PCB_OFF_VERSION, pcb->hp_version);
-	le32enc(buf + HIBERNATE_PCB_OFF_ENCODED_SIZE,
-	    pcb->hp_encoded_size);
+	le32enc(buf + HIBERNATE_PCB_OFF_ENCODED_SIZE, pcb->hp_encoded_size);
 	le64enc(buf + HIBERNATE_PCB_OFF_CR0, pcb->hp_cr0);
 	le64enc(buf + HIBERNATE_PCB_OFF_CR3, pcb->hp_cr3);
 	le64enc(buf + HIBERNATE_PCB_OFF_CR4, pcb->hp_cr4);
@@ -2574,16 +2858,11 @@ hibernate_pcb_encode(uint8_t *buf, size_t len,
 	le64enc(buf + HIBERNATE_PCB_OFF_RFLAGS, pcb->hp_rflags);
 	le64enc(buf + HIBERNATE_PCB_OFF_RSP, pcb->hp_rsp);
 	le64enc(buf + HIBERNATE_PCB_OFF_RIP, pcb->hp_rip);
-	le64enc(buf + HIBERNATE_PCB_OFF_R12_PCB_PA,
-	    pcb->hp_r12_pcb_pa);
-	le16enc(buf + HIBERNATE_PCB_OFF_GDTR_LIMIT,
-	    pcb->hp_gdtr_limit);
-	le64enc(buf + HIBERNATE_PCB_OFF_GDTR_BASE,
-	    pcb->hp_gdtr_base);
-	le16enc(buf + HIBERNATE_PCB_OFF_IDTR_LIMIT,
-	    pcb->hp_idtr_limit);
-	le64enc(buf + HIBERNATE_PCB_OFF_IDTR_BASE,
-	    pcb->hp_idtr_base);
+	le64enc(buf + HIBERNATE_PCB_OFF_R12_PCB_PA, pcb->hp_r12_pcb_pa);
+	le16enc(buf + HIBERNATE_PCB_OFF_GDTR_LIMIT, pcb->hp_gdtr_limit);
+	le64enc(buf + HIBERNATE_PCB_OFF_GDTR_BASE, pcb->hp_gdtr_base);
+	le16enc(buf + HIBERNATE_PCB_OFF_IDTR_LIMIT, pcb->hp_idtr_limit);
+	le64enc(buf + HIBERNATE_PCB_OFF_IDTR_BASE, pcb->hp_idtr_base);
 	le64enc(buf + HIBERNATE_PCB_OFF_FSBASE, pcb->hp_fsbase);
 	le64enc(buf + HIBERNATE_PCB_OFF_GSBASE, pcb->hp_gsbase);
 	le64enc(buf + HIBERNATE_PCB_OFF_KGSBASE, pcb->hp_kgsbase);
@@ -2591,14 +2870,10 @@ hibernate_pcb_encode(uint8_t *buf, size_t len,
 	le64enc(buf + HIBERNATE_PCB_OFF_LSTAR, pcb->hp_lstar);
 	le64enc(buf + HIBERNATE_PCB_OFF_CSTAR, pcb->hp_cstar);
 	le64enc(buf + HIBERNATE_PCB_OFF_SFMASK, pcb->hp_sfmask);
-	le64enc(buf + HIBERNATE_PCB_OFF_KERNEL_GSBASE,
-	    pcb->hp_kernel_gsbase);
-	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_LENGTH,
-	    pcb->hp_xsave_length);
-	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_FORMAT,
-	    pcb->hp_xsave_format);
-	le64enc(buf + HIBERNATE_PCB_OFF_XSAVE_OFFSET,
-	    pcb->hp_xsave_offset);
+	le64enc(buf + HIBERNATE_PCB_OFF_KERNEL_GSBASE, pcb->hp_kernel_gsbase);
+	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_LENGTH, pcb->hp_xsave_length);
+	le32enc(buf + HIBERNATE_PCB_OFF_XSAVE_FORMAT, pcb->hp_xsave_format);
+	le64enc(buf + HIBERNATE_PCB_OFF_XSAVE_OFFSET, pcb->hp_xsave_offset);
 	le64enc(buf + HIBERNATE_PCB_OFF_XSAVE_ENABLED_MASK,
 	    pcb->hp_xsave_enabled_mask);
 	return (0);
@@ -2644,10 +2919,8 @@ hibernate_writer_payload_start(size_t run_count, uint64_t *payload_start_out)
 		&phnum64) ||
 	    phnum64 > HIBERNATE_MAX_PHDRS || phnum64 > UINT16_MAX)
 		return (EOVERFLOW);
-	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE,
-		&phdr_bytes) ||
-	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes,
-		&phdr_end))
+	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE, &phdr_bytes) ||
+	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes, &phdr_end))
 		return (EOVERFLOW);
 	if (phdr_end > 50464)
 		return (E2BIG);
@@ -2685,8 +2958,7 @@ hibernate_writer_payload_start(size_t run_count, uint64_t *payload_start_out)
  */
 int
 hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
-    const struct hibernate_cb *input_cb,
-    const struct hibernate_pcb *input_pcb)
+    const struct hibernate_cb *input_cb, const struct hibernate_pcb *input_pcb)
 {
 	struct hibernate_cb cb;
 	struct hibernate_pcb pcb;
@@ -2715,16 +2987,14 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 	    plan->hwp_run_count > HIBERNATE_MAX_PHDRS - 3)
 		return (EINVAL);
 
-	if (__builtin_add_overflow((uint64_t)plan->hwp_run_count,
-		UINT64_C(3), &phnum64) ||
+	if (__builtin_add_overflow((uint64_t)plan->hwp_run_count, UINT64_C(3),
+		&phnum64) ||
 	    phnum64 > HIBERNATE_MAX_PHDRS || phnum64 > UINT16_MAX)
 		return (EOVERFLOW);
 	phnum = (uint16_t)phnum64;
 
-	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE,
-		&phdr_bytes) ||
-	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes,
-		&phdr_end))
+	if (__builtin_mul_overflow(phnum64, (uint64_t)PHDR_SIZE, &phdr_bytes) ||
+	    __builtin_add_overflow((uint64_t)EHDR_SIZE, phdr_bytes, &phdr_end))
 		return (EOVERFLOW);
 	if (phdr_end > 50464)
 		return (E2BIG);
@@ -2763,8 +3033,7 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 	if (pcb.hp_xsave_length < HIBERNATE_PCB_XSAVE_MIN)
 		return (EINVAL);
 	if (pcb.hp_xsave_offset != cursor ||
-	    (pcb.hp_xsave_offset &
-		(HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
+	    (pcb.hp_xsave_offset & (HIBERNATE_PCB_ALIGNMENT - 1)) != 0)
 		return (EINVAL);
 	if (__builtin_add_overflow(cursor, pcb.hp_xsave_length, &xsave_end))
 		return (EOVERFLOW);
@@ -2789,8 +3058,7 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 			run->hwr_length, &destination_end))
 			return (EOVERFLOW);
 
-		if (cb.hc_arena_size != 0 &&
-		    run->hwr_destination < arena_end &&
+		if (cb.hc_arena_size != 0 && run->hwr_destination < arena_end &&
 		    destination_end > cb.hc_arena_start)
 			return (EINVAL);
 
@@ -2809,13 +3077,11 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 				return (EINVAL);
 		}
 
-		if (__builtin_add_overflow(destination_bytes,
-			run->hwr_length, &destination_bytes) ||
+		if (__builtin_add_overflow(destination_bytes, run->hwr_length,
+			&destination_bytes) ||
 		    __builtin_add_overflow(destination_pages,
-			run->hwr_length / HIB_PAGE_SIZE,
-			&destination_pages) ||
-		    __builtin_add_overflow(cursor, run->hwr_length,
-			&cursor))
+			run->hwr_length / HIB_PAGE_SIZE, &destination_pages) ||
+		    __builtin_add_overflow(cursor, run->hwr_length, &cursor))
 			return (EOVERFLOW);
 	}
 	image_length = cursor;
@@ -2850,13 +3116,11 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 	le16enc(prefix + EHDR_OFF_E_PHNUM, phnum);
 
 	ph = prefix + EHDR_SIZE;
-	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_CB,
-	    cb_offset, HIBERNATE_CB_ENCODED_SIZE, 0,
-	    HIBERNATE_CB_ALIGNMENT);
+	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_CB, cb_offset,
+	    HIBERNATE_CB_ENCODED_SIZE, 0, HIBERNATE_CB_ALIGNMENT);
 	ph += PHDR_SIZE;
-	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_PCB,
-	    pcb_offset, HIBERNATE_PCB_ENCODED_SIZE, 0,
-	    HIBERNATE_PCB_ALIGNMENT);
+	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_PCB, pcb_offset,
+	    HIBERNATE_PCB_ENCODED_SIZE, 0, HIBERNATE_PCB_ALIGNMENT);
 	ph += PHDR_SIZE;
 	hibernate_writer_phdr_encode(ph, PT_FREEBSD_HIBERNATE_XSAVE,
 	    pcb.hp_xsave_offset, pcb.hp_xsave_length, 0,
@@ -2864,9 +3128,8 @@ hibernate_writer_plan_assemble(struct hibernate_writer_plan *plan,
 	ph += PHDR_SIZE;
 	for (i = 0; i < plan->hwp_run_count; i++) {
 		run = &plan->hwp_runs[i];
-		hibernate_writer_phdr_encode(ph, PT_LOAD,
-		    run->hwr_file_offset, run->hwr_length,
-		    run->hwr_destination, HIB_PAGE_SIZE);
+		hibernate_writer_phdr_encode(ph, PT_LOAD, run->hwr_file_offset,
+		    run->hwr_length, run->hwr_destination, HIB_PAGE_SIZE);
 		ph += PHDR_SIZE;
 	}
 
@@ -2906,8 +3169,7 @@ int
 hibernate_writer_plan_interval_next(struct hibernate_writer_plan *plan,
     struct hibernate_image_interval *interval)
 {
-	if (plan == NULL || interval == NULL ||
-	    plan->hwp_prefix_length == 0 ||
+	if (plan == NULL || interval == NULL || plan->hwp_prefix_length == 0 ||
 	    plan->hwp_iterator.hii_image != &plan->hwp_image)
 		return (EINVAL);
 	return (hibernate_image_interval_next(&plan->hwp_iterator, interval));
@@ -2958,8 +3220,8 @@ hibernate_writer_plan_stream(struct hibernate_writer_plan *plan,
 
 		/*
 		 * interval_next() advances before the logical callback runs.
-		 * Snapshot the complete iterator and CRC so a failed logical write
-		 * remains retryable from the last completed boundary.
+		 * Snapshot the complete iterator and CRC so a failed logical
+		 * write remains retryable from the last completed boundary.
 		 */
 		checkpoint = plan->hwp_iterator;
 		checkpoint_crc = crc;
@@ -3905,6 +4167,74 @@ hibernate_safe_pages_alloc(struct hibernate_attempt *ha)
 	return (0);
 }
 
+/*
+ * hibernate_staging_source_pages: K-10 narrow, read-only accessor (issue
+ * #12, Design 036 S5.3/S5.4).  struct hibernate_staging stays file-private
+ * to this file; this is the sole cross-translation-unit read of its
+ * K-8-built shape, for hibernate_machdep_prepare() (sys/amd64/amd64/
+ * hibernate_machdep.c).  Performs no allocation and no state change.
+ *
+ * The source-PA vector written by hibernate_safe_pages_alloc() (step 9)
+ * occupies the first hs_vector_pages pages of hs_aux, holding exactly P
+ * (ha->ha_image.hi_destination_pages) checked 64-bit source physical
+ * addresses, one per destination page in destination order.  A single
+ * arena-header PA field (hah_source_vector_pa) can represent this vector
+ * only if those hs_vector_pages pages are physically contiguous; this
+ * function verifies that contiguity and refuses (EINVAL) otherwise, rather
+ * than guessing a scatter-list representation this issue does not define.
+ *
+ * On success (0): *vector_pa is the physical address of the first vector
+ * page; *vector_va is a kernel VA (direct-map) at which the complete
+ * P-entry vm_paddr_t array can be read sequentially (vector_va[0..P-1]);
+ * *vector_pages is the page count of that vector storage (hs_vector_pages);
+ * *xsave_pa is the physical address of the single already-staged XSAVE
+ * page immediately following the vector storage
+ * (hs_aux.hp_pa[hs_vector_pages]).
+ *
+ * Returns EINVAL if ha is NULL, any out pointer is NULL, ha->ha_staging is
+ * NULL (ALLOCATE not yet complete), the staged XSAVE page count is not
+ * exactly 1 (K-8 refuses E2BIG otherwise, so this should not occur), or
+ * the vector's pages are not physically contiguous.
+ */
+int
+hibernate_staging_source_pages(struct hibernate_attempt *ha,
+    vm_paddr_t *vector_pa, const vm_paddr_t **vector_va, size_t *vector_pages,
+    vm_paddr_t *xsave_pa)
+{
+	struct hibernate_staging *st;
+	vm_paddr_t expect;
+	void *va;
+	u_long i, v;
+
+	if (ha == NULL || vector_pa == NULL || vector_va == NULL ||
+	    vector_pages == NULL || xsave_pa == NULL)
+		return (EINVAL);
+	st = ha->ha_staging;
+	if (st == NULL || st->hs_aux.hp_pa == NULL)
+		return (EINVAL);
+	if (st->hs_xsave_pages != 1)
+		return (EINVAL);
+	v = st->hs_vector_pages;
+	if (v == 0 || v + st->hs_xsave_pages > st->hs_aux.hp_count)
+		return (EINVAL);
+
+	expect = st->hs_aux.hp_pa[0];
+	for (i = 0; i < v; i++) {
+		if (st->hs_aux.hp_pa[i] != expect)
+			return (EINVAL);
+		expect += (vm_paddr_t)HIB_PAGE_SIZE;
+	}
+
+	va = hib_pages_map(st->hs_aux.hp_pa[0]);
+	if (va == NULL)
+		return (EINVAL);
+	*vector_pa = st->hs_aux.hp_pa[0];
+	*vector_va = (const vm_paddr_t *)va;
+	*vector_pages = (size_t)v;
+	*xsave_pa = st->hs_aux.hp_pa[v];
+	return (0);
+}
+
 #ifdef _HIBERNATE_USERLAND_BUILD
 /*
  * TEST-ONLY K-8 coverage-refusal seam.  NULL means "use the real
@@ -4045,7 +4375,8 @@ hibernate_image_walk(struct hibernate_attempt *ha, bool do_read,
 		}
 
 		if (end <= img->hi_payload_start) {
-			/* Metadata: STORED or ZERO_GAP bytes from ha_meta_buf.
+			/*
+			 * Metadata: STORED or ZERO_GAP bytes from ha_meta_buf.
 			 */
 			hib_crc_feed(&crc, cursor,
 			    (const uint8_t *)ha->ha_meta_buf + cursor,
@@ -4053,7 +4384,8 @@ hibernate_image_walk(struct hibernate_attempt *ha, bool do_read,
 			    img->hi_crc_zero_length);
 		} else if (iv.hii_class == HIIC_STORED &&
 		    iv.hii_offset == img->hi_xsave_offset) {
-			/* The sole XSAVE object -> the single aux XSAVE page.
+			/*
+			 * Route the sole XSAVE object to its auxiliary page.
 			 */
 			void *xva;
 
@@ -4287,8 +4619,7 @@ hibernate_coordinator_provider_release(struct hibernate_attempt *ha)
  * in the userland build so the host test can drive and observe cleanup.
  */
 int (*hibernate_test_probe_fn)(struct hibernate_attempt *) = NULL;
-void (*hibernate_test_provider_release_fn)(
-    struct hibernate_attempt *) = NULL;
+void (*hibernate_test_provider_release_fn)(struct hibernate_attempt *) = NULL;
 
 static int
 hibernate_coordinator_probe(struct hibernate_attempt *ha)
@@ -4397,8 +4728,9 @@ hibernate_attempt_cleanup_marker(struct hibernate_attempt *ha)
 	if (error == 0)
 		ha->ha_marker_owned = HM_OWNED_NONE;
 #ifdef _KERNEL
-	else
+	else {
 		printf("hibernate: marker cleanup failed: %d\n", error);
+	}
 #endif
 }
 
@@ -4455,8 +4787,7 @@ hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 	/* Step 3: roll back the selected owner unconditionally. */
 	outcome = HIBERNATE_OWNER_ROLLBACK_UNKNOWN;
 	error = hibernate_selected_owner_rollback(ha, &outcome);
-	if (error != 0 ||
-	    outcome != HIBERNATE_OWNER_ROLLBACK_VERIFIED)
+	if (error != 0 || outcome != HIBERNATE_OWNER_ROLLBACK_VERIFIED)
 		hibernate_cleanup_terminal("owner rollback");
 
 	/* Step 4: roll back the coordinator while admission remains closed. */
@@ -4487,13 +4818,11 @@ hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 		hibernate_safe_pages_free(ha);
 	if (ha->ha_has_metadata)
 		hibernate_metadata_free(ha);
-	if (ha->ha_has_provider || ha->ha_has_extent ||
-	    ha->ha_has_root_hold)
+	if (ha->ha_has_provider || ha->ha_has_extent || ha->ha_has_root_hold)
 		hibernate_coordinator_provider_release(ha);
 
 	/* Step 8: reopening and verification are the final action. */
-	if (ha->ha_has_admission_closed &&
-	    hibernate_admission_reopen(ha) != 0)
+	if (ha->ha_has_admission_closed && hibernate_admission_reopen(ha) != 0)
 		hibernate_cleanup_terminal("admission reopen");
 }
 
@@ -4573,6 +4902,9 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	 */
 	stage = HIB_RESUME_MD_PREPARE;
 	hibernate_resume_stage_record(stage);
+	error = hibernate_machdep_prepare(ha);
+	if (error != 0)
+		goto cleanup;
 
 	consuming_marker = ha->ha_marker_result.marker;
 	consuming_marker.hm_state = HIBERNATE_MARKER_STATE_CONSUMING;
@@ -4605,8 +4937,9 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	target = empty_set;
 #endif
 	error = hibernate_stop_cpus(target, &ha->ha_acknowledged_cpus);
-	if (error == 0 && __builtin_memcmp(&ha->ha_acknowledged_cpus,
-	    &empty_set, sizeof(empty_set)) != 0)
+	if (error == 0 &&
+	    __builtin_memcmp(&ha->ha_acknowledged_cpus, &empty_set,
+		sizeof(empty_set)) != 0)
 		ha->ha_has_stopped_cpus = true;
 	if (error != 0)
 		goto cleanup;
@@ -4630,7 +4963,7 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	hibernate_resume_stage_record(stage);
 	stage = HIB_RESUME_ENTER_SAVED;
 	hibernate_resume_stage_record(stage);
-	return (0);
+	hibernate_machdep_enter();
 
 classify_non_pending:
 	switch (ha->ha_marker_result.class) {
@@ -4710,16 +5043,15 @@ hibernate_test_amd64_cpu_validate_default(const struct hibernate_pcb *pcb,
 	return (0);
 }
 
-int (*hibernate_test_amd64_cpu_validate)(
-    const struct hibernate_pcb *, bool *, bool *) =
-    hibernate_test_amd64_cpu_validate_default;
+int (*hibernate_test_amd64_cpu_validate)(const struct hibernate_pcb *, bool *,
+    bool *) = hibernate_test_amd64_cpu_validate_default;
 
 static int
-hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb,
-    bool *refuse_la57, bool *refuse_mtrr)
+hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb, bool *refuse_la57,
+    bool *refuse_mtrr)
 {
-	return (hibernate_test_amd64_cpu_validate(pcb, refuse_la57,
-	    refuse_mtrr));
+	return (
+	    hibernate_test_amd64_cpu_validate(pcb, refuse_la57, refuse_mtrr));
 }
 #endif
 
@@ -4759,8 +5091,8 @@ hibernate_image_validate(struct hibernate_attempt *ha)
 	    ha->ha_dst_count == 0)
 		return (EINVAL);
 	arena_start = ha->ha_arena_start;
-	if (__builtin_add_overflow((uint64_t)arena_start,
-	    ha->ha_arena_size, &end))
+	if (__builtin_add_overflow((uint64_t)arena_start, ha->ha_arena_size,
+		&end))
 		return (EOVERFLOW);
 	arena_end = end;
 	count = ha->ha_dst_count;
@@ -4769,8 +5101,7 @@ hibernate_image_validate(struct hibernate_attempt *ha)
 		end = ha->ha_dst_intervals[i * 2 + 1];
 		if (end <= start)
 			return (EINVAL);
-		if (i > 0 &&
-		    start <= ha->ha_dst_intervals[(i - 1) * 2 + 1])
+		if (i > 0 && start <= ha->ha_dst_intervals[(i - 1) * 2 + 1])
 			return (EINVAL);
 		if (start < arena_end && end > arena_start)
 			return (EINVAL);
@@ -5070,8 +5401,7 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 		/* Closed type set. */
 		if (p_type != PT_FREEBSD_HIBERNATE_CB &&
 		    p_type != PT_FREEBSD_HIBERNATE_PCB &&
-		    p_type != PT_FREEBSD_HIBERNATE_XSAVE &&
-		    p_type != PT_LOAD)
+		    p_type != PT_FREEBSD_HIBERNATE_XSAVE && p_type != PT_LOAD)
 			return (EINVAL);
 
 		/* Strictly increasing image-relative file offsets. */
@@ -5081,8 +5411,8 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 		/* Checked segment end; metadata must fit within the prefix. */
 		if (__builtin_add_overflow(p_offset, p_filesz, &seg_end))
 			return (EOVERFLOW);
-		if (p_type != PT_LOAD &&
-		    p_type != PT_FREEBSD_HIBERNATE_XSAVE && seg_end > len)
+		if (p_type != PT_LOAD && p_type != PT_FREEBSD_HIBERNATE_XSAVE &&
+		    seg_end > len)
 			return (EINVAL);
 
 		if (p_type == PT_FREEBSD_HIBERNATE_CB) {
@@ -5154,7 +5484,8 @@ hibernate_image_decode(const void *buf, size_t len, struct hibernate_image *out)
 	}
 
 	/* Require exactly one CB, one PCB, and at least one PT_LOAD. */
-	if (cb_count != 1 || pcb_count != 1 || xsave_count != 1 || load_count < 1)
+	if (cb_count != 1 || pcb_count != 1 || xsave_count != 1 ||
+	    load_count < 1)
 		return (EINVAL);
 
 	/*

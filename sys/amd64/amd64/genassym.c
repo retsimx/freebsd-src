@@ -165,6 +165,39 @@ ASSYM(HPCB_CR4, offsetof(struct hibernate_save_pcb, cr4));
 ASSYM(HPCB_RSP, offsetof(struct hibernate_save_pcb, rsp));
 ASSYM(HPCB_RIP, offsetof(struct hibernate_save_pcb, rip));
 ASSYM(HPCB_R12, offsetof(struct hibernate_save_pcb, r12));
+ASSYM(HAH_PRIVATE_CR3_PA,
+    offsetof(struct hibernate_arena_header, hah_private_cr3_pa));
+ASSYM(HAH_SAVED_CR3_PA,
+    offsetof(struct hibernate_arena_header, hah_saved_cr3_pa));
+ASSYM(HAH_TRAMPOLINE_SAVED_VA,
+    offsetof(struct hibernate_arena_header, hah_trampoline_saved_va));
+ASSYM(HAH_ARENA_STACK_PA,
+    offsetof(struct hibernate_arena_header, hah_arena_stack_pa));
+ASSYM(HAH_ARENA_STACK_SIZE,
+    offsetof(struct hibernate_arena_header, hah_arena_stack_size));
+ASSYM(HAH_SOURCE_VECTOR_PA,
+    offsetof(struct hibernate_arena_header, hah_source_vector_pa));
+ASSYM(HAH_DESTINATION_PAGE_COUNT,
+    offsetof(struct hibernate_arena_header, hah_destination_page_count));
+ASSYM(HAH_ITERATOR_PA,
+    offsetof(struct hibernate_arena_header, hah_iterator_pa));
+ASSYM(HAH_HANDOFF_RECORD_PA,
+    offsetof(struct hibernate_arena_header, hah_handoff_record_pa));
+ASSYM(HAH_SAVED_HANDOFF_VA,
+    offsetof(struct hibernate_arena_header, hah_saved_handoff_va));
+ASSYM(HAH_SAVED_PCB_VA,
+    offsetof(struct hibernate_arena_header, hah_saved_pcb_va));
+ASSYM(HAH_RESTORE_KERNEL_VA,
+    offsetof(struct hibernate_arena_header, hah_restore_kernel_va));
+ASSYM(HAH_SAVED_CR0, offsetof(struct hibernate_arena_header, hah_saved_cr0));
+ASSYM(HAH_SAVED_CR4, offsetof(struct hibernate_arena_header, hah_saved_cr4));
+ASSYM(HAH_SAVED_EFER, offsetof(struct hibernate_arena_header, hah_saved_efer));
+ASSYM(HAH_SAVED_PAT, offsetof(struct hibernate_arena_header, hah_saved_pat));
+ASSYM(HAH_SAVED_XCR0, offsetof(struct hibernate_arena_header, hah_saved_xcr0));
+ASSYM(HAH_GDTR, offsetof(struct hibernate_arena_header, hah_gdtr));
+ASSYM(HAH_IDTR, offsetof(struct hibernate_arena_header, hah_idtr));
+ASSYM(HAH_HANDOFF_LENGTH,
+    offsetof(struct hibernate_arena_header, hah_handoff_length));
 ASSYM(EJUSTRETURN, EJUSTRETURN);
 
 ASSYM(TSS_RSP0, offsetof(struct amd64tss, tss_rsp0));
