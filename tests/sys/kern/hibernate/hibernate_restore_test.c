@@ -1992,7 +1992,7 @@ ATF_TC_BODY(coordinator_payload_and_verify_failure_cleanup_once, tc)
 	    hibernate_resume_stage_log[hibernate_resume_stage_log_length - 1]);
 	ATF_CHECK(!ff.rf.ha.ha_has_safe_pages);
 	ATF_CHECK(!ff.rf.ha.ha_has_metadata);
-	ATF_CHECK(g_pg.release_calls >= 1);
+	ATF_CHECK_EQ(2, g_pg.release_calls);
 
 	full_chain_fixture_fini();
 
@@ -2011,6 +2011,7 @@ ATF_TC_BODY(coordinator_payload_and_verify_failure_cleanup_once, tc)
 	    hibernate_resume_stage_log[hibernate_resume_stage_log_length - 1]);
 	ATF_CHECK(!ff.rf.ha.ha_has_safe_pages);
 	ATF_CHECK(!ff.rf.ha.ha_has_metadata);
+	ATF_CHECK_EQ(2, g_pg.release_calls);
 
 	full_chain_fixture_fini();
 }

@@ -672,6 +672,37 @@ ATF_TC_BODY(shortage_reserve_count_zero_eligible, tc)
 }
 
 /*
+ * shortage_reserve_count_p_minus_one: a request for P pages with exactly
+ * P - 1 eligible pages must roll back every partial acquisition.
+ */
+ATF_TC_WITHOUT_HEAD(shortage_reserve_count_p_minus_one);
+ATF_TC_BODY(shortage_reserve_count_p_minus_one, tc)
+{
+	struct fx_res res;
+	int before[FX_MAX_PAGES], after[FX_MAX_PAGES];
+	int nb, na, i;
+
+	fx_reset();
+	for (i = 0; i < 3; i++)
+		fx_alloc_page(i, FX_PA_BASE + i * FX_PAGE_SIZE,
+		    0, 0, 0, true);
+
+	nb = fx_collect_free_set(before, FX_MAX_PAGES);
+	fx_sort(before, nb);
+
+	memset(&res, 0, sizeof(res));
+	res.capacity = FX_RES_MAX;
+
+	ATF_CHECK_EQ(ENOMEM, fx_reserve_count(&res, 4));
+	ATF_CHECK_EQ(0, res.count);
+
+	na = fx_collect_free_set(after, FX_MAX_PAGES);
+	ATF_CHECK_EQ(nb, na);
+	fx_sort(after, na);
+	ATF_CHECK(memcmp(before, after, nb * sizeof(int)) == 0);
+}
+
+/*
  * exact_count_reserve_count: reserve_count(want=P) against exactly P
  * eligible pages succeeds with count==P (design 035 SS6.3 "Exactly P").
  */
@@ -842,6 +873,7 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, shortage_reserve);
 	ATF_TP_ADD_TC(tp, fault_after_nth_append);
 	ATF_TP_ADD_TC(tp, shortage_reserve_count_zero_eligible);
+	ATF_TP_ADD_TC(tp, shortage_reserve_count_p_minus_one);
 	ATF_TP_ADD_TC(tp, exact_count_reserve_count);
 	ATF_TP_ADD_TC(tp, multi_domain_ascending_order);
 	ATF_TP_ADD_TC(tp, reserve_count_destination_run_precedes_eligible);
