@@ -143,6 +143,8 @@ const char *		xpt_action_name(uint32_t action);
 void			xpt_pollwait(union ccb *start_ccb, uint32_t timeout);
 uint32_t		xpt_poll_setup(union ccb *start_ccb);
 void			xpt_sim_poll(struct cam_sim *sim);
+u_int			xpt_simq_frozen_count(struct cam_sim *sim);
+bool			xpt_done_queues_idle(void);
 
 /*
  * Perform a path inquiry. bzero may be redundant for allocated CCBs, but for

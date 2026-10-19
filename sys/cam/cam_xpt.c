@@ -4418,6 +4418,19 @@ xpt_freeze_simq(struct cam_sim *sim, u_int count)
 	return (freeze);
 }
 
+u_int
+xpt_simq_frozen_count(struct cam_sim *sim)
+{
+	struct cam_devq *devq;
+	u_int count;
+
+	devq = sim->devq;
+	mtx_lock(&devq->send_mtx);
+	count = devq->send_queue.qfrozen_cnt;
+	mtx_unlock(&devq->send_mtx);
+	return (count);
+}
+
 static void
 xpt_release_devq_timeout(void *arg)
 {
@@ -5482,6 +5495,23 @@ xpt_done_td(void *arg)
 
 		mtx_lock(&queue->cam_doneq_mtx);
 	}
+}
+
+bool
+xpt_done_queues_idle(void)
+{
+	bool idle;
+	u_int i;
+
+	for (i = 0; i < cam_num_doneqs; i++)
+		mtx_lock(&cam_doneqs[i].cam_doneq_mtx);
+	idle = true;
+	for (i = 0; i < cam_num_doneqs; i++)
+		idle &= STAILQ_EMPTY(&cam_doneqs[i].cam_doneq) &&
+		    cam_doneqs[i].cam_doneq_sleep != 0;
+	for (i = cam_num_doneqs; i > 0; i--)
+		mtx_unlock(&cam_doneqs[i - 1].cam_doneq_mtx);
+	return (idle);
 }
 
 static void
