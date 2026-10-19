@@ -23,8 +23,8 @@ ATF_TC_BODY(required_golden, tc)
 	ATF_CHECK_EQ(UINT64_C(1024), sizing.has_aux_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(32768), sizing.has_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(28665), sizing.has_alignment_allowance);
-	ATF_CHECK_EQ(UINT64_C(319737), sizing.has_raw_required);
-	ATF_CHECK_EQ(UINT64_C(323584), sizing.has_required);
+	ATF_CHECK_EQ(UINT64_C(327929), sizing.has_raw_required);
+	ATF_CHECK_EQ(UINT64_C(331776), sizing.has_required);
 	ATF_CHECK_EQ(1, HCB_VERSION);
 	ATF_CHECK_EQ(0x040, HIBERNATE_CB_OFF_ARENA_START);
 	ATF_CHECK_EQ(0x048, HIBERNATE_CB_OFF_ARENA_SIZE);
@@ -89,8 +89,8 @@ ATF_TC_BODY(selection_highest, tc)
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(intervals, nitems(intervals),
 		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
-	ATF_CHECK_EQ(UINT64_C(323584), size);
-	ATF_CHECK_EQ(UINT64_C(0x9b1000), pa);
+	ATF_CHECK_EQ(UINT64_C(331776), size);
+	ATF_CHECK_EQ(UINT64_C(0x9af000), pa);
 	ATF_CHECK_EQ(ENOMEM,
 	    hibernate_arena_select(intervals, nitems(intervals),
 		UINT64_C(319488), &pa, &size));
@@ -278,7 +278,7 @@ ATF_TC_BODY(live_range_matrix, tc)
 ATF_TC_WITHOUT_HEAD(selection_boundaries);
 ATF_TC_BODY(selection_boundaries, tc)
 {
-	const uint64_t required = UINT64_C(323584);
+	const uint64_t required = UINT64_C(331776);
 	struct hibernate_arena_interval interval;
 	vm_paddr_t pa;
 	vm_size_t size;
