@@ -90,6 +90,10 @@ struct hibernate_arena_header {
 	uint8_t hah_reserved_0f0[16];
 } __aligned(64);
 
+/*
+ * This record is a packed wire image copied verbatim by the assembly terminal
+ * step, so its layout must match the packed wire format byte for byte.
+ */
 struct hibernate_handoff_record {
 	uint64_t hhr_magic;
 	uint32_t hhr_version;
@@ -105,7 +109,7 @@ struct hibernate_handoff_record {
 	uint8_t hhr_completion_provider_acquired;
 	uint8_t hhr_completion_consumer_attached;
 	uint8_t hhr_reserved[6];
-};
+} __packed;
 
 extern struct hibernate_handoff_record hibernate_saved_handoff;
 
@@ -232,6 +236,9 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_HANDOFF_MAGIC UINT64_C(0x484f444e4148424e)
 #define HIBERNATE_HANDOFF_VERSION 1
 #define HIBERNATE_HANDOFF_ENCODED_SIZE (SPECNAMELEN + 65)
+_Static_assert(sizeof(struct hibernate_handoff_record) ==
+	HIBERNATE_HANDOFF_ENCODED_SIZE,
+    "struct hibernate_handoff_record must match the packed handoff wire size");
 
 #define HIBERNATE_ARENA_PRIVATE_PT_PAGES                                 \
 	(HIBERNATE_ARENA_PT_PML4_PAGES + HIBERNATE_ARENA_PT_PDPT_PAGES + \
