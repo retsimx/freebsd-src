@@ -14,9 +14,12 @@
 #include <sys/hibernate.h>
 
 #include <atf-c.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #define	RESUME_MEDIA_SIZE	(HIBERNATE_METADATA_SIZE + DEV_BSIZE)
 #define	RESUME_MAX_EVENTS	16
@@ -51,6 +54,7 @@ struct resume_fixture {
 };
 
 static struct resume_fixture *active_fixture;
+static int cleanup_failure;
 
 static void
 record_event(struct resume_mock *mock, char event)
@@ -201,7 +205,7 @@ quiesce_rollback(struct hibernate_attempt *ha)
 
 	active_fixture->mock.quiesce_rollbacks++;
 	(void)ha;
-	return (0);
+	return (cleanup_failure == 3 ? EIO : 0);
 }
 
 static int
@@ -210,18 +214,20 @@ restart_cpus(cpuset_t acknowledged)
 
 	active_fixture->mock.restarts++;
 	(void)acknowledged;
-	return (0);
+	return (cleanup_failure == 4 ? EIO : 0);
 }
 
 static int
 owner_rollback(struct hibernate_attempt *ha,
-    enum hibernate_owner_rollback_outcome *outcome)
+    struct hibernate_owner_rollback_proof *proof)
 {
 
 	active_fixture->mock.owner_rollbacks++;
 	(void)ha;
-	*outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
-	return (0);
+	hibernate_test_proof_fill(proof, 0, 0, 0xf);
+	if (cleanup_failure == 2)
+		hibernate_test_proof_fill(proof, 1, 0, 0xf);
+	return (cleanup_failure == 1 ? EIO : 0);
 }
 
 static int
@@ -443,6 +449,47 @@ ATF_TC_BODY(temporary_stubs, tc)
 }
 
 static void
+check_cleanup_terminal(int failure)
+{
+	struct resume_fixture f;
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	ATF_REQUIRE(pid >= 0);
+	if (pid == 0) {
+		fixture_init(&f);
+		install_cleanup_seams();
+		cleanup_failure = failure;
+		if (failure == 3)
+			f.ha.ha_has_quiesce = true;
+		if (failure == 4)
+			f.ha.ha_has_stopped_cpus = true;
+		hibernate_attempt_cleanup(&f.ha);
+		_exit(0);
+	}
+	ATF_REQUIRE_EQ(pid, waitpid(pid, &status, 0));
+	ATF_CHECK(WIFSIGNALED(status));
+	ATF_CHECK_EQ(SIGILL, WTERMSIG(status));
+}
+
+ATF_TC_WITHOUT_HEAD(cleanup_terminal_failures);
+ATF_TC_BODY(cleanup_terminal_failures, tc)
+{
+
+	/*
+	 * Each failure runs in a child because the production userland
+	 * terminal policy is deliberately __builtin_trap().
+	 */
+	check_cleanup_terminal(1);	/* Owner rollback returned nonzero. */
+	check_cleanup_terminal(2);	/* Owner proof reported UNSAFE. */
+	check_cleanup_terminal(3);	/* Coordinator rollback failed. */
+	check_cleanup_terminal(4);	/* Acknowledged-CPU restart failed. */
+	cleanup_failure = 0;
+	reset_seams();
+}
+
+static void
 validation_fixture(struct hibernate_attempt *ha, vm_paddr_t *intervals)
 {
 
@@ -501,6 +548,7 @@ ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, coordinator_order_and_marker_ownership);
 	ATF_TP_ADD_TC(tp, cleanup_idempotence);
+	ATF_TP_ADD_TC(tp, cleanup_terminal_failures);
 	ATF_TP_ADD_TC(tp, temporary_stubs);
 	ATF_TP_ADD_TC(tp, image_validation);
 	return (atf_no_error());

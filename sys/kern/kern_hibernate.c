@@ -69,6 +69,39 @@
 #include <cam/cam_xpt.h>
 #include <cam/cam_xpt_sim.h>
 #include <cam/cam_queue.h>
+#include <cam/cam_periph.h>
+
+#include <sys/bus.h>
+#include <sys/rman.h>
+#include <sys/mutex.h>
+#include <sys/callout.h>
+#include <sys/queue.h>
+#include <sys/time.h>
+#include <sys/errno.h>
+#include <machine/bus.h>
+#include <machine/resource.h>
+#include <dev/ahci/ahci.h>
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+#include <geom/geom_disk.h>
+
+struct hibernate_k12_cpu_record {
+	cpuset_t target, acknowledged, restarted, missing;
+};
+static struct hibernate_k12_cpu_record hibernate_k12_cpus;
+/* The coordinator serialises resume; these proofs belong to one attempt. */
+static struct hibernate_attempt *hibernate_k12_attempt;
+static struct {
+	struct ahci_channel *ch;
+	struct ahci_hibernate_owner_snapshot before;
+	uint32_t completed_stage_bits;
+	sbintime_t drain_deadline;
+	bool rollback_valid;
+	bool admission_still_closed;
+	bool dma_idle;
+	bool deferred_work_idle;
+	bool interrupt_state_matches;
+} hibernate_k12_owner;
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -1147,6 +1180,117 @@ hibernate_dst_page_agrees(const struct hibernate_attempt *ha,
 	return (expected_dst == predicate_dst);
 }
 
+/*
+ * hibernate_capacity_check: sequential checked subtraction capacity test.
+ *
+ * Inputs (all in pages):
+ *   b->physmem_pages                  Total physical pages.
+ *   b->arena_pages                    Transition-arena pages (disjoint).
+ *   b->destination_union_pages        Union of all PT_LOAD destination pages.
+ *   b->restore_kernel_footprint_budget Conservative restore footprint.
+ *
+ * Outputs (filled only on success):
+ *   r->eligible_source_pages   Residual after arena + dst + footprint.
+ *   r->required_source_pages   destination_union_pages (one copy needed).
+ *   r->shortfall_pages         max(required - eligible, 0).
+ *
+ * Return codes:
+ *   0         Sufficient (eligible >= required), including equality.
+ *   EINVAL    Null pointer, zero required cardinality, or impossible sizes.
+ *   EOVERFLOW Checked arithmetic failure.
+ *   ENOMEM    Valid cardinalities but insufficient eligible sources.
+ */
+int
+hibernate_capacity_check(const struct hibernate_capacity_budget *b,
+    struct hibernate_capacity_result *r)
+{
+	uint64_t eligible;
+
+	/*
+	 * Zero the result struct unconditionally so no failing return
+	 * leaks partial output.
+	 */
+	if (r != NULL)
+		memset(r, 0, sizeof(*r));
+
+	if (b == NULL || r == NULL)
+		return (EINVAL);
+
+	/* Required cardinalities must be non-zero. */
+	if (b->physmem_pages == 0 || b->destination_union_pages == 0)
+		return (EINVAL);
+
+	/*
+	 * Each individual set size must not exceed physmem; if any single
+	 * deduction already exceeds physmem the sets cannot be pairwise
+	 * disjoint.
+	 */
+	if (b->arena_pages > b->physmem_pages ||
+	    b->destination_union_pages > b->physmem_pages)
+		return (EINVAL);
+
+	/*
+	 * The restore footprint is a valid capacity requirement, not a PFN set
+	 * whose standalone size must fit physmem for the input to be
+	 * meaningful. A representable configured footprint larger than
+	 * available physical memory is therefore an ordinary capacity shortage.
+	 * Populate the result consistently and return ENOMEM rather than
+	 * classifying it as EINVAL.
+	 */
+	if (b->restore_kernel_footprint_budget > b->physmem_pages) {
+		r->eligible_source_pages = 0;
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages;
+		return (ENOMEM);
+	}
+
+	/*
+	 * Sequential checked subtraction.  Each step proves the deduction
+	 * does not exceed the current residual; arena overflow is EINVAL
+	 * (mathematically impossible disjoint set), destination and
+	 * footprint overflow are ENOMEM (valid shortfall).
+	 */
+	eligible = b->physmem_pages;
+
+	/* Deduct arena. */
+	if (b->arena_pages > eligible)
+		return (EINVAL);
+	eligible -= b->arena_pages;
+
+	/* Deduct destination union. */
+	if (b->destination_union_pages > eligible) {
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages - eligible;
+		return (ENOMEM);
+	}
+	eligible -= b->destination_union_pages;
+
+	/* Deduct restore-kernel footprint. */
+	if (b->restore_kernel_footprint_budget > eligible) {
+		/*
+		 * The footprint itself consumes remaining space; no sources
+		 * remain.  Eligible is now 0 after footprint deduction would
+		 * underflow, so shortfall is required - 0 = required.
+		 */
+		r->eligible_source_pages = 0;
+		r->required_source_pages = b->destination_union_pages;
+		r->shortfall_pages = b->destination_union_pages;
+		return (ENOMEM);
+	}
+	eligible -= b->restore_kernel_footprint_budget;
+
+	r->eligible_source_pages = eligible;
+	r->required_source_pages = b->destination_union_pages;
+
+	if (eligible < b->destination_union_pages) {
+		r->shortfall_pages = b->destination_union_pages - eligible;
+		return (ENOMEM);
+	}
+
+	r->shortfall_pages = 0;
+	return (0);
+}
+
 #ifndef _HIBERNATE_USERLAND_BUILD
 
 struct hibernate_provider_owner {
@@ -1483,6 +1627,23 @@ hibernate_probe(struct hibernate_attempt *ha)
 static SYSCTL_NODE(_kern, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Hibernate parameters");
 
+#if defined(_KERNEL) && defined(INVARIANTS)
+static SYSCTL_NODE(_debug, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE,
+    0, "Hibernate debugging");
+static int hibernate_k12_inject;
+SYSCTL_INT(_debug_hibernate, OID_AUTO, k12_inject, CTLFLAG_RW,
+    &hibernate_k12_inject, 0, "One-shot K-12 fault injection (1-7)");
+
+static bool
+hibernate_k12_inject_once(int value)
+{
+	if (hibernate_k12_inject != value)
+		return (false);
+	hibernate_k12_inject = 0;
+	return (true);
+}
+#endif
+
 /*
  * Configured restore-footprint floor.  Read once at boot; protected by
  * CTLFLAG_RDTUN so it cannot be changed at runtime.
@@ -1530,116 +1691,6 @@ hib_pages_roundup(uint64_t bytes, uint64_t *pages_out)
 	return (0);
 }
 
-/*
- * hibernate_capacity_check: sequential checked subtraction capacity test.
- *
- * Inputs (all in pages):
- *   b->physmem_pages                  Total physical pages.
- *   b->arena_pages                    Transition-arena pages (disjoint).
- *   b->destination_union_pages        Union of all PT_LOAD destination pages.
- *   b->restore_kernel_footprint_budget Conservative restore footprint.
- *
- * Outputs (filled only on success):
- *   r->eligible_source_pages   Residual after arena + dst + footprint.
- *   r->required_source_pages   destination_union_pages (one copy needed).
- *   r->shortfall_pages         max(required - eligible, 0).
- *
- * Return codes:
- *   0         Sufficient (eligible >= required), including equality.
- *   EINVAL    Null pointer, zero required cardinality, or impossible sizes.
- *   EOVERFLOW Checked arithmetic failure.
- *   ENOMEM    Valid cardinalities but insufficient eligible sources.
- */
-int
-hibernate_capacity_check(const struct hibernate_capacity_budget *b,
-    struct hibernate_capacity_result *r)
-{
-	uint64_t eligible;
-
-	/*
-	 * Zero the result struct unconditionally so no failing return
-	 * leaks partial output.
-	 */
-	if (r != NULL)
-		memset(r, 0, sizeof(*r));
-
-	if (b == NULL || r == NULL)
-		return (EINVAL);
-
-	/* Required cardinalities must be non-zero. */
-	if (b->physmem_pages == 0 || b->destination_union_pages == 0)
-		return (EINVAL);
-
-	/*
-	 * Each individual set size must not exceed physmem; if any single
-	 * deduction already exceeds physmem the sets cannot be pairwise
-	 * disjoint.
-	 */
-	if (b->arena_pages > b->physmem_pages ||
-	    b->destination_union_pages > b->physmem_pages)
-		return (EINVAL);
-
-	/*
-	 * The restore footprint is a valid capacity requirement, not a PFN set
-	 * whose standalone size must fit physmem for the input to be
-	 * meaningful. A representable configured footprint larger than
-	 * available physical memory is therefore an ordinary capacity shortage.
-	 * Populate the result consistently and return ENOMEM rather than
-	 * classifying it as EINVAL.
-	 */
-	if (b->restore_kernel_footprint_budget > b->physmem_pages) {
-		r->eligible_source_pages = 0;
-		r->required_source_pages = b->destination_union_pages;
-		r->shortfall_pages = b->destination_union_pages;
-		return (ENOMEM);
-	}
-
-	/*
-	 * Sequential checked subtraction.  Each step proves the deduction
-	 * does not exceed the current residual; arena overflow is EINVAL
-	 * (mathematically impossible disjoint set), destination and
-	 * footprint overflow are ENOMEM (valid shortfall).
-	 */
-	eligible = b->physmem_pages;
-
-	/* Deduct arena. */
-	if (b->arena_pages > eligible)
-		return (EINVAL);
-	eligible -= b->arena_pages;
-
-	/* Deduct destination union. */
-	if (b->destination_union_pages > eligible) {
-		r->required_source_pages = b->destination_union_pages;
-		r->shortfall_pages = b->destination_union_pages - eligible;
-		return (ENOMEM);
-	}
-	eligible -= b->destination_union_pages;
-
-	/* Deduct restore-kernel footprint. */
-	if (b->restore_kernel_footprint_budget > eligible) {
-		/*
-		 * The footprint itself consumes remaining space; no sources
-		 * remain.  Eligible is now 0 after footprint deduction would
-		 * underflow, so shortfall is required - 0 = required.
-		 */
-		r->eligible_source_pages = 0;
-		r->required_source_pages = b->destination_union_pages;
-		r->shortfall_pages = b->destination_union_pages;
-		return (ENOMEM);
-	}
-	eligible -= b->restore_kernel_footprint_budget;
-
-	r->eligible_source_pages = eligible;
-	r->required_source_pages = b->destination_union_pages;
-
-	if (eligible < b->destination_union_pages) {
-		r->shortfall_pages = b->destination_union_pages - eligible;
-		return (ENOMEM);
-	}
-
-	r->shortfall_pages = 0;
-	return (0);
-}
 
 /*
  * hibernate_page_is_destination: test whether page m's physical address
@@ -3412,8 +3463,6 @@ static volatile size_t hibernate_resume_stage_log_length;
  * coordinator-local because cleanup's public interface is fixed.  This path
  * does not change APIC TPR state.
  */
-static register_t hibernate_resume_intr_state;
-static bool hibernate_resume_intr_state_valid;
 
 static void
 hibernate_resume_stage_record(enum hibernate_resume_stage stage)
@@ -4615,11 +4664,234 @@ hibernate_image_crc32c_verify(struct hibernate_attempt *ha, uint32_t crc)
 	return (0);
 }
 
+#ifdef _KERNEL
+static bool
+hibernate_k12_pci_dispositioned(device_t dev)
+{
+	u_int bus, slot, function;
+
+	bus = pci_get_bus(dev);
+	slot = pci_get_slot(dev);
+	function = pci_get_function(dev);
+	return (bus == 0 && ((slot == 0 && function == 0) ||
+	    (slot == 0x1f && (function == 0 || function == 2 ||
+	    function == 3))));
+}
+
+static int
+hibernate_k12_pci_qualify(device_t controller)
+{
+	device_t dev, host;
+	uint32_t class;
+	uint16_t command;
+	u_int bus, slot, function;
+
+	host = pci_find_bsf(0, 0, 0);
+	if (host == NULL || pci_get_vendor(host) != 0x8086 ||
+	    pci_get_device(host) != 0x29c0)
+		return (ENOTSUP);
+	if (controller == NULL || controller != pci_find_bsf(0, 0x1f, 2) ||
+	    pci_get_vendor(controller) != 0x8086 ||
+	    pci_get_device(controller) != 0x2922)
+		return (ENOTSUP);
+	class = (pci_get_class(controller) << 16) |
+	    (pci_get_subclass(controller) << 8) |
+	    pci_get_progif(controller);
+	if (class != 0x010601)
+		return (ENOTSUP);
+
+	for (bus = 0; bus <= PCI_BUSMAX; bus++) {
+		for (slot = 0; slot <= PCI_SLOTMAX; slot++) {
+			for (function = 0; function <= PCI_FUNCMAX;
+			    function++) {
+				dev = pci_find_bsf(bus, slot, function);
+				if (dev == NULL)
+					continue;
+				command = pci_read_config(dev, PCIR_COMMAND, 2);
+				/*
+				 * Convention: all-ones means an incomplete
+				 * read.
+				 */
+				if (command == 0xffff)
+					return (ENOTSUP);
+				if ((command & PCIM_CMD_BUSMASTEREN) != 0 &&
+				    !hibernate_k12_pci_dispositioned(dev))
+					return (ENOTSUP);
+			}
+		}
+	}
+	return (0);
+}
+#endif
+
 int
 hibernate_quiesce(struct hibernate_attempt *ha)
 {
+#ifdef _KERNEL
+	struct ahci_hibernate_owner_snapshot forward;
+	struct hibernate_qstate *qs;
+	struct cam_periph *periph;
+	struct cam_sim *sim;
+	struct ahci_channel *ch;
+	struct dumperinfo *di;
+	struct disk *dp;
+	device_t controller;
+	bool admission_closed, done_idle;
+	int error;
+
+	if (ha == NULL)
+		return (EINVAL);
+	qs = &ha->ha_q;
+	if (ha->ha_dumper == NULL || qs->qs_stages != 0)
+		return (ha->ha_dumper == NULL ? ENXIO : EINVAL);
+
+	hibernate_k12_attempt = ha;
+	memset(&hibernate_k12_cpus, 0, sizeof(hibernate_k12_cpus));
+	memset(&hibernate_k12_owner, 0, sizeof(hibernate_k12_owner));
+	di = ha->ha_dumper;
+	if (di->priv == NULL || !di->provider_valid ||
+	    di->provider_media_size == 0 || di->dumper == NULL)
+		return (ENXIO);
+	dp = di->priv;
+	if (di->dumper != dp->d_dump || dp->d_drv1 == NULL)
+		return (ENXIO);
+	/*
+	 * The provider may be a GPT partition.  The resolved backing disk,
+	 * rather than the provider spelling, is the measured dedicated ada0.
+	 * K-4's held provider identity supplies the no-sharing ownership proof.
+	 */
+	if (strcmp(dp->d_name, "ada") != 0 || dp->d_unit != 0 ||
+	    !ha->ha_has_provider)
+		return (ENOTSUP);
+	periph = dp->d_drv1;
+	sim = periph->sim;
+	if (sim == NULL || !cam_sim_pollable(sim))
+		return (ENXIO);
+	if (strcmp(cam_sim_name(sim), "ahcich") != 0)
+		return (ENOTSUP);
+	if (xpt_path_target_id(periph->path) != 0 ||
+	    xpt_path_lun_id(periph->path) != 0 ||
+	    cam_sim_bus(sim) != 0 || cam_sim_unit(sim) != 0)
+		return (ENOTSUP);
+
+	ch = cam_sim_softc(sim);
+	if (ch == NULL || ch->unit != 0 ||
+	    ch->vendorid != 0x8086 || ch->deviceid != 0x2922)
+		return (ENOTSUP);
+	controller = device_get_parent(ch->dev);
+	error = hibernate_k12_pci_qualify(controller);
+	if (error != 0)
+		return (error);
+
+	mtx_lock(&ch->mtx);
+	if (!ahci_ch_hibernate_quiescent_locked(ch))
+		error = EBUSY;
+	else
+		error = 0;
+	mtx_unlock(&ch->mtx);
+	if (error != 0) {
+		printf("hibernate: k12: periph fail %d\n", error);
+		return (error);
+	}
+	error = cam_periph_acquire(periph);
+	if (error != 0) {
+		printf("hibernate: k12: periph fail %d\n", ENXIO);
+		return (ENXIO);
+	}
+	qs->qs_periph = periph;
+	qs->qs_stages |= HIBERNATE_QS_PERIPH;
+	ha->ha_cam_sim = sim;
+	ha->ha_has_quiesce = true;
+	printf("hibernate: k12: periph ok\n");
+
+	sched_pin();
+	qs->qs_cpu = PCPU_GET(cpuid);
+	qs->qs_rflags = read_rflags();
+	qs->qs_bsp_valid = true;
+	qs->qs_stages |= HIBERNATE_QS_BSP;
+	printf("hibernate: k12: bsp ok\n");
+
+	qs->qs_simq_pre = xpt_simq_frozen_count(sim);
+	xpt_freeze_simq(sim, 1);
+	ha->ha_has_admission_closed = true;
+	qs->qs_stages |= HIBERNATE_QS_ADMISSION;
+	printf("hibernate: k12: admission ok\n");
+
+	qs->qs_deadline = sbinuptime() + HIBERNATE_Q_DRAIN_SBT;
+	admission_closed = xpt_simq_frozen_count(sim) ==
+	    qs->qs_simq_pre + 1;
+	done_idle = xpt_done_queues_idle();
+	mtx_lock(&ch->mtx);
+	ahci_ch_hibernate_snapshot_locked(ch, NULL, admission_closed,
+	    done_idle, &hibernate_k12_owner.before);
+	error = ahci_ch_hibernate_arm_locked(ch, qs->qs_deadline);
+	mtx_unlock(&ch->mtx);
+	if (error != 0) {
+		printf("hibernate: k12: armed fail %d\n", error);
+		return (error);
+	}
+	hibernate_k12_owner.ch = ch;
+	hibernate_k12_owner.drain_deadline = qs->qs_deadline;
+	qs->qs_stages |= HIBERNATE_QS_ARMED;
+	printf("hibernate: k12: armed ok\n");
+
+#ifdef INVARIANTS
+	if (hibernate_k12_inject_once(1))
+		error = EIO;
+	else
+#endif
+	{
+		bus_topo_lock();
+		error = DEVICE_SUSPEND(root_bus);
+		bus_topo_unlock();
+	}
+	if (error != 0) {
+		qs->qs_root_failed = true;
+		printf("hibernate: k12: root-susp fail %d\n", error);
+		return (error);
+	}
+	qs->qs_stages |= HIBERNATE_QS_ROOT_SUSP;
+	printf("hibernate: k12: root-susp ok\n");
+
+	admission_closed = ha->ha_has_admission_closed &&
+	    xpt_simq_frozen_count(sim) == qs->qs_simq_pre + 1;
+	done_idle = xpt_done_queues_idle();
+	mtx_lock(&ch->mtx);
+	ahci_ch_hibernate_snapshot_locked(ch, NULL, admission_closed,
+	    done_idle, &forward);
+	mtx_unlock(&ch->mtx);
+	if (sbinuptime() > qs->qs_deadline
+#ifdef INVARIANTS
+	    || hibernate_k12_inject_once(2)
+#endif
+	    ) {
+		printf("hibernate: k12: proved fail %d\n", ETIMEDOUT);
+		return (ETIMEDOUT);
+	}
+	/*
+	 * Ordered proof: admission is closed; the staged image BIO is already
+	 * complete; CAM freeze/drain, engine stop, port-interrupt disable, and
+	 * deferred-work idleness are independently observed.  dma_idle means
+	 * ch->oslots == 0 && ch->rslots == 0 when before is NULL.  busdma
+	 * sync/unload is inferred from that gated zero-slot fact because
+	 * ahci_end_transaction performs sync/unload at lines 2060-2065 before
+	 * clearing oslots at lines 2119-2123.  The gate consumes every
+	 * observable fact.
+	 */
+	if (!admission_closed || !ha->ha_has_safe_pages ||
+	    !forward.dma_idle || !forward.engines_stopped ||
+	    !forward.port_interrupts_disabled ||
+	    !forward.deferred_work_idle || !done_idle) {
+		printf("hibernate: k12: proved fail %d\n", EIO);
+		return (EIO);
+	}
+	qs->qs_stages |= HIBERNATE_QS_PROVED;
+	printf("hibernate: k12: proved ok\n");
+	return (0);
+#else
 	(void)ha;
 	return (ENOTSUP);
+#endif
 }
 
 #ifdef _HIBERNATE_USERLAND_BUILD
@@ -4634,16 +4906,82 @@ hibernate_quiesce_rollback(struct hibernate_attempt *ha)
 	if (hibernate_test_quiesce_rollback_fn != NULL)
 		return (hibernate_test_quiesce_rollback_fn(ha));
 #endif
+#ifdef _KERNEL
+	struct hibernate_qstate *qs;
+
+	if (ha == NULL)
+		return (EINVAL);
+	if (hibernate_k12_attempt != ha)
+		return (EIO);
+	qs = &ha->ha_q;
+	if ((qs->qs_stages & HIBERNATE_QS_OWNER_MASK) != 0)
+		return (EIO);
+	if (!hibernate_k12_owner.rollback_valid ||
+	    !hibernate_k12_owner.admission_still_closed ||
+	    !hibernate_k12_owner.dma_idle ||
+	    !hibernate_k12_owner.deferred_work_idle ||
+	    !hibernate_k12_owner.interrupt_state_matches)
+		return (EIO);
+	/*
+	 * K12-T07 fills missing after a stop attempt.  Its zero-initialised
+	 * value is intentionally empty on rollback before STOP_CPUS.
+	 */
+	if (!CPU_EMPTY(&hibernate_k12_cpus.missing))
+		return (EIO);
+	if (qs->qs_deadline <= 0 ||
+	    qs->qs_deadline != hibernate_k12_owner.drain_deadline)
+		return (EIO);
+	if (!xpt_done_queues_idle())
+		return (EIO);
+	if (!ha->ha_has_admission_closed || ha->ha_cam_sim == NULL ||
+	    xpt_simq_frozen_count(ha->ha_cam_sim) != qs->qs_simq_pre + 1)
+		return (EIO);
+	return (0);
+#else
 	(void)ha;
 	return (ENOTSUP);
+#endif
 }
 
 int
 hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged)
 {
+#ifdef _KERNEL
+	int error;
+
+	if (acknowledged == NULL)
+		return (EINVAL);
+	CPU_ZERO(acknowledged);
+	hibernate_k12_cpus.target = target;
+	CPU_ZERO(&hibernate_k12_cpus.acknowledged);
+	CPU_ZERO(&hibernate_k12_cpus.restarted);
+	CPU_ZERO(&hibernate_k12_cpus.missing);
+	if (CPU_EMPTY(&target))
+		return (0);
+#ifdef INVARIANTS
+	if (hibernate_k12_inject_once(3)) {
+		cpuset_t dispatched;
+
+		dispatched = target;
+		CPU_CLR(CPU_FFS(&dispatched) - 1, &dispatched);
+		error = stop_cpus_deadline(dispatched, acknowledged);
+		if (error == 0)
+			error = ETIMEDOUT;
+	} else
+#endif
+		error = stop_cpus_deadline(target, acknowledged);
+	hibernate_k12_cpus.acknowledged = *acknowledged;
+	if (error != 0) {
+		hibernate_k12_cpus.missing = target;
+		CPU_ANDNOT(&hibernate_k12_cpus.missing,
+		    &hibernate_k12_cpus.missing, acknowledged);
+	}
+	return (error);
+#else
 	(void)target;
 	(void)acknowledged;
 	return (ENOTSUP);
+#endif
 }
 
 #ifdef _HIBERNATE_USERLAND_BUILD
@@ -4658,8 +4996,29 @@ hibernate_restart_cpus(cpuset_t acknowledged)
 	if (hibernate_test_restart_cpus_fn != NULL)
 		return (hibernate_test_restart_cpus_fn(acknowledged));
 #endif
+#ifdef _KERNEL
+	int error;
+
+	CPU_ZERO(&hibernate_k12_cpus.restarted);
+#ifdef INVARIANTS
+	if (hibernate_k12_inject_once(4) && !CPU_EMPTY(&acknowledged)) {
+		cpuset_t restarted;
+
+		restarted = acknowledged;
+		CPU_CLR(CPU_FFS(&restarted) - 1, &restarted);
+		error = restart_cpus_deadline(restarted);
+		if (error == 0)
+			error = ETIMEDOUT;
+	} else
+#endif
+		error = restart_cpus_deadline(acknowledged);
+	if (error == 0)
+		hibernate_k12_cpus.restarted = acknowledged;
+	return (error);
+#else
 	(void)acknowledged;
 	return (ENOTSUP);
+#endif
 }
 
 #ifdef _KERNEL
@@ -4715,6 +5074,7 @@ hibernate_safe_pages_free(struct hibernate_attempt *ha)
 
 	if (ha == NULL)
 		return;
+
 	st = ha->ha_staging;
 	if (st == NULL) {
 		ha->ha_has_safe_pages = false;
@@ -4761,8 +5121,23 @@ hibernate_metadata_free(struct hibernate_attempt *ha)
 static int
 hibernate_admission_reopen(struct hibernate_attempt *ha)
 {
+#ifdef _KERNEL
+	if (ha == NULL)
+		return (EINVAL);
+	if (!ha->ha_has_admission_closed)
+		return (0);
+	if (ha->ha_cam_sim == NULL)
+		return (EIO);
+	xpt_release_simq(ha->ha_cam_sim, TRUE);
+	if (xpt_simq_frozen_count(ha->ha_cam_sim) !=
+	    ha->ha_q.qs_simq_pre)
+		return (EIO);
 	ha->ha_has_admission_closed = false;
 	return (0);
+#else
+	ha->ha_has_admission_closed = false;
+	return (0);
+#endif
 }
 
 static void
@@ -4800,55 +5175,219 @@ hibernate_attempt_cleanup_marker(struct hibernate_attempt *ha)
  * rollback.  It does not reopen admission, perform marker I/O, or restore
  * interrupts.
  */
+enum hibernate_owner_rollback_outcome {
+	HIBERNATE_OWNER_ROLLBACK_VERIFIED = 0,
+	HIBERNATE_OWNER_ROLLBACK_UNSAFE,
+	HIBERNATE_OWNER_ROLLBACK_UNKNOWN
+};
+
+struct hibernate_owner_rollback_proof {
+	enum hibernate_owner_rollback_outcome outcome;
+	uint32_t completed_stage_bits;
+	bool admission_still_closed;
+	bool dma_idle;
+	bool deferred_work_idle;
+	bool interrupt_state_matches;
+};
+
 #ifdef _HIBERNATE_USERLAND_BUILD
 /*
  * TEST-ONLY selected-owner rollback seam.  NULL retains the verified no-owner
  * K-7 default while an injected function makes exact-once cleanup observable.
  */
 int (*hibernate_test_owner_rollback_fn)(struct hibernate_attempt *,
-    enum hibernate_owner_rollback_outcome *);
+    struct hibernate_owner_rollback_proof *);
+
+void
+hibernate_test_proof_fill(struct hibernate_owner_rollback_proof *proof,
+    int outcome, uint32_t completed_stage_bits, unsigned facts)
+{
+	proof->outcome = outcome;
+	proof->completed_stage_bits = completed_stage_bits;
+	proof->admission_still_closed = (facts & 0x1) != 0;
+	proof->dma_idle = (facts & 0x2) != 0;
+	proof->deferred_work_idle = (facts & 0x4) != 0;
+	proof->interrupt_state_matches = (facts & 0x8) != 0;
+}
 #endif
 
 static int
 hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
-    enum hibernate_owner_rollback_outcome *outcome)
+    struct hibernate_owner_rollback_proof *proof)
 {
 #ifdef _HIBERNATE_USERLAND_BUILD
 	if (hibernate_test_owner_rollback_fn != NULL)
-		return (hibernate_test_owner_rollback_fn(ha, outcome));
-#endif
+		return (hibernate_test_owner_rollback_fn(ha, proof));
 	(void)ha;
-	*outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+	proof->outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+	proof->completed_stage_bits = 0;
+	proof->admission_still_closed = true;
+	proof->dma_idle = true;
+	proof->deferred_work_idle = true;
+	proof->interrupt_state_matches = true;
 	return (0);
+#else
+	struct ahci_hibernate_owner_snapshot after;
+	struct hibernate_qstate *qs;
+	struct ahci_channel *ch;
+	sbintime_t deadline, now, slice;
+	uint32_t owned;
+	bool admission_closed, done_idle;
+	int error;
+
+	if (ha == NULL || proof == NULL)
+		return (EINVAL);
+	if (hibernate_k12_attempt != NULL &&
+	    hibernate_k12_attempt != ha)
+		return (EIO);
+	memset(proof, 0, sizeof(*proof));
+	proof->outcome = HIBERNATE_OWNER_ROLLBACK_UNKNOWN;
+	qs = &ha->ha_q;
+	ch = hibernate_k12_owner.ch;
+	owned = qs->qs_stages & HIBERNATE_QS_OWNER_MASK;
+	if (owned == 0) {
+		proof->outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+		proof->admission_still_closed = !ha->ha_has_quiesce ||
+		    ha->ha_has_admission_closed;
+		proof->dma_idle = true;
+		proof->deferred_work_idle = true;
+		proof->interrupt_state_matches = true;
+		hibernate_k12_owner.completed_stage_bits = 0;
+		hibernate_k12_owner.admission_still_closed =
+		    proof->admission_still_closed;
+		hibernate_k12_owner.dma_idle = true;
+		hibernate_k12_owner.deferred_work_idle = true;
+		hibernate_k12_owner.interrupt_state_matches = true;
+		hibernate_k12_owner.rollback_valid =
+		    proof->admission_still_closed;
+		return (proof->admission_still_closed ? 0 : EIO);
+	}
+	if (ch == NULL)
+		return (ENXIO);
+
+	if ((owned & HIBERNATE_QS_ROOT_SUSP) != 0) {
+		if (!qs->qs_root_failed) {
+			bus_topo_lock();
+			error = DEVICE_RESUME(root_bus);
+			bus_topo_unlock();
+			if (error != 0)
+				return (error);
+		}
+		qs->qs_stages &= ~HIBERNATE_QS_ROOT_SUSP;
+		proof->completed_stage_bits |= HIBERNATE_QS_ROOT_SUSP;
+	}
+
+	deadline = sbinuptime() + HIBERNATE_Q_SETTLE_SBT;
+	mtx_lock(&ch->mtx);
+	while (!ahci_ch_hibernate_settled_locked(ch)) {
+		now = sbinuptime();
+		if (now >= deadline) {
+			mtx_unlock(&ch->mtx);
+			return (ETIMEDOUT);
+		}
+		slice = MIN(deadline, now + 10 * SBT_1MS);
+		error = msleep_sbt(ch, &ch->mtx, PRIBIO, "ahcihib",
+		    slice, 0, C_ABSOLUTE);
+		if (error != 0) {
+			mtx_unlock(&ch->mtx);
+			return (error);
+		}
+	}
+	if ((owned & HIBERNATE_QS_ARMED) != 0) {
+		ahci_ch_hibernate_disarm_locked(ch);
+		qs->qs_stages &= ~HIBERNATE_QS_ARMED;
+		proof->completed_stage_bits |= HIBERNATE_QS_ARMED;
+	}
+	mtx_unlock(&ch->mtx);
+
+	/* CAM-global observers stay outside ch->mtx to preserve lock order. */
+	admission_closed = ha->ha_has_admission_closed &&
+	    xpt_simq_frozen_count(ha->ha_cam_sim) == qs->qs_simq_pre + 1;
+	done_idle = xpt_done_queues_idle();
+
+	mtx_lock(&ch->mtx);
+	ahci_ch_hibernate_snapshot_locked(ch, &hibernate_k12_owner.before,
+	    admission_closed, done_idle, &after);
+	mtx_unlock(&ch->mtx);
+
+	proof->admission_still_closed = after.admission_still_closed;
+	proof->dma_idle = after.dma_idle;
+	proof->deferred_work_idle = after.deferred_work_idle;
+	proof->interrupt_state_matches = after.interrupt_state_matches;
+	if (proof->completed_stage_bits == owned &&
+	    proof->admission_still_closed && proof->dma_idle &&
+	    proof->deferred_work_idle && proof->interrupt_state_matches)
+		proof->outcome = HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+	else
+		proof->outcome = HIBERNATE_OWNER_ROLLBACK_UNSAFE;
+
+	hibernate_k12_owner.completed_stage_bits =
+	    proof->completed_stage_bits;
+	hibernate_k12_owner.admission_still_closed =
+	    proof->admission_still_closed;
+	hibernate_k12_owner.dma_idle = proof->dma_idle;
+	hibernate_k12_owner.deferred_work_idle =
+	    proof->deferred_work_idle;
+	hibernate_k12_owner.interrupt_state_matches =
+	    proof->interrupt_state_matches;
+#ifdef INVARIANTS
+	if (hibernate_k12_inject_once(6))
+		proof->outcome = HIBERNATE_OWNER_ROLLBACK_UNSAFE;
+#endif
+	hibernate_k12_owner.rollback_valid =
+	    proof->outcome == HIBERNATE_OWNER_ROLLBACK_VERIFIED;
+	return (hibernate_k12_owner.rollback_valid ? 0 : EIO);
+#endif
 }
 
 void
 hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 {
-	enum hibernate_owner_rollback_outcome outcome;
-	cpuset_t empty_set;
+	struct hibernate_owner_rollback_proof proof;
 	int error;
+#ifdef _KERNEL
+	bool k12_active;
+#endif
 
 	if (ha == NULL)
 		return;
+#ifdef _KERNEL
+	k12_active = hibernate_k12_attempt != NULL;
+#endif
 
 	/* Step 1: admission remains closed if this attempt acquired it. */
 
 	/* Step 2: restart exactly the APs which acknowledged STOP_CPUS. */
-	__builtin_memset(&empty_set, 0, sizeof(empty_set));
-	if (ha->ha_has_stopped_cpus ||
-	    __builtin_memcmp(&ha->ha_acknowledged_cpus, &empty_set,
-	    sizeof(empty_set)) != 0) {
+#ifdef _KERNEL
+	/*
+	 * The record is installed only when quiesce starts.  Pre-quiesce
+	 * refusals have no K-12 identity or CPU acknowledgement to consume.
+	 */
+	if (k12_active && hibernate_k12_attempt != ha)
+		hibernate_cleanup_terminal("attempt identity");
+	if (k12_active && !CPU_EMPTY(&hibernate_k12_cpus.acknowledged)) {
+		error = hibernate_restart_cpus(hibernate_k12_cpus.acknowledged);
+		if (error != 0)
+			hibernate_cleanup_terminal("AP restart");
+		ha->ha_has_stopped_cpus = false;
+	}
+#else
+	if (ha->ha_has_stopped_cpus) {
 		error = hibernate_restart_cpus(ha->ha_acknowledged_cpus);
 		if (error != 0)
 			hibernate_cleanup_terminal("AP restart");
 		ha->ha_has_stopped_cpus = false;
 	}
+#endif
 
 	/* Step 3: roll back the selected owner unconditionally. */
-	outcome = HIBERNATE_OWNER_ROLLBACK_UNKNOWN;
-	error = hibernate_selected_owner_rollback(ha, &outcome);
-	if (error != 0 || outcome != HIBERNATE_OWNER_ROLLBACK_VERIFIED)
+	__builtin_memset(&proof, 0, sizeof(proof));
+	proof.outcome = HIBERNATE_OWNER_ROLLBACK_UNKNOWN;
+	error = hibernate_selected_owner_rollback(ha, &proof);
+	if (error != 0 ||
+	    proof.outcome != HIBERNATE_OWNER_ROLLBACK_VERIFIED ||
+	    !proof.admission_still_closed || !proof.dma_idle ||
+	    !proof.deferred_work_idle || !proof.interrupt_state_matches)
 		hibernate_cleanup_terminal("owner rollback");
 
 	/* Step 4: roll back the coordinator while admission remains closed. */
@@ -4859,12 +5398,27 @@ hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 		ha->ha_has_quiesce = false;
 	}
 
-	/* Step 5: restore only the BSP IF state captured at STOP_CPUS. */
-	if (hibernate_resume_intr_state_valid) {
+	/*
+	 * Step 5: restore and verify the BSP IF state captured by quiesce,
+	 * then release its scheduler pin.
+	 */
+	if (ha->ha_q.qs_bsp_valid &&
+	    (ha->ha_q.qs_stages & HIBERNATE_QS_BSP) != 0) {
 #ifdef _KERNEL
-		intr_restore(hibernate_resume_intr_state);
+		bool if_mismatch;
+
+		intr_restore(ha->ha_q.qs_rflags);
+		if_mismatch = (read_rflags() & PSL_I) !=
+		    (ha->ha_q.qs_rflags & PSL_I);
+#ifdef INVARIANTS
+		if_mismatch |= hibernate_k12_inject_once(5);
 #endif
-		hibernate_resume_intr_state_valid = false;
+		if (if_mismatch)
+			hibernate_cleanup_terminal("BSP IF restore");
+		sched_unpin();
+#endif
+		ha->ha_q.qs_bsp_valid = false;
+		ha->ha_q.qs_stages &= ~HIBERNATE_QS_BSP;
 	}
 
 	/* Step 6: the sole owned-marker clear and flush action. */
@@ -4882,9 +5436,19 @@ hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 	if (ha->ha_has_provider || ha->ha_has_extent || ha->ha_has_root_hold)
 		hibernate_coordinator_provider_release(ha);
 
-	/* Step 8: reopening and verification are the final action. */
+	/* Step 8: reopen admission, then release its owning peripheral. */
 	if (ha->ha_has_admission_closed && hibernate_admission_reopen(ha) != 0)
 		hibernate_cleanup_terminal("admission reopen");
+#ifdef _KERNEL
+	if ((ha->ha_q.qs_stages & HIBERNATE_QS_PERIPH) != 0) {
+		cam_periph_release(ha->ha_q.qs_periph);
+		ha->ha_q.qs_stages &= ~HIBERNATE_QS_PERIPH;
+		ha->ha_q.qs_periph = NULL;
+	}
+	memset(&hibernate_k12_cpus, 0, sizeof(hibernate_k12_cpus));
+	memset(&hibernate_k12_owner, 0, sizeof(hibernate_k12_owner));
+	hibernate_k12_attempt = NULL;
+#endif
 }
 
 int
@@ -4894,9 +5458,12 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	size_t meta_len;
 	uint32_t crc;
 	struct hibernate_marker consuming_marker;
-	cpuset_t target, empty_set;
+	cpuset_t acknowledged, target;
 	enum hibernate_resume_stage stage;
 	int error;
+#ifdef INVARIANTS
+	bool inject_after_stop;
+#endif
 
 	if (ha == NULL)
 		return (EINVAL);
@@ -4987,43 +5554,35 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		goto cleanup;
 
 	stage = HIB_RESUME_STOP_CPUS;
+#ifdef INVARIANTS
+	inject_after_stop = hibernate_k12_inject_once(7);
+#endif
 	hibernate_resume_stage_record(stage);
-	__builtin_memset(&empty_set, 0, sizeof(empty_set));
-	__builtin_memset(&ha->ha_acknowledged_cpus, 0,
-	    sizeof(ha->ha_acknowledged_cpus));
 #ifdef _KERNEL
+	CPU_ZERO(&acknowledged);
 	target = all_cpus;
 	CPU_CLR(PCPU_GET(cpuid), &target);
 #else
-	target = empty_set;
+	__builtin_memset(&acknowledged, 0, sizeof(acknowledged));
+	__builtin_memset(&target, 0, sizeof(target));
 #endif
-	error = hibernate_stop_cpus(target, &ha->ha_acknowledged_cpus);
-	if (error == 0 &&
-	    __builtin_memcmp(&ha->ha_acknowledged_cpus, &empty_set,
-		sizeof(empty_set)) != 0)
-		ha->ha_has_stopped_cpus = true;
-	if (error != 0)
-		goto cleanup;
-	/*
-	 * BSP interrupt state is captured only after every targeted AP has
-	 * acknowledged the stop (the STOP_CPUS stage's required result).
-	 */
-	hibernate_resume_intr_state_valid = false;
+	error = hibernate_stop_cpus(target, &acknowledged);
+	if (error != 0) {
+		ha->ha_acknowledged_cpus = acknowledged;
 #ifdef _KERNEL
-	hibernate_resume_intr_state = intr_disable();
+		ha->ha_has_stopped_cpus = !CPU_EMPTY(&acknowledged);
 #else
-	hibernate_resume_intr_state = 0;
+		ha->ha_has_stopped_cpus = false;
 #endif
-	hibernate_resume_intr_state_valid = true;
-
-	/*
-	 * RESTORE and ENTER_SAVED: K-10, K-11, and K-13 insert their
-	 * no-return destructive restore and saved-context entry here.
-	 */
-	stage = HIB_RESUME_RESTORE;
-	hibernate_resume_stage_record(stage);
-	stage = HIB_RESUME_ENTER_SAVED;
-	hibernate_resume_stage_record(stage);
+		goto cleanup;
+	}
+#if defined(_KERNEL) && defined(INVARIANTS)
+	if (inject_after_stop)
+		goto cleanup;
+#endif
+#ifdef _KERNEL
+	(void)intr_disable();
+#endif
 	hibernate_machdep_enter();
 
 classify_non_pending:

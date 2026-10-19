@@ -67,6 +67,11 @@
 #include <sys/types.h>
 #include <sys/param.h>
 
+#ifndef _SBINTIME_T_DECLARED
+typedef int64_t sbintime_t;
+#define	_SBINTIME_T_DECLARED
+#endif
+
 /*
  * Provide the ELF constants that kern_hibernate.c references from
  * <sys/elf64.h> and <sys/elf_common.h>.  In userland those headers
@@ -137,8 +142,11 @@ extern int (*hibernate_test_probe_fn)(struct hibernate_attempt *);
 extern void (*hibernate_test_provider_release_fn)(struct hibernate_attempt *);
 extern int (*hibernate_test_quiesce_rollback_fn)(struct hibernate_attempt *);
 extern int (*hibernate_test_restart_cpus_fn)(cpuset_t);
+struct hibernate_owner_rollback_proof;
 extern int (*hibernate_test_owner_rollback_fn)(struct hibernate_attempt *,
-    enum hibernate_owner_rollback_outcome *);
+    struct hibernate_owner_rollback_proof *);
+extern void hibernate_test_proof_fill(
+    struct hibernate_owner_rollback_proof *, int, uint32_t, unsigned);
 extern int (*hibernate_test_amd64_cpu_validate)(
     const struct hibernate_pcb *, bool *, bool *);
 extern uint64_t hibernate_test_facs_signature;
