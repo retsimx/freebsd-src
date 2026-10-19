@@ -262,6 +262,69 @@ forward_signal(struct thread *td)
 #else
 #define	X86	0
 #endif
+#if X86
+#define	SMP_STOP_DEADLINE	SBT_1S
+
+static void
+smp_load_acq_cpus(volatile cpuset_t *source, cpuset_t *dest)
+{
+	u_int i;
+
+	for (i = 0; i < _NCPUWORDS; i++)
+		dest->__bits[i] = atomic_load_acq_long(&source->__bits[i]);
+}
+
+int
+stop_cpus_deadline(cpuset_t target, cpuset_t *acknowledged)
+{
+	cpuset_t stopped;
+	sbintime_t deadline;
+
+	CPU_ZERO(acknowledged);
+	if (!smp_started)
+		return (0);
+	deadline = sbinuptime() + SMP_STOP_DEADLINE;
+	if (!nmi_is_broadcast || nmi_kdb_lock == 0)
+		ipi_selected(target, IPI_STOP);
+	do {
+		smp_load_acq_cpus(&stopped_cpus, &stopped);
+		CPU_AND(acknowledged, &stopped, &target);
+		if (CPU_CMP(acknowledged, &target) == 0)
+			return (0);
+		cpu_spinwait();
+	} while (sbinuptime() < deadline);
+	return (ETIMEDOUT);
+}
+
+int
+restart_cpus_deadline(cpuset_t acknowledged)
+{
+	struct monitorbuf *mb;
+	cpuset_t stopped;
+	sbintime_t deadline;
+	u_int id;
+
+	if (!smp_started)
+		return (0);
+	deadline = sbinuptime() + SMP_STOP_DEADLINE;
+	CPU_COPY_STORE_REL(&acknowledged, &started_cpus);
+	CPU_FOREACH(id) {
+		if (!CPU_ISSET(id, &acknowledged))
+			continue;
+		mb = &pcpu_find(id)->pc_monitorbuf;
+		atomic_store_int(&mb->stop_state, MONITOR_STOPSTATE_RUNNING);
+	}
+	do {
+		smp_load_acq_cpus(&stopped_cpus, &stopped);
+		if (!CPU_OVERLAP(&stopped, &acknowledged))
+			return (0);
+		cpu_spinwait();
+	} while (sbinuptime() < deadline);
+	return (ETIMEDOUT);
+}
+#undef SMP_STOP_DEADLINE
+#endif
+
 static int
 generic_stop_cpus(cpuset_t map, u_int type)
 {
