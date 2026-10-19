@@ -109,6 +109,13 @@ struct hibernate_handoff_record {
 
 extern struct hibernate_handoff_record hibernate_saved_handoff;
 
+/*
+ * Validate the saved-kernel handoff after the destructive restore.
+ */
+void hibernate_handoff_consume(void);
+#ifdef _HIBERNATE_USERLAND_BUILD
+extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
+#endif
 
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536

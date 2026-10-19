@@ -21,6 +21,7 @@ ATF_TESTS_C+=	hibernate_capacity_test
 ATF_TESTS_C+=	hibernate_classify_test
 ATF_TESTS_C+=	hibernate_dump_extent_test
 ATF_TESTS_C+=	hibernate_format_test
+ATF_TESTS_C+=	hibernate_handoff_test
 ATF_TESTS_C+=	hibernate_marker_test
 ATF_TESTS_C+=	hibernate_resume_test
 ATF_TESTS_C+=	hibernate_restore_test
@@ -39,6 +40,9 @@ SRCS.hibernate_classify_test+=	kern_hibernate.c
 
 SRCS.hibernate_format_test+=	hibernate_format_test.c
 SRCS.hibernate_format_test+=	kern_hibernate.c
+
+SRCS.hibernate_handoff_test+=	hibernate_handoff_test.c
+SRCS.hibernate_handoff_test+=	kern_hibernate.c
 
 SRCS.hibernate_marker_test+=	hibernate_marker_test.c
 SRCS.hibernate_marker_test+=	kern_hibernate.c
@@ -73,6 +77,7 @@ CFLAGS.hibernate_arena_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_capacity_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_classify_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_format_test.c+=	-D_HIBERNATE_USERLAND_BUILD
+CFLAGS.hibernate_handoff_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_marker_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_resume_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_restore_test.c+=	-D_HIBERNATE_USERLAND_BUILD

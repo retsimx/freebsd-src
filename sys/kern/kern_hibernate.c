@@ -139,6 +139,27 @@ static struct hibernate_attempt *g_hibernate_arena_owner;
  */
 struct hibernate_handoff_record hibernate_saved_handoff;
 
+#ifdef _HIBERNATE_USERLAND_BUILD
+/*
+ * TEST-ONLY fatal handoff-validation seam.  A test callback must not return;
+ * NULL preserves fatal behaviour.
+ */
+void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
+
+int
+hibernate_machdep_prepare(struct hibernate_attempt *ha)
+{
+	(void)ha;
+	return (0);
+}
+
+void
+hibernate_machdep_enter(void)
+{
+	abort();
+}
+#endif
+
 /*
  * These buffers are used only by serial early-boot arena derivation.
  * Each active range is fully written before it is read.
@@ -2699,6 +2720,46 @@ hibernate_handoff_record_encode(uint8_t *buf, size_t len,
 	buf[HANDOFF_OFF_CONSUMER_ATTACHED] =
 	    hhr->hhr_completion_consumer_attached;
 	return (0);
+}
+
+void
+hibernate_handoff_consume(void)
+{
+	uintmax_t value;
+
+	if (hibernate_saved_handoff.hhr_magic != HIBERNATE_HANDOFF_MAGIC) {
+		value = hibernate_saved_handoff.hhr_magic;
+#ifdef _KERNEL
+		panic("hibernate_handoff_consume: bad magic %#jx", value);
+#else
+		if (hibernate_test_handoff_failure_fn != NULL)
+			hibernate_test_handoff_failure_fn("magic", value);
+		abort();
+#endif
+	}
+	if (hibernate_saved_handoff.hhr_version != HIBERNATE_HANDOFF_VERSION) {
+		value = hibernate_saved_handoff.hhr_version;
+#ifdef _KERNEL
+		panic("hibernate_handoff_consume: bad version %#jx", value);
+#else
+		if (hibernate_test_handoff_failure_fn != NULL)
+			hibernate_test_handoff_failure_fn("version", value);
+		abort();
+#endif
+	}
+	if (hibernate_saved_handoff.hhr_encoded_size !=
+	    HIBERNATE_HANDOFF_ENCODED_SIZE) {
+		value = hibernate_saved_handoff.hhr_encoded_size;
+#ifdef _KERNEL
+		panic("hibernate_handoff_consume: bad encoded_size %#jx",
+		    value);
+#else
+		if (hibernate_test_handoff_failure_fn != NULL)
+			hibernate_test_handoff_failure_fn("encoded_size",
+			    value);
+		abort();
+#endif
+	}
 }
 
 int
