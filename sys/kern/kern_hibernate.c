@@ -1632,7 +1632,7 @@ static SYSCTL_NODE(_debug, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE,
     0, "Hibernate debugging");
 static int hibernate_k12_inject;
 SYSCTL_INT(_debug_hibernate, OID_AUTO, k12_inject, CTLFLAG_RW,
-    &hibernate_k12_inject, 0, "One-shot K-12 fault injection (1-7)");
+    &hibernate_k12_inject, 0, "One-shot K-12 fault injection (1-8)");
 
 static bool
 hibernate_k12_inject_once(int value)
@@ -4923,8 +4923,9 @@ hibernate_quiesce_rollback(struct hibernate_attempt *ha)
 	    !hibernate_k12_owner.interrupt_state_matches)
 		return (EIO);
 	/*
-	 * K12-T07 fills missing after a stop attempt.  Its zero-initialised
-	 * value is intentionally empty on rollback before STOP_CPUS.
+	 * An AP targeted by the stop IPI that never acknowledged is
+	 * unobservable: neither provably stopped nor provably running.
+	 * Prefer terminal refusal to inferred safety (design 038, section 7.8).
 	 */
 	if (!CPU_EMPTY(&hibernate_k12_cpus.missing))
 		return (EIO);
@@ -5232,7 +5233,7 @@ hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
 	struct ahci_channel *ch;
 	sbintime_t deadline, now, slice;
 	uint32_t owned;
-	bool admission_closed, done_idle;
+	bool admission_closed, done_idle, settle_never;
 	int error;
 
 	if (ha == NULL || proof == NULL)
@@ -5277,9 +5278,13 @@ hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
 		proof->completed_stage_bits |= HIBERNATE_QS_ROOT_SUSP;
 	}
 
+	settle_never = false;
+#ifdef INVARIANTS
+	settle_never = hibernate_k12_inject_once(8);
+#endif
 	deadline = sbinuptime() + HIBERNATE_Q_SETTLE_SBT;
 	mtx_lock(&ch->mtx);
-	while (!ahci_ch_hibernate_settled_locked(ch)) {
+	while (settle_never || !ahci_ch_hibernate_settled_locked(ch)) {
 		now = sbinuptime();
 		if (now >= deadline) {
 			mtx_unlock(&ch->mtx);
@@ -5288,7 +5293,7 @@ hibernate_selected_owner_rollback(struct hibernate_attempt *ha,
 		slice = MIN(deadline, now + 10 * SBT_1MS);
 		error = msleep_sbt(ch, &ch->mtx, PRIBIO, "ahcihib",
 		    slice, 0, C_ABSOLUTE);
-		if (error != 0) {
+		if (error != 0 && error != EWOULDBLOCK) {
 			mtx_unlock(&ch->mtx);
 			return (error);
 		}
@@ -5369,7 +5374,6 @@ hibernate_attempt_cleanup(struct hibernate_attempt *ha)
 		error = hibernate_restart_cpus(hibernate_k12_cpus.acknowledged);
 		if (error != 0)
 			hibernate_cleanup_terminal("AP restart");
-		ha->ha_has_stopped_cpus = false;
 	}
 #else
 	if (ha->ha_has_stopped_cpus) {
@@ -5568,10 +5572,14 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 #endif
 	error = hibernate_stop_cpus(target, &acknowledged);
 	if (error != 0) {
+#ifndef _KERNEL
+		/*
+		 * Host test fixture only: it has no K-12 private CPU
+		 * record, so the attempt carries the exact subset.  The
+		 * kernel path must not touch the attempt after the stop
+		 * was issued and consumes hibernate_k12_cpus instead.
+		 */
 		ha->ha_acknowledged_cpus = acknowledged;
-#ifdef _KERNEL
-		ha->ha_has_stopped_cpus = !CPU_EMPTY(&acknowledged);
-#else
 		ha->ha_has_stopped_cpus = false;
 #endif
 		goto cleanup;
