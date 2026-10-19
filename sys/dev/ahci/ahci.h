@@ -441,6 +441,7 @@ struct ahci_channel {
 	union ccb		*hold[AHCI_MAX_SLOTS];
 	struct ahci_slot	slot[AHCI_MAX_SLOTS];
 	uint32_t		oslots;		/* Occupied slots */
+	sbintime_t		hib_deadline;	/* 0 means ordinary suspend */
 	uint32_t		rslots;		/* Running slots */
 	uint32_t		aslots;		/* Slots with atomic commands  */
 	uint32_t		eslots;		/* Slots in error */
@@ -650,6 +651,84 @@ enum ahci_err_type {
 	"\031IOMMU_BUSWIDE"	\
 	"\032SLOWDEV"
 
+struct ahci_hibernate_owner_snapshot {
+	uint32_t	port_cmd;
+	uint32_t	port_ie;
+	bool		admission_still_closed;
+	bool		dma_idle;
+	bool		deferred_work_idle;
+	bool		interrupt_state_matches;
+	/* FORWARD facts are independent; ROLLBACK facts compare with before. */
+	bool		engines_stopped;
+	bool		port_interrupts_disabled;
+};
+
+static inline bool
+ahci_ch_hibernate_quiescent_locked(struct ahci_channel *ch)
+{
+	mtx_assert(&ch->mtx, MA_OWNED);
+	return (ch->resetting == 0 && ch->fatalerr == 0 &&
+	    ch->recoverycmd == 0);
+}
+
+static inline int
+ahci_ch_hibernate_arm_locked(struct ahci_channel *ch, sbintime_t deadline)
+{
+	mtx_assert(&ch->mtx, MA_OWNED);
+	if (deadline <= 0)
+		return (EINVAL);
+	if (!ahci_ch_hibernate_quiescent_locked(ch))
+		return (EBUSY);
+	ch->hib_deadline = deadline;
+	return (0);
+}
+
+static inline void
+ahci_ch_hibernate_disarm_locked(struct ahci_channel *ch)
+{
+	mtx_assert(&ch->mtx, MA_OWNED);
+	ch->hib_deadline = 0;
+}
+
+static inline bool
+ahci_ch_hibernate_settled_locked(struct ahci_channel *ch)
+{
+	mtx_assert(&ch->mtx, MA_OWNED);
+	return (ch->resetting == 0);
+}
+
+static inline void
+ahci_ch_hibernate_snapshot_locked(struct ahci_channel *ch,
+    const struct ahci_hibernate_owner_snapshot *before,
+    bool admission_still_closed, bool cam_done_queues_idle,
+    struct ahci_hibernate_owner_snapshot *snapshot)
+{
+	uint32_t cmd;
+
+	mtx_assert(&ch->mtx, MA_OWNED);
+	cmd = ATA_INL(ch->r_mem, AHCI_P_CMD);
+	snapshot->port_cmd = cmd;
+	snapshot->port_ie = ATA_INL(ch->r_mem, AHCI_P_IE);
+	snapshot->engines_stopped = (cmd & (AHCI_P_CMD_ST | AHCI_P_CMD_FRE |
+	    AHCI_P_CMD_FR | AHCI_P_CMD_CR)) == 0;
+	snapshot->port_interrupts_disabled = snapshot->port_ie == 0;
+	snapshot->admission_still_closed = admission_still_closed;
+	snapshot->dma_idle = ch->oslots == 0 && ch->rslots == 0 &&
+	    (before == NULL || ((cmd ^ before->port_cmd) &
+	    (AHCI_P_CMD_ST | AHCI_P_CMD_FRE | AHCI_P_CMD_FR |
+	    AHCI_P_CMD_CR)) == 0);
+	snapshot->deferred_work_idle = STAILQ_EMPTY(&ch->doneq) &&
+	    ch->batch == 0 && ch->resetting == 0 &&
+	    !callout_pending(&ch->pm_timer) &&
+	    !callout_pending(&ch->reset_timer) && cam_done_queues_idle;
+	snapshot->interrupt_state_matches = before == NULL ||
+	    (snapshot->port_ie == before->port_ie &&
+	    ((cmd ^ before->port_cmd) & (AHCI_P_CMD_ST | AHCI_P_CMD_FRE |
+	    AHCI_P_CMD_FR | AHCI_P_CMD_CR)) == 0);
+}
+
+int ahci_ch_hibernate_drain_locked(struct ahci_channel *ch,
+    sbintime_t absolute_deadline);
 int ahci_attach(device_t dev);
 int ahci_detach(device_t dev);
 int ahci_setup_interrupt(device_t dev);
