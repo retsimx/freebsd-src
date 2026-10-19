@@ -274,6 +274,11 @@ smp_load_acq_cpus(volatile cpuset_t *source, cpuset_t *dest)
 		dest->__bits[i] = atomic_load_acq_long(&source->__bits[i]);
 }
 
+/*
+ * This variant omits generic_stop_cpus()'s stopping_cpu serialisation;
+ * stopped_cpus is shared with KDB, panic, and offline paths.  The caller
+ * must therefore be the only active stop transaction.
+ */
 int
 stop_cpus_deadline(cpuset_t target, cpuset_t *acknowledged)
 {
@@ -283,6 +288,15 @@ stop_cpus_deadline(cpuset_t target, cpuset_t *acknowledged)
 	CPU_ZERO(acknowledged);
 	if (!smp_started)
 		return (0);
+#ifdef INVARIANTS
+	{
+		cpuset_t pre;
+
+		smp_load_acq_cpus(&stopped_cpus, &pre);
+		KASSERT(!CPU_OVERLAP(&pre, &target),
+		    ("%s: target overlaps already-stopped CPUs", __func__));
+	}
+#endif
 	deadline = sbinuptime() + SMP_STOP_DEADLINE;
 	if (!nmi_is_broadcast || nmi_kdb_lock == 0)
 		ipi_selected(target, IPI_STOP);
@@ -296,6 +310,7 @@ stop_cpus_deadline(cpuset_t target, cpuset_t *acknowledged)
 	return (ETIMEDOUT);
 }
 
+/* Only CPUs stopped by this transaction may be restarted here. */
 int
 restart_cpus_deadline(cpuset_t acknowledged)
 {
