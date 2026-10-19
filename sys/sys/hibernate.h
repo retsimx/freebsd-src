@@ -651,13 +651,28 @@ enum hibernate_marker_owned {
 	HM_OWNED_CONSUMING
 };
 
-enum hibernate_owner_rollback_outcome {
-	HIBERNATE_OWNER_ROLLBACK_VERIFIED = 0,
-	HIBERNATE_OWNER_ROLLBACK_UNSAFE,
-	HIBERNATE_OWNER_ROLLBACK_UNKNOWN
+struct cam_sim;		/* Forward declaration; full type in cam/cam_sim.h. */
+
+#define	HIBERNATE_QS_PERIPH	0x01
+#define	HIBERNATE_QS_BSP	0x02
+#define	HIBERNATE_QS_ADMISSION	0x04
+#define	HIBERNATE_QS_ARMED	0x08
+#define	HIBERNATE_QS_ROOT_SUSP	0x10
+#define	HIBERNATE_QS_PROVED	0x20
+#define	HIBERNATE_QS_OWNER_MASK	(HIBERNATE_QS_ARMED | HIBERNATE_QS_ROOT_SUSP)
+#define	HIBERNATE_Q_DRAIN_SBT	(5 * SBT_1S)
+#define	HIBERNATE_Q_SETTLE_SBT	(10 * SBT_1S)
+struct hibernate_qstate {
+	register_t qs_rflags;
+	uint32_t qs_stages;
+	u_int qs_cpu;
+	u_int qs_simq_pre;
+	sbintime_t qs_deadline;
+	void *qs_periph;
+	bool qs_root_failed;
+	bool qs_bsp_valid;
 };
 
-struct cam_sim;		/* Forward declaration; full type in cam/cam_sim.h. */
 
 struct hibernate_attempt {
 	struct hibernate_marker_result ha_marker_result;
@@ -697,6 +712,7 @@ struct hibernate_attempt {
 	 * drain (step 6), then xpt_release_simq() on unwind.  NULL when
 	 * no pollable CAM sim is associated with the dump path.
 	 */
+	struct hibernate_qstate ha_q;
 	struct cam_sim *ha_cam_sim;	/* Dump-path CAM sim; NULL if none. */
 
 	/*
@@ -713,7 +729,7 @@ struct hibernate_attempt {
 	bool ha_has_safe_pages;		/* K-8 source-page reservation. */
 	bool ha_has_arena;		/* K-9 hibernate_arena_claim(). */
 	bool ha_has_admission_closed;	/* K-12 coordinator admission closed. */
-	bool ha_has_quiesce;		/* K-12 hibernate_quiesce() success. */
+	bool ha_has_quiesce;		/* First acquired K-12 quiesce stage. */
 	bool ha_has_stopped_cpus;	/* K-12 stop_cpus() success. */
 	cpuset_t ha_acknowledged_cpus;	/* Exact acknowledged AP subset. */
 	struct hibernate_image ha_image;
@@ -739,6 +755,7 @@ struct hibernate_attempt {
 		.ha_arena_start = 0,                            \
 		.ha_arena_size = 0,                             \
 		.ha_dst_valid = false,                          \
+		.ha_q = { 0 },                              \
 		.ha_cam_sim = NULL,                             \
 		.ha_marker_owned = HM_OWNED_NONE,               \
 		.ha_has_root_hold = false,                      \
