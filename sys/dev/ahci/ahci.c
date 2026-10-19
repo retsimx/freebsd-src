@@ -39,6 +39,7 @@
 #include <sys/sbuf.h>
 #include <sys/stdarg.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <machine/resource.h>
 #include <machine/bus.h>
 #include <sys/rman.h>
@@ -1021,6 +1022,44 @@ ahci_ch_deinit(device_t dev)
 	return (0);
 }
 
+int
+ahci_ch_hibernate_drain_locked(struct ahci_channel *ch,
+    sbintime_t absolute_deadline)
+{
+	sbintime_t now, slice;
+	int error;
+
+#ifdef INVARIANTS
+	KASSERT(ch != NULL, ("NULL AHCI channel"));
+	if (ch != NULL)
+		mtx_assert(&ch->mtx, MA_OWNED);
+	KASSERT(absolute_deadline > 0, ("invalid AHCI drain deadline"));
+	KASSERT(ch == NULL || xpt_simq_frozen_count(ch->sim) != 0,
+	    ("AHCI admission is not closed"));
+#endif
+#ifdef DIAGNOSTIC
+	if (ch == NULL || absolute_deadline <= 0 ||
+	    !mtx_owned(&ch->mtx) || xpt_simq_frozen_count(ch->sim) == 0)
+		return (EINVAL);
+#endif
+	for (;;) {
+		if (ch->oslots == 0)
+			return (0);
+		if (ch->fatalerr)
+			return (EIO);
+		now = sbinuptime();
+		if (now >= absolute_deadline)
+			return (ETIMEDOUT);
+		slice = MIN(absolute_deadline, now + 10 * SBT_1MS);
+		error = msleep_sbt(ch, &ch->mtx, PRIBIO, "ahcihib", slice, 0,
+		    C_ABSOLUTE);
+		if (error == EINTR)
+			return (EINTR);
+		if (error != 0 && error != EWOULDBLOCK)
+			return (EIO);
+	}
+}
+
 static int
 ahci_ch_suspend(device_t dev)
 {
@@ -1034,8 +1073,20 @@ ahci_ch_suspend(device_t dev)
 		callout_stop(&ch->reset_timer);
 		xpt_release_simq(ch->sim, TRUE);
 	}
+	if (ch->hib_deadline != 0) {
+		int error;
+
+		error = ahci_ch_hibernate_drain_locked(ch, ch->hib_deadline);
+		if (error != 0) {
+			xpt_release_simq(ch->sim, FALSE);
+			mtx_unlock(&ch->mtx);
+			return (error);
+		}
+		goto drained;
+	}
 	while (ch->oslots)
 		msleep(ch, &ch->mtx, PRIBIO, "ahcisusp", hz/100);
+drained:
 	ahci_ch_deinit(dev);
 	mtx_unlock(&ch->mtx);
 	return (0);
