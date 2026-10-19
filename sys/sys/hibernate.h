@@ -730,7 +730,12 @@ struct hibernate_attempt {
 	bool ha_has_arena;		/* K-9 hibernate_arena_claim(). */
 	bool ha_has_admission_closed;	/* K-12 coordinator admission closed. */
 	bool ha_has_quiesce;		/* First acquired K-12 quiesce stage. */
-	bool ha_has_stopped_cpus;	/* K-12 stop_cpus() success. */
+	/*
+	 * Host-fixture state only.  The kernel tracks acknowledgements in its
+	 * private K-12 record and does not touch the attempt after
+	 * acknowledgement.
+	 */
+	bool ha_has_stopped_cpus;
 	cpuset_t ha_acknowledged_cpus;	/* Exact acknowledged AP subset. */
 	struct hibernate_image ha_image;
 					/* K-7 decoded image (transient). */
