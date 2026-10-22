@@ -22,6 +22,7 @@ ATF_TESTS_C+=	hibernate_classify_test
 ATF_TESTS_C+=	hibernate_dump_extent_test
 ATF_TESTS_C+=	hibernate_format_test
 ATF_TESTS_C+=	hibernate_handoff_test
+ATF_TESTS_C+=	hibernate_leaf_requirement_test
 ATF_TESTS_C+=	hibernate_marker_test
 ATF_TESTS_C+=	hibernate_resume_test
 ATF_TESTS_C+=	hibernate_restore_test
@@ -44,6 +45,8 @@ SRCS.hibernate_format_test+=	kern_hibernate.c
 SRCS.hibernate_handoff_test+=	hibernate_handoff_test.c
 SRCS.hibernate_handoff_test+=	kern_hibernate.c
 
+SRCS.hibernate_leaf_requirement_test+=	hibernate_leaf_requirement_test.c
+
 SRCS.hibernate_marker_test+=	hibernate_marker_test.c
 SRCS.hibernate_marker_test+=	kern_hibernate.c
 
@@ -58,6 +61,11 @@ SRCS.hibernate_writer_test+=	kern_hibernate.c
 
 # Pull in kern_hibernate.c and kern_dump.c from the kernel source tree.
 .PATH:	${SRCTOP}/sys/kern
+
+# hibernate_leaf_requirement_test.c includes hibernate_machdep.c directly
+# (see that test file's header comment); make it visible the same way
+# kern_hibernate.c/kern_dump.c are above.
+.PATH:	${SRCTOP}/sys/amd64/amd64
 
 # Dual-build portability seam: define _HIBERNATE_USERLAND_BUILD so
 # kern_hibernate.c omits <sys/systm.h> and uses userland headers
@@ -78,6 +86,7 @@ CFLAGS.hibernate_capacity_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_classify_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_format_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_handoff_test.c+=	-D_HIBERNATE_USERLAND_BUILD
+CFLAGS.hibernate_leaf_requirement_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_marker_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_resume_test.c+=	-D_HIBERNATE_USERLAND_BUILD
 CFLAGS.hibernate_restore_test.c+=	-D_HIBERNATE_USERLAND_BUILD

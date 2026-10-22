@@ -126,9 +126,28 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
 #define HIBERNATE_MAX_PHDRS	      900
 
-#define HIBERNATE_ARENA_RULE_VERSION	     1U
+#define HIBERNATE_ARENA_RULE_VERSION	     2U
 #define HIBERNATE_ARENA_ALIGNMENT	     UINT64_C(4096)
-#define HIBERNATE_ARENA_HEADER_BYTES	     UINT64_C(256)
+/*
+ * Reserved arena span for the encoded transition-arena header (rule
+ * version 2).  The encoded header itself is exactly
+ * HIBERNATE_ARENA_HEADER_ENCODED_SIZE (256) bytes, but every later
+ * sub-object in hibernate_md_arena_layout_compute()'s offset chain
+ * (sys/amd64/amd64/hibernate_machdep.c) -- trampoline_pa, stack_pa,
+ * private_pt_pa, handoff_pa, run_table_pa -- is a literal physical
+ * address that callers treat as page-aligned (the private CR3 PML4 is
+ * loaded directly into CR3; the trampoline and its saved-domain stub
+ * are identity-mapped at page granularity).  Reserving only the
+ * header's literal 256-byte encoded size left every later offset
+ * misaligned by that same 256 bytes, since every other component ahead
+ * of it in the sum is already a page multiple; this was latent (rule
+ * version 1 never exercised a real saved-kernel continuation to
+ * surface it) and is fixed here by rounding the header's reserved span
+ * up to one full page.  This is a layout-affecting constant, correctly
+ * covered by rule version 2's bump alongside the leaf-page-budget
+ * change.
+ */
+#define HIBERNATE_ARENA_HEADER_BYTES HIBERNATE_ARENA_ALIGNMENT
 /*
  * Reserved arena span for the copied, position-independent trampoline.
  * hibernate_tramp_entry contains two page-aligned pages (the both-domain
@@ -150,13 +169,55 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_ARENA_AUX_DESCRIPTOR_BYTES UINT64_C(16)
 #define HIBERNATE_ARENA_PT_PML4_PAGES	     UINT64_C(1)
 #define HIBERNATE_ARENA_PT_PDPT_PAGES	     UINT64_C(4)
-#define HIBERNATE_ARENA_PT_PD_PAGES	     UINT64_C(8)
-#define HIBERNATE_ARENA_PT_LEAF_PAGES	     UINT64_C(16)
+/*
+ * PD- and leaf-page-table budgets (rule version 2; see 039-k13-...-qemu-
+ * s4-resume.md SS12 for the full derivation record).
+ *
+ * These bound struct hibernate_md_private_builder's hmb_pd[]/hmb_leaf[]
+ * (sys/amd64/amd64/hibernate_machdep.c), each one entry per distinct 1 GiB
+ * / 2 MiB region the private CR3 tree must identity-map (arena + every
+ * destination run + source-vector pages + the staged XSAVE page).  Rule
+ * version 1's fixed values (PD=8, LEAF=16) were sized for a contiguous or
+ * lightly fragmented destination set and never re-derived against a real
+ * memory map; a measured 4 GiB and 16 GiB resume attempt (K13-T00, 2026-
+ * 10-22) needed 502 and 585 distinct 2 MiB leaf regions respectively (4
+ * and 6 distinct 1 GiB PD regions) -- the true driver is destination-page
+ * fragmentation below 4 GiB, not total RAM size, so this bound does not
+ * scale with HIBERNATE_ARENA_PHYS_LIMIT.
+ *
+ * HIBERNATE_ARENA_PT_LEAF_PAGES = 4096 covers the measured 585-region
+ * requirement with roughly 7x headroom for a more fragmented real-world
+ * memory map (more firmware-reserved holes, more device MMIO windows)
+ * without an unbounded or open-ended budget: hmb_leaf[] is heap-allocated
+ * (not stack-resident) precisely so this value can be large without
+ * risking a kernel-stack overflow on the no-return restore path.
+ * HIBERNATE_ARENA_PT_PD_PAGES = 128 covers the measured 4-6-region
+ * requirement with comparable headroom; each 1 GiB PD region can itself
+ * require multiple leaf pages, so PD is not the limiting budget.
+ * HIBERNATE_ARENA_PT_PDPT_PAGES stays 4 (unchanged, not observed to be a
+ * limiting factor: every measured run fit in one 512 GiB PDPT-covered
+ * region).
+ *
+ * hibernate_machdep_prepare() computes the exact measured requirement
+ * from the validated ha_dst_intervals view before attempting to build the
+ * tree (hibernate_md_private_leaf_requirement()) and fails closed with a
+ * named refusal citing the measured count vs. this budget, rather than a
+ * bare ENOMEM surfacing only once the budget is actually exhausted deep
+ * inside page-table construction.
+ */
+#define HIBERNATE_ARENA_PT_PD_PAGES	     UINT64_C(128)
+#define HIBERNATE_ARENA_PT_LEAF_PAGES	     UINT64_C(4096)
 #define HIBERNATE_ARENA_OBJECT_ALIGNMENTS    UINT64_C(7)
 #define HIBERNATE_ARENA_BOUNDED_SLACK_BYTES  UINT64_C(65536)
 #define HIBERNATE_ARENA_POLICY_DEFAULT_BYTES (UINT64_C(4) * 1024 * 1024)
 #define HIBERNATE_ARENA_PHYS_LIMIT	     UINT64_C(0x100000000)
-#define HIBERNATE_ARENA_INTERVAL_MAX	     128
+
+/*
+ * OVMF can supply more than 128 EFI memory descriptors; the QEMU q35 map
+ * currently contains 130.  Keep an honest power-of-two bound with headroom
+ * for firmware fragmentation while retaining fixed, off-stack boot storage.
+ */
+#define HIBERNATE_ARENA_INTERVAL_MAX	    256
 
 #define HIBERNATE_ARENA_HEADER_MAGIC UINT64_C(0x4852454e41454241)
 #define HIBERNATE_ARENA_HEADER_VERSION 1
@@ -1081,6 +1142,16 @@ int hibernate_dumper_lookup(const struct hibernate_provider_id *id,
     struct dumperinfo **dip);
 int hibernate_owner_publish(const struct hibernate_provider_id *id);
 void hibernate_owner_deactivate(const struct hibernate_provider_id *id);
+
+/*
+ * K13-T00 fix: GEOM_HIBERNATE's taste() always races ahead of GEOM_DEV's
+ * for the same new-provider arrival (see sys/geom/geom_hibernate.c), so
+ * the first discovery attempt typically finds no registered dumperinfo
+ * yet and defers instead of refusing.  dumper_insert() (kern_shutdown.c)
+ * calls this after every successful registration so a deferred attempt
+ * can retry once its configured device actually has a dumper.
+ */
+void hibernate_dumper_registered(const char *devname);
 
 /* Live FACS HardwareSignature; defined in sys/dev/acpica/acpi.c. */
 uint64_t acpi_hibernate_facs_signature(void);

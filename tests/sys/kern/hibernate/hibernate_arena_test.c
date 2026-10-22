@@ -18,13 +18,13 @@ ATF_TC_BODY(required_golden, tc)
 	struct hibernate_arena_sizing sizing;
 
 	ATF_REQUIRE_EQ(0, hibernate_arena_required(&sizing));
-	ATF_CHECK_EQ(UINT64_C(118784), sizing.has_private_page_tables);
+	ATF_CHECK_EQ(UINT64_C(17321984), sizing.has_private_page_tables);
 	ATF_CHECK_EQ(UINT64_C(28800), sizing.has_copy_run_storage);
 	ATF_CHECK_EQ(UINT64_C(1024), sizing.has_aux_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(32768), sizing.has_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(28665), sizing.has_alignment_allowance);
-	ATF_CHECK_EQ(UINT64_C(327929), sizing.has_raw_required);
-	ATF_CHECK_EQ(UINT64_C(331776), sizing.has_required);
+	ATF_CHECK_EQ(UINT64_C(17534969), sizing.has_raw_required);
+	ATF_CHECK_EQ(UINT64_C(17534976), sizing.has_required);
 	ATF_CHECK_EQ(1, HCB_VERSION);
 	ATF_CHECK_EQ(0x040, HIBERNATE_CB_OFF_ARENA_START);
 	ATF_CHECK_EQ(0x048, HIBERNATE_CB_OFF_ARENA_SIZE);
@@ -78,25 +78,30 @@ ATF_TC_BODY(live_exclusion, tc)
 ATF_TC_WITHOUT_HEAD(selection_highest);
 ATF_TC_BODY(selection_highest, tc)
 {
+	/*
+	 * Intervals sized well above the rule-version-2 required bytes
+	 * (17,534,976, driven by HIBERNATE_ARENA_PT_LEAF_PAGES=4096; see
+	 * hibernate.h), unlike rule version 1's much smaller requirement.
+	 */
 	struct hibernate_arena_interval intervals[] = {
-		{ 0x100000, 0x300000, HAIC_ELIGIBLE },
-		{ 0x800000, 0xa00000, HAIC_ELIGIBLE },
-		{ 0xb00000, 0xc00000, HAIC_INELIGIBLE_FIRMWARE },
+		{ 0x1000000, 0x3000000, HAIC_ELIGIBLE },
+		{ 0x8000000, 0xa000000, HAIC_ELIGIBLE },
+		{ 0xb000000, 0xc000000, HAIC_INELIGIBLE_FIRMWARE },
 	};
 	vm_paddr_t pa;
 	vm_size_t size;
 
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(intervals, nitems(intervals),
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
-	ATF_CHECK_EQ(UINT64_C(331776), size);
-	ATF_CHECK_EQ(UINT64_C(0x9af000), pa);
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
+	ATF_CHECK_EQ(UINT64_C(17534976), size);
+	ATF_CHECK_EQ(UINT64_C(0x8f47000), pa);
 	ATF_CHECK_EQ(ENOMEM,
 	    hibernate_arena_select(intervals, nitems(intervals),
-		UINT64_C(319488), &pa, &size));
+		UINT64_C(17530880), &pa, &size));
 	ATF_CHECK_EQ(EINVAL,
 	    hibernate_arena_select(intervals, nitems(intervals),
-		UINT64_C(323585), &pa, &size));
+		UINT64_C(17534977), &pa, &size));
 }
 
 static void
@@ -278,7 +283,8 @@ ATF_TC_BODY(live_range_matrix, tc)
 ATF_TC_WITHOUT_HEAD(selection_boundaries);
 ATF_TC_BODY(selection_boundaries, tc)
 {
-	const uint64_t required = UINT64_C(331776);
+	/* Rule version 2's required bytes (hibernate.h, PT_LEAF_PAGES=4096). */
+	const uint64_t required = UINT64_C(17534976);
 	struct hibernate_arena_interval interval;
 	vm_paddr_t pa;
 	vm_size_t size;
@@ -287,14 +293,14 @@ ATF_TC_BODY(selection_boundaries, tc)
 		0x100000 + required, HAIC_ELIGIBLE };
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(&interval, 1,
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
 	ATF_CHECK_EQ(UINT64_C(0x100000), pa);
 	ATF_CHECK_EQ(required, size);
 
 	interval.hai_end--;
 	ATF_CHECK_EQ(ENOMEM,
 	    hibernate_arena_select(&interval, 1,
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
 
 	interval = (struct hibernate_arena_interval) {
 		HIBERNATE_ARENA_PHYS_LIMIT - required,
@@ -302,11 +308,11 @@ ATF_TC_BODY(selection_boundaries, tc)
 	};
 	ATF_CHECK_EQ(0,
 	    hibernate_arena_select(&interval, 1,
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
 	interval.hai_end++;
 	ATF_CHECK_EQ(ENOMEM,
 	    hibernate_arena_select(&interval, 1,
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa, &size));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
 
 	interval = (struct hibernate_arena_interval) { 0x100000,
 		0x100000 + required, HAIC_ELIGIBLE };
@@ -327,23 +333,28 @@ ATF_TC_BODY(selection_boundaries, tc)
 ATF_TC_WITHOUT_HEAD(selection_reorder_equivalence);
 ATF_TC_BODY(selection_reorder_equivalence, tc)
 {
+	/*
+	 * Intervals sized well above the rule-version-2 required bytes
+	 * (17,534,976; see hibernate.h's HIBERNATE_ARENA_PT_LEAF_PAGES
+	 * rationale), unlike rule version 1's much smaller requirement.
+	 */
 	const struct hibernate_arena_interval a[] = {
-		{ 0x100000, 0x300000, HAIC_ELIGIBLE },
-		{ 0x800000, 0xa00000, HAIC_ELIGIBLE },
+		{ 0x1000000, 0x3000000, HAIC_ELIGIBLE },
+		{ 0x8000000, 0xa000000, HAIC_ELIGIBLE },
 	};
 	const struct hibernate_arena_interval b[] = {
-		{ 0x800000, 0xa00000, HAIC_ELIGIBLE },
-		{ 0x100000, 0x300000, HAIC_ELIGIBLE },
+		{ 0x8000000, 0xa000000, HAIC_ELIGIBLE },
+		{ 0x1000000, 0x3000000, HAIC_ELIGIBLE },
 	};
 	vm_paddr_t pa_a, pa_b;
 	vm_size_t size_a, size_b;
 
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(a, nitems(a),
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa_a, &size_a));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa_a, &size_a));
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(b, nitems(b),
-		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES, &pa_b, &size_b));
+		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa_b, &size_b));
 	ATF_CHECK_EQ(pa_a, pa_b);
 	ATF_CHECK_EQ(size_a, size_b);
 }
@@ -426,6 +437,44 @@ ATF_TC_BODY(ownership_boundaries, tc)
 	hibernate_arena_release(&owner);
 }
 
+/*
+ * OVMF's QEMU q35 EFI map can exceed 128 descriptors.  Exercise the shared
+ * normalisation storage beyond that former limit without placing the fixture
+ * arrays on the test stack.
+ */
+#define MANY_INTERVAL_COUNT 129
+static struct hibernate_arena_interval many_interval_input[MANY_INTERVAL_COUNT];
+static struct hibernate_arena_interval
+    many_interval_output[MANY_INTERVAL_COUNT];
+
+ATF_TC_WITHOUT_HEAD(normalize_more_than_128_intervals);
+ATF_TC_BODY(normalize_more_than_128_intervals, tc)
+{
+	size_t count, i;
+
+	for (i = 0; i < nitems(many_interval_input); i++) {
+		many_interval_input[i].hai_start = UINT64_C(0x1000) +
+		    i * UINT64_C(0x2000);
+		many_interval_input[i].hai_end =
+		    many_interval_input[i].hai_start + UINT64_C(0x1000);
+		many_interval_input[i].hai_class = HAIC_ELIGIBLE;
+	}
+	ATF_REQUIRE_EQ(0,
+	    hibernate_arena_normalize(many_interval_input,
+		nitems(many_interval_input), many_interval_output,
+		nitems(many_interval_output), &count));
+	ATF_REQUIRE_EQ(nitems(many_interval_input), count);
+	for (i = 0; i < count; i++) {
+		ATF_CHECK_EQ(many_interval_input[i].hai_start,
+		    many_interval_output[i].hai_start);
+		ATF_CHECK_EQ(many_interval_input[i].hai_end,
+		    many_interval_output[i].hai_end);
+		ATF_CHECK_EQ(many_interval_input[i].hai_class,
+		    many_interval_output[i].hai_class);
+	}
+}
+#undef MANY_INTERVAL_COUNT
+
 ATF_TP_ADD_TCS(tp)
 {
 	ATF_TP_ADD_TC(tp, required_golden);
@@ -441,5 +490,6 @@ ATF_TP_ADD_TCS(tp)
 	ATF_TP_ADD_TC(tp, both_map_accounting);
 	ATF_TP_ADD_TC(tp, complete_removal_refusal);
 	ATF_TP_ADD_TC(tp, ownership_boundaries);
+	ATF_TP_ADD_TC(tp, normalize_more_than_128_intervals);
 	return (atf_no_error());
 }

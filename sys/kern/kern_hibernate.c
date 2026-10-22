@@ -4853,8 +4853,26 @@ hibernate_quiesce(struct hibernate_attempt *ha)
 	qs->qs_stages |= HIBERNATE_QS_ROOT_SUSP;
 	printf("hibernate: k12: root-susp ok\n");
 
+	/*
+	 * K13-T00 fix: DEVICE_SUSPEND(root_bus), just called above,
+	 * unconditionally walks the device tree and invokes every
+	 * attached device's own suspend method -- including
+	 * ahci_ch_suspend() (sys/dev/ahci/ahci.c), which independently
+	 * calls xpt_freeze_simq(ch->sim, 1) as ordinary AHCI-channel
+	 * suspend behavior, on the same sim this quiesce proof already
+	 * froze once itself (the "admission ok" freeze above).  The
+	 * post-suspend frozen count is therefore qs_simq_pre + 2 (one
+	 * freeze from K-12's own pre-suspend admission close, one from
+	 * the driver's standard suspend method), not + 1 -- a pre-
+	 * existing accounting gap in this proof that a real continuation
+	 * through DEVICE_SUSPEND/DEVICE_RESUME never previously exercised.
+	 * The pre-suspend admission_closed check above (used for the
+	 * before-snapshot/arm sequence) is unaffected: at that point only
+	 * the first freeze has happened, so qs_simq_pre + 1 there remains
+	 * correct.
+	 */
 	admission_closed = ha->ha_has_admission_closed &&
-	    xpt_simq_frozen_count(sim) == qs->qs_simq_pre + 1;
+	    xpt_simq_frozen_count(sim) == qs->qs_simq_pre + 2;
 	done_idle = xpt_done_queues_idle();
 	mtx_lock(&ch->mtx);
 	ahci_ch_hibernate_snapshot_locked(ch, NULL, admission_closed,
@@ -5716,23 +5734,28 @@ hibernate_image_validate(struct hibernate_attempt *ha)
 	 * strictly increasing non-overlapping, disjoint from the arena.
 	 */
 	if (!ha->ha_dst_valid || ha->ha_dst_intervals == NULL ||
-	    ha->ha_dst_count == 0)
+	    ha->ha_dst_count == 0) {
 		return (EINVAL);
+	}
 	arena_start = ha->ha_arena_start;
 	if (__builtin_add_overflow((uint64_t)arena_start, ha->ha_arena_size,
-		&end))
+		&end)) {
 		return (EOVERFLOW);
+	}
 	arena_end = end;
 	count = ha->ha_dst_count;
 	for (i = 0; i < count; i++) {
 		start = ha->ha_dst_intervals[i * 2];
 		end = ha->ha_dst_intervals[i * 2 + 1];
-		if (end <= start)
+		if (end <= start) {
 			return (EINVAL);
-		if (i > 0 && start <= ha->ha_dst_intervals[(i - 1) * 2 + 1])
+		}
+		if (i > 0 && start <= ha->ha_dst_intervals[(i - 1) * 2 + 1]) {
 			return (EINVAL);
-		if (start < arena_end && end > arena_start)
+		}
+		if (start < arena_end && end > arena_start) {
 			return (EINVAL);
+		}
 	}
 
 	/* 5-7. Live CPU/paging + LA57/MTRR refusal via the MD helper. */
