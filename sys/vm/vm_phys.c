@@ -2356,8 +2356,18 @@ hib_process_block_all(struct hibernate_attempt *ha,
 		} else {
 			/* Eligible: flush any pending excluded run first. */
 			if (m_excl_head != NULL) {
-				vm_phys_enq_range(m_excl_head, excl_count,
-				    fl, pind, 1);
+				/*
+				 * K13-T00 fix: see the matching comment in
+				 * hib_process_block_count() -- an arbitrary
+				 * offset/length run within a removed buddy
+				 * block does not generally satisfy
+				 * vm_phys_enq_range()'s buddy-alignment
+				 * precondition.  vm_phys_enqueue_contig()
+				 * decomposes it correctly (same tail=1
+				 * behavior).
+				 */
+				vm_phys_enqueue_contig(m_excl_head, pind,
+				    excl_count);
 				m_excl_head = NULL;
 				excl_count = 0;
 			}
@@ -2368,8 +2378,8 @@ hib_process_block_all(struct hibernate_attempt *ha,
 				 * the tail of the block (m onward) to fl;
 				 * the caller unlocks and rolls back.
 				 */
-				vm_phys_enq_range(m, block_pages - k,
-				    fl, pind, 1);
+				vm_phys_enqueue_contig(m, pind,
+				    block_pages - k);
 				return (error);
 			}
 		}
@@ -2377,7 +2387,7 @@ hib_process_block_all(struct hibernate_attempt *ha,
 
 	/* Return any trailing excluded span. */
 	if (m_excl_head != NULL)
-		vm_phys_enq_range(m_excl_head, excl_count, fl, pind, 1);
+		vm_phys_enqueue_contig(m_excl_head, pind, excl_count);
 
 	return (0);
 }
@@ -2420,16 +2430,34 @@ hib_process_block_count(struct hibernate_attempt *ha,
 		} else {
 			/* Eligible: flush any pending return run first. */
 			if (m_ret_head != NULL) {
-				vm_phys_enq_range(m_ret_head, ret_count,
-				    fl, pind, 1);
+				/*
+				 * K13-T00 fix: an ineligible/excess run
+				 * accumulated here begins at an arbitrary
+				 * offset within the buddy block removed by
+				 * the caller and has an arbitrary length, so
+				 * it does not generally satisfy
+				 * vm_phys_enq_range()'s buddy-alignment
+				 * precondition (observed panic:
+				 * "vm_phys_enq_range: page ... and npages
+				 * ... are misaligned").
+				 * vm_phys_enqueue_contig() is the existing
+				 * stock helper for enqueuing an arbitrary
+				 * contiguous, arbitrarily aligned run: it
+				 * internally decomposes it into valid
+				 * buddy-sized chunks (same tail=1 behavior
+				 * as every vm_phys_enq_range(..., 1) call
+				 * this replaces).
+				 */
+				vm_phys_enqueue_contig(m_ret_head, pind,
+				    ret_count);
 				m_ret_head = NULL;
 				ret_count = 0;
 			}
 			error = hib_append_page(res, m, pind, domain);
 			if (error != 0) {
 				/* EOVERFLOW: return tail and signal. */
-				vm_phys_enq_range(m, block_pages - k,
-				    fl, pind, 1);
+				vm_phys_enqueue_contig(m, pind,
+				    block_pages - k);
 				return (error);
 			}
 		}
@@ -2437,7 +2465,7 @@ hib_process_block_count(struct hibernate_attempt *ha,
 
 	/* Return any trailing ineligible/excess run. */
 	if (m_ret_head != NULL)
-		vm_phys_enq_range(m_ret_head, ret_count, fl, pind, 1);
+		vm_phys_enqueue_contig(m_ret_head, pind, ret_count);
 
 	return (0);
 }
