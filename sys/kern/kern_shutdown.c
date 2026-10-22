@@ -1410,6 +1410,14 @@ dumper_insert(const struct dumperinfo *di_template, const char *devname,
 		TAILQ_INSERT_TAIL(&dumper_configs, newdi, di_next);
 	mtx_unlock(&dumpconf_list_lk);
 
+	/*
+	 * K13-T00 fix: a deferred GEOM_HIBERNATE discovery attempt (see
+	 * sys/geom/geom_hibernate.c) may be waiting for exactly this
+	 * device's dumperinfo.  This is a cheap, lock-free no-op once
+	 * discovery has claimed or completed.
+	 */
+	hibernate_dumper_registered(devname);
+
 	return (0);
 }
 

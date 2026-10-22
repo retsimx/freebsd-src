@@ -8,6 +8,19 @@
  */
 
 #include <sys/param.h>
+/*
+ * _HIBERNATE_LEAF_REQUIREMENT_TEST: narrow test-build mode, matching the
+ * precedent already established by sys/kern/kern_dump.c's
+ * _HIBERNATE_DUMP_EXTENT_TEST.  Defining this macro before including this
+ * file compiles only hibernate_md_private_leaf_requirement() and
+ * hibernate_md_leaf_budget_ok() -- self-contained functions with no
+ * CR3/page-table/MD
+ * dependency beyond the numeric constant NBPDR (sys/amd64/include/param.h,
+ * already userland-safe) -- and skips every other declaration, include,
+ * and function in this file, none of which are needed by or safe to
+ * compile in a userland test build.
+ */
+#ifndef _HIBERNATE_LEAF_REQUIREMENT_TEST
 #include <sys/systm.h>
 #include <sys/conf.h>
 #include <sys/endian.h>
@@ -32,7 +45,11 @@
 #include <machine/specialreg.h>
 
 #include <x86/x86_var.h>
+#else
+#include <sys/hibernate.h>
+#endif /* !_HIBERNATE_LEAF_REQUIREMENT_TEST */
 
+#ifndef _HIBERNATE_LEAF_REQUIREMENT_TEST
 /*
  * XXX
  *
@@ -307,18 +324,24 @@ hibernate_amd64_pcb_populate(const struct hibernate_save_pcb *hpcb,
 /*
  * Compare the decoded saved CPU state with the live restore CPU.  CR0_TS is
  * excluded because normal lazy-FPU handling may legitimately change it.
- * The EFER mask contains every bit currently defined by specialreg.h.  Each
- * PAT entry has three architecturally defined memory-type bits.
+ * CR4_DE (debugging extensions) is excluded for the same reason: it tracks
+ * transient hardware-watchpoint/debug-register use during the live save
+ * session (e.g. ptrace(2) PT_SETDBREGS), not a CPU paging/feature
+ * capability the restore kernel needs to match -- it was observed set in
+ * every save-side snapshot and clear on every freshly booted resume
+ * kernel, with no in-tree code ever setting it explicitly.  The EFER mask
+ * contains every bit currently defined by specialreg.h.  Each PAT entry
+ * has three architecturally defined memory-type bits.
  */
 #define HIBERNATE_CR0_MASK                                              \
 	(CR0_PE | CR0_MP | CR0_EM | CR0_NE | CR0_WP | CR0_AM | CR0_NW | \
 	    CR0_CD | CR0_PG)
-#define HIBERNATE_CR4_MASK                                                    \
-	(CR4_VME | CR4_PVI | CR4_TSD | CR4_DE | CR4_PSE | CR4_PAE | CR4_MCE | \
-	    CR4_PGE | CR4_PCE | CR4_FXSR | CR4_XMM | CR4_UMIP | CR4_LA57 |    \
-	    CR4_VMXE | CR4_FSGSBASE | CR4_PCIDE | CR4_XSAVE | CR4_SMEP |      \
-	    CR4_SMAP | CR4_PKE | CR4_CET | CR4_PKS | CR4_UINTR | CR4_LASS |   \
-	    CR4_LAM_SUP | CR4_FRED)
+#define HIBERNATE_CR4_MASK                                                     \
+	(CR4_VME | CR4_PVI | CR4_TSD | CR4_PSE | CR4_PAE | CR4_MCE | CR4_PGE | \
+	    CR4_PCE | CR4_FXSR | CR4_XMM | CR4_UMIP | CR4_LA57 | CR4_VMXE |    \
+	    CR4_FSGSBASE | CR4_PCIDE | CR4_XSAVE | CR4_SMEP | CR4_SMAP |       \
+	    CR4_PKE | CR4_CET | CR4_PKS | CR4_UINTR | CR4_LASS | CR4_LAM_SUP | \
+	    CR4_FRED)
 #define HIBERNATE_EFER_MASK                                                  \
 	(EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVM | EFER_LMSLE | \
 	    EFER_FFXSR | EFER_TCE | EFER_MCOMMIT | EFER_INTWB | EFER_UAIE |  \
@@ -670,8 +693,21 @@ struct hibernate_md_private_builder {
 	pdp_entry_t *hmb_pdpt[HIBERNATE_ARENA_PT_PDPT_PAGES];
 	vm_paddr_t hmb_superbase[HIBERNATE_ARENA_PT_PDPT_PAGES];
 	struct hibernate_md_private_pd hmb_pd[HIBERNATE_ARENA_PT_PD_PAGES];
-	struct hibernate_md_private_leaf
-	    hmb_leaf[HIBERNATE_ARENA_PT_LEAF_PAGES];
+	/*
+	 * hmb_leaf[] is heap-allocated (M_TEMP, M_NOWAIT), not a fixed
+	 * stack array: HIBERNATE_ARENA_PT_LEAF_PAGES (rule version 2) is
+	 * sized from a measured real-world destination-fragmentation
+	 * count (see hibernate.h's rationale comment and design-039 SS12),
+	 * not a small compile-time constant, so it no longer fits safely
+	 * on the kernel stack (struct hibernate_md_private_builder is
+	 * itself stack-resident in hibernate_md_private_tree_build()).
+	 * hmb_leaf_capacity is the number of allocated-and-usable entries
+	 * (HIBERNATE_ARENA_PT_LEAF_PAGES unless allocation is truncated;
+	 * truncation is itself a fail-closed refusal, never a silent
+	 * smaller budget -- see hibernate_md_private_tree_build()).
+	 */
+	struct hibernate_md_private_leaf *hmb_leaf;
+	u_int hmb_leaf_capacity;
 	vm_paddr_t hmb_pml4_pa;
 	vm_paddr_t hmb_pdpt_base;
 	vm_paddr_t hmb_pd_base;
@@ -783,7 +819,7 @@ hibernate_md_private_leaf_get(struct hibernate_md_private_builder *builder,
 			return (0);
 		}
 	}
-	if (builder->hmb_nleaf >= HIBERNATE_ARENA_PT_LEAF_PAGES)
+	if (builder->hmb_nleaf >= builder->hmb_leaf_capacity)
 		return (ENOMEM);
 	error = hibernate_md_private_pd_get(builder, pa, &pd);
 	if (error != 0)
@@ -793,7 +829,7 @@ hibernate_md_private_leaf_get(struct hibernate_md_private_builder *builder,
 		return (EINVAL);
 	i = builder->hmb_nleaf;
 	error = hibernate_md_private_page_at(builder, builder->hmb_leaf_base, i,
-	    HIBERNATE_ARENA_PT_LEAF_PAGES, &table_pa);
+	    builder->hmb_leaf_capacity, &table_pa);
 	if (error != 0)
 		return (error);
 	builder->hmb_nleaf++;
@@ -815,12 +851,48 @@ hibernate_md_private_page_map_flags(
     struct hibernate_md_private_builder *builder, vm_paddr_t pa,
     pt_entry_t flags)
 {
-	pt_entry_t entry, *pt;
-	u_int leaf, pte_index;
+	pt_entry_t entry, *pt, pde;
+	vm_paddr_t super_base, super_pa;
+	u_int leaf, pte_index, pd;
 	int error;
 
 	if ((pa & PAGE_MASK) != 0)
 		return (EINVAL);
+
+	/*
+	 * hibernate_md_private_arena_map() installs 2 MiB identity
+	 * superpages for every 2 MiB-aligned chunk intersecting the
+	 * arena's byte range (Design 036 S5.3's "minimum set of 2 MiB
+	 * superpages").  Because the arena's byte range is not itself
+	 * 2 MiB-aligned, the first/last superpage can cover physical
+	 * memory outside the literal arena bytes -- and a destination,
+	 * source-vector, or XSAVE page can legitimately fall in that
+	 * already-mapped padding (observed: arena_start 0x7d1c4000's
+	 * covering superpage at 0x7d000000 also covers an unrelated
+	 * destination page at the same address).  Detect an existing,
+	 * permission-compatible superpage translation here and treat the
+	 * request as already satisfied, mirroring the PTE-level
+	 * idempotent-if-compatible check below one level down, rather
+	 * than reporting a hard EINVAL collision for a mapping the
+	 * superpage already grants.  A real permission mismatch (e.g. the
+	 * XSAVE page's required NX bit against a non-NX arena superpage)
+	 * still correctly refuses.
+	 */
+	error = hibernate_md_private_pd_get(builder, pa, &pd);
+	if (error != 0)
+		return (error);
+	pde = builder->hmb_pd[pd]
+		  .hmp_entries[(u_int)((pa >> PDRSHIFT) & (NPDEPG - 1))];
+	if ((pde & X86_PG_V) != 0 && (pde & PG_PS) != 0) {
+		super_base = pde & PG_PS_FRAME;
+		super_pa = super_base | (pa & PDRMASK);
+		if (super_pa == pa &&
+		    (pde & (X86_PG_V | X86_PG_RW)) == (X86_PG_V | X86_PG_RW) &&
+		    (pde & X86_PG_NX) == (flags & X86_PG_NX))
+			return (0);
+		return (EINVAL);
+	}
+
 	error = hibernate_md_private_leaf_get(builder, pa, &leaf);
 	if (error != 0)
 		return (error);
@@ -875,11 +947,149 @@ hibernate_md_private_arena_map(struct hibernate_md_private_builder *builder,
 }
 
 /*
+ * hibernate_md_private_leaf_requirement: compute, with checked arithmetic
+ * and no page-table side effects, the exact number of distinct 2 MiB-
+ * aligned leaf regions hibernate_md_private_tree_build() will need to
+ * identity-map: the arena, every coalesced destination run, every
+ * scattered source page, the contiguous source-vector storage range,
+ * and the single staged XSAVE page.
+ *
+ * ha->ha_dst_intervals is already K-5/K-7-validated sorted and strictly
+ * non-overlapping (hibernate_image_validate() step 4), so the destination
+ * contribution is computed in a single linear pass with no scratch array
+ * and no dependence on ha_dst_count's bound beyond
+ * HIBERNATE_ARENA_COPY_RUN_MAX (the run-table capacity
+ * hibernate_md_build_run_table() already enforces).  The arena, vector
+ * storage, and XSAVE contributions are each counted independently (never
+ * deduplicated against the destination count or each other): this can
+ * only overcount, never undercount, so the computed requirement is a
+ * safe upper bound on the true distinct-region count the real pass will
+ * need -- it must still be correct, but it is deliberately allowed to be
+ * conservative rather than exact, since exact cross-term deduplication
+ * would need the same O(n) scratch structure this function is designed
+ * to avoid.
+ *
+ * Returns 0 with *out set on success; EOVERFLOW on checked-arithmetic
+ * failure; EINVAL if ha_dst_intervals is unpublished or empty (callers
+ * must not reach here before VALIDATE has published it).
+ */
+#endif /* !_HIBERNATE_LEAF_REQUIREMENT_TEST */
+#ifdef _HIBERNATE_LEAF_REQUIREMENT_TEST
+int
+#else
+static int
+#endif
+hibernate_md_private_leaf_requirement(const struct hibernate_attempt *ha,
+    vm_paddr_t arena_end, const vm_paddr_t *vector, uint64_t vector_count,
+    vm_paddr_t vector_pa, uint64_t vector_pages, vm_paddr_t xsave_pa,
+    uint64_t *out)
+{
+	vm_paddr_t region, last_region, start, end, bytes, vector_end;
+	uint64_t count, i;
+
+	if (!ha->ha_dst_valid || ha->ha_dst_intervals == NULL ||
+	    ha->ha_dst_count == 0)
+		return (EINVAL);
+
+	count = 0;
+	last_region = 0;
+	for (i = 0; i < ha->ha_dst_count; i++) {
+		start = ha->ha_dst_intervals[i * 2];
+		end = ha->ha_dst_intervals[i * 2 + 1];
+		if (end <= start)
+			return (EINVAL);
+		region = start & ~(vm_paddr_t)(NBPDR - 1);
+		if (i == 0 || region != last_region) {
+			if (__builtin_add_overflow(count, 1, &count))
+				return (EOVERFLOW);
+		}
+		while (region < end) {
+			last_region = region;
+			if (__builtin_add_overflow(region, (vm_paddr_t)NBPDR,
+				&region))
+				return (EOVERFLOW);
+			if (region >= end)
+				break;
+			if (__builtin_add_overflow(count, 1, &count))
+				return (EOVERFLOW);
+		}
+	}
+
+	/* Arena: always counted, never deduplicated against destination. */
+	region = ha->ha_arena_start & ~(vm_paddr_t)(NBPDR - 1);
+	if (__builtin_add_overflow(count, 1, &count))
+		return (EOVERFLOW);
+	while (region < arena_end) {
+		if (__builtin_add_overflow(region, (vm_paddr_t)NBPDR, &region))
+			return (EOVERFLOW);
+		if (region >= arena_end)
+			break;
+		if (__builtin_add_overflow(count, 1, &count))
+			return (EOVERFLOW);
+	}
+
+	/*
+	 * Scattered source pages: conservatively count every page as a
+	 * distinct 2 MiB region, matching the non-deduplicating treatment
+	 * of the other terms.
+	 */
+	(void)vector;
+	if (__builtin_add_overflow(count, vector_count, &count))
+		return (EOVERFLOW);
+
+	/* Contiguous source-vector storage range. */
+	if (__builtin_mul_overflow(vector_pages, (uint64_t)HIB_PAGE_SIZE,
+		&bytes) ||
+	    __builtin_add_overflow(vector_pa, bytes, &vector_end))
+		return (EOVERFLOW);
+	if (vector_pages != 0) {
+		region = vector_pa & ~(vm_paddr_t)(NBPDR - 1);
+		if (__builtin_add_overflow(count, 1, &count))
+			return (EOVERFLOW);
+		while (region < vector_end) {
+			if (__builtin_add_overflow(region, (vm_paddr_t)NBPDR,
+				&region))
+				return (EOVERFLOW);
+			if (region >= vector_end)
+				break;
+			if (__builtin_add_overflow(count, 1, &count))
+				return (EOVERFLOW);
+		}
+	}
+
+	/* Staged XSAVE page: single page, its own region. */
+	(void)xsave_pa;
+	if (__builtin_add_overflow(count, 1, &count))
+		return (EOVERFLOW);
+
+	*out = count;
+	return (0);
+}
+
+#ifdef _HIBERNATE_LEAF_REQUIREMENT_TEST
+bool
+#else
+static bool
+#endif
+hibernate_md_leaf_budget_ok(uint64_t required, uint64_t budget)
+{
+	return (required <= budget);
+}
+#ifndef _HIBERNATE_LEAF_REQUIREMENT_TEST
+
+/*
  * Construct the arena-owned private CR3.  Arena execution/data is covered
  * by the minimum set of 2 MiB superpages.  Destination pages, source pages,
  * source-vector pages, and the staged XSAVE page use exact 4 KiB PTEs from
- * the sixteen-page leaf budget.  No untouched PDE in a referenced 1 GiB
- * region is populated.
+ * the leaf budget (HIBERNATE_ARENA_PT_LEAF_PAGES, rule version 2; see
+ * hibernate.h).  No untouched PDE in a referenced 1 GiB region is
+ * populated.
+ *
+ * hmb_leaf[] is heap-allocated here (not stack-resident) and freed on
+ * every return path: HIBERNATE_ARENA_PT_LEAF_PAGES is sized from a
+ * measured real-world requirement, not a small compile-time constant, so
+ * it no longer fits safely in struct hibernate_md_private_builder's
+ * stack frame.
  */
 static int
 hibernate_md_private_tree_build(struct hibernate_attempt *ha,
@@ -891,12 +1101,33 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 {
 	struct hibernate_md_private_builder builder;
 	vm_paddr_t arena_end, pa, run_end, root_pa;
-	uint64_t bytes, i, j;
+	uint64_t bytes, i, j, leaf_required;
 	int error;
 
 	if (__builtin_add_overflow(ha->ha_arena_start, ha->ha_arena_size,
 		&arena_end))
 		return (EOVERFLOW);
+
+	/*
+	 * Fail closed with a named, measured refusal before any allocation
+	 * or page-table construction, rather than letting a generic ENOMEM
+	 * surface deep inside hibernate_md_private_leaf_get() once the
+	 * budget is already exhausted.
+	 */
+	error = hibernate_md_private_leaf_requirement(ha, arena_end, vector,
+	    vector_count, vector_pa, vector_pages, xsave_pa, &leaf_required);
+	if (error != 0)
+		return (error);
+	if (!hibernate_md_leaf_budget_ok(leaf_required,
+		HIBERNATE_ARENA_PT_LEAF_PAGES)) {
+		printf("hibernate: private-tree leaf-page budget exceeded: "
+		       "measured requirement %ju distinct 2 MiB regions, "
+		       "budget %ju (HIBERNATE_ARENA_PT_LEAF_PAGES); refusing\n",
+		    (uintmax_t)leaf_required,
+		    (uintmax_t)HIBERNATE_ARENA_PT_LEAF_PAGES);
+		return (ENOMEM);
+	}
+
 	__builtin_memset(&builder, 0, sizeof(builder));
 	builder.hmb_layout = layout;
 	builder.hmb_pml4_pa = layout->private_pt_pa;
@@ -915,6 +1146,13 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 		&builder.hmb_end))
 		return (EOVERFLOW);
 
+	builder.hmb_leaf_capacity = HIBERNATE_ARENA_PT_LEAF_PAGES;
+	builder.hmb_leaf = (struct hibernate_md_private_leaf *)malloc(
+	    (size_t)HIBERNATE_ARENA_PT_LEAF_PAGES * sizeof(*builder.hmb_leaf),
+	    M_TEMP, M_NOWAIT | M_ZERO);
+	if (builder.hmb_leaf == NULL)
+		return (ENOMEM);
+
 	root_pa = builder.hmb_pml4_pa;
 	__builtin_memset((void *)PHYS_TO_DMAP(root_pa), 0, HIB_PAGE_SIZE);
 	builder.hmb_pml4 = (pml4_entry_t *)PHYS_TO_DMAP(root_pa);
@@ -923,34 +1161,40 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 	error = hibernate_md_private_arena_map(&builder, ha->ha_arena_start,
 	    arena_end);
 	if (error != 0)
-		return (error);
+		goto out;
 
 	for (i = 0; i < run_count; i++) {
-		if (runs[i].hmr_count == 0)
-			return (EINVAL);
+		if (runs[i].hmr_count == 0) {
+			error = EINVAL;
+			goto out;
+		}
 		if (__builtin_mul_overflow(runs[i].hmr_count,
 			(uint64_t)HIB_PAGE_SIZE, &bytes) ||
-		    __builtin_add_overflow(runs[i].hmr_pa, bytes, &run_end))
-			return (EOVERFLOW);
+		    __builtin_add_overflow(runs[i].hmr_pa, bytes, &run_end)) {
+			error = EOVERFLOW;
+			goto out;
+		}
 		for (pa = runs[i].hmr_pa; pa < run_end; pa += HIB_PAGE_SIZE) {
 			error = hibernate_md_private_page_map(&builder, pa);
 			if (error != 0)
-				return (error);
+				goto out;
 		}
 	}
 	for (i = 0; i < vector_count; i++) {
 		error = hibernate_md_private_page_map(&builder, vector[i]);
 		if (error != 0)
-			return (error);
+			goto out;
 	}
 	for (j = 0; j < vector_pages; j++) {
 		if (__builtin_mul_overflow(j, (uint64_t)HIB_PAGE_SIZE,
 			&bytes) ||
-		    __builtin_add_overflow(vector_pa, bytes, &pa))
-			return (EOVERFLOW);
+		    __builtin_add_overflow(vector_pa, bytes, &pa)) {
+			error = EOVERFLOW;
+			goto out;
+		}
 		error = hibernate_md_private_page_map(&builder, pa);
 		if (error != 0)
-			return (error);
+			goto out;
 	}
 	/*
 	 * The staged XSAVE object is data-only.  Its exact private-domain
@@ -959,16 +1203,19 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 	error = hibernate_md_private_page_map_flags(&builder, xsave_pa,
 	    X86_PG_NX);
 	if (error != 0)
-		return (error);
+		goto out;
 
-	KASSERT(builder.hmb_nleaf <= HIBERNATE_ARENA_PT_LEAF_PAGES,
+	KASSERT(builder.hmb_nleaf <= builder.hmb_leaf_capacity,
 	    ("hibernate private leaf-page budget exceeded"));
 	KASSERT(builder.hmb_npd <= HIBERNATE_ARENA_PT_PD_PAGES,
 	    ("hibernate private PD-page budget exceeded"));
 	KASSERT(builder.hmb_nsuper <= HIBERNATE_ARENA_PT_PDPT_PAGES,
 	    ("hibernate private PDPT-page budget exceeded"));
 	*leaf_pages_out = builder.hmb_nleaf;
-	return (0);
+	error = 0;
+out:
+	free(builder.hmb_leaf, M_TEMP);
+	return (error);
 }
 
 /*
@@ -1174,8 +1421,9 @@ hibernate_md_saved_domain_validate(vm_offset_t trampoline_saved_va,
 
 	for (i = 0; i < nitems(va); i++) {
 		if (!hibernate_md_walk_matches(kernel_pmap->pm_cr3, va[i],
-			expected_pa[i], expected_flags[i]))
+			expected_pa[i], expected_flags[i])) {
 			return (EINVAL);
+		}
 	}
 	return (0);
 }
@@ -1429,7 +1677,19 @@ hibernate_md_patch_saved_domain(const struct hibernate_md_arena_layout *layout,
 	if (susppcbs == NULL || susppcbs[0] == NULL)
 		return (EINVAL);
 	pcb_pa = vtophys(&susppcbs[0]->sp_pcb);
-	error = hibernate_md_identity_ensure(pcb_pa, 0, saved_pcb_va);
+	/*
+	 * hibernate_md_identity_ensure() maps one exact 4 KiB page and
+	 * requires a page-aligned input PA; &susppcbs[0]->sp_pcb is an
+	 * arbitrary field offset within its containing allocation, not
+	 * page-aligned in general.  Ensure the *containing page* is
+	 * identity-mapped (slot 0 contributes a zero VA offset, so the
+	 * mapped page's VA equals its PA either way); the exact,
+	 * sub-page-offset identity VA/PA equivalence below then holds for
+	 * every address within that mapped page, including the unaligned
+	 * pcb_pa itself.
+	 */
+	error = hibernate_md_identity_ensure(pcb_pa & ~(vm_paddr_t)PAGE_MASK, 0,
+	    saved_pcb_va);
 	if (error != 0)
 		return (error);
 	/*
@@ -1500,13 +1760,27 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	if (!ha->ha_has_safe_pages || ha->ha_staging == NULL)
 		return (EINVAL);
 
+	/*
+	 * hibernate_setup_identity_map() is idempotent (its own
+	 * map_initialized guard) and was previously only reached via the
+	 * SAVE path's dumpsys_hibernate_savectx_preinit().  The RESUME
+	 * path's kernel_pmap is a freshly booted kernel's own page tables
+	 * and never otherwise gets this low-4GiB identity range: later
+	 * identity-VA proofs in this function (hibernate_md_patch_saved_
+	 * domain()/hibernate_md_saved_domain_validate(), which walk
+	 * kernel_pmap directly, not the private CR3) require it to already
+	 * exist.
+	 */
+	hibernate_setup_identity_map();
+
 	/* 2. Arena-bridge-boundary proof (Design 036 S5.8). */
 	error = hibernate_md_arena_layout_compute(ha, &layout);
 	if (error != 0)
 		return (error);
 	if (ha->ha_image.hi_cb.hc_arena_start != ha->ha_arena_start ||
-	    ha->ha_image.hi_cb.hc_arena_size != ha->ha_arena_size)
+	    ha->ha_image.hi_cb.hc_arena_size != ha->ha_arena_size) {
 		return (EINVAL);
+	}
 	if (__builtin_add_overflow(ha->ha_arena_start, ha->ha_arena_size,
 		&arena_end))
 		return (EOVERFLOW);
@@ -1537,8 +1811,10 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 */
 	if ((xsave_pa & 63) != 0 || ha->ha_image.hi_xsave_length == 0 ||
 	    ha->ha_image.hi_xsave_length > HIB_PAGE_SIZE ||
-	    ha->ha_image.hi_xsave_length != ha->ha_image.hi_pcb.hp_xsave_length)
+	    ha->ha_image.hi_xsave_length !=
+		ha->ha_image.hi_pcb.hp_xsave_length) {
 		return (EINVAL);
+	}
 
 	/*
 	 * Physical-address-width compatibility (issue #12 refusal list).  Every
@@ -1552,8 +1828,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	if ((uint64_t)arena_end > phys_limit ||
 	    (uint64_t)xsave_pa >= phys_limit ||
 	    (uint64_t)vector_pa + (uint64_t)vector_pages * HIB_PAGE_SIZE >
-	    phys_limit)
+		phys_limit) {
 		return (EINVAL);
+	}
 	for (di = 0; di < ha->ha_dst_count; di++) {
 		if ((uint64_t)ha->ha_dst_intervals[di * 2 + 1] > phys_limit)
 			return (EINVAL);
@@ -1566,8 +1843,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	if (!hibernate_md_dtr_valid(ha->ha_image.hi_pcb.hp_gdtr_limit,
 		ha->ha_image.hi_pcb.hp_gdtr_base) ||
 	    !hibernate_md_dtr_valid(ha->ha_image.hi_pcb.hp_idtr_limit,
-		ha->ha_image.hi_pcb.hp_idtr_base))
+		ha->ha_image.hi_pcb.hp_idtr_base)) {
 		return (EINVAL);
+	}
 
 	/* 4. Coalesced destination run table. */
 	error = hibernate_md_build_run_table(ha, &layout, &run_count);
@@ -1614,15 +1892,17 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		return (EOVERFLOW);
 	trampoline_size &= ~(uintptr_t)(HIBERNATE_ARENA_ALIGNMENT - 1);
 	if (trampoline_size == 0 ||
-	    trampoline_size > (uintptr_t)HIBERNATE_ARENA_TRAMPOLINE_BYTES)
+	    trampoline_size > (uintptr_t)HIBERNATE_ARENA_TRAMPOLINE_BYTES) {
 		return (E2BIG);
+	}
 	if ((uintptr_t)hibernate_tramp_both_domain_page <=
-	    (uintptr_t)hibernate_tramp_entry ||
+		(uintptr_t)hibernate_tramp_entry ||
 	    (uintptr_t)hibernate_tramp_saved_domain_stub <=
-	    (uintptr_t)hibernate_tramp_both_domain_page ||
+		(uintptr_t)hibernate_tramp_both_domain_page ||
 	    (uintptr_t)hibernate_tramp_end <=
-	    (uintptr_t)hibernate_tramp_saved_domain_stub)
+		(uintptr_t)hibernate_tramp_saved_domain_stub) {
 		return (EINVAL);
+	}
 	bcopy((const void *)hibernate_tramp_entry, trampoline_buf,
 	    trampoline_size);
 	trampoline_identity_va = (vm_offset_t)layout.trampoline_pa;
@@ -1630,8 +1910,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	    (vm_paddr_t)((uintptr_t)hibernate_tramp_saved_domain_stub -
 	    (uintptr_t)hibernate_tramp_entry);
 	if (trampoline_stub_pa + HIB_PAGE_SIZE >
-	    layout.trampoline_pa + HIBERNATE_ARENA_TRAMPOLINE_BYTES)
+	    layout.trampoline_pa + HIBERNATE_ARENA_TRAMPOLINE_BYTES) {
 		return (E2BIG);
+	}
 
 	/*
 	 * hibernate_md_patch_saved_domain(): exactly four lookups/insertions.
@@ -1665,8 +1946,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	    bcmp((const void *)hibernate_tramp_entry,
 		(const void *)trampoline_identity_va, trampoline_size) != 0 ||
 	    bcmp((const void *)hibernate_tramp_saved_domain_stub,
-		(const void *)trampoline_saved_va, HIB_PAGE_SIZE) != 0)
+		(const void *)trampoline_saved_va, HIB_PAGE_SIZE) != 0) {
 		return (EINVAL);
+	}
 
 	/*
 	 * Compute both additional canary ranges before any canary write.
@@ -1826,3 +2108,4 @@ hibernate_machdep_enter(void)
 	    : "rdi", "rsi");
 	__builtin_unreachable();
 }
+#endif /* !_HIBERNATE_LEAF_REQUIREMENT_TEST */

@@ -50,6 +50,14 @@ static volatile u_int g_hibernate_claimed;
 
 static void g_hibernate_teardown_event(void *, int);
 static void g_hibernate_teardown_topology(struct g_hibernate_softc *);
+static void g_hibernate_retry_event(void *, int);
+
+/*
+ * K13-T00 fix: g_hibernate_retry_event() (defined before the class's own
+ * definition further down) re-enters g_hibernate_taste() directly, so the
+ * class object needs a forward declaration here.
+ */
+static struct g_class g_hibernate_class;
 
 static struct hibernate_marker_result
 g_hibernate_error_result(int error)
@@ -280,7 +288,25 @@ g_hibernate_worker(void *arg)
 		sc->io_inflight++;
 		attempt.ha_dumper = sc->dumper;
 		attempt.ha_marker_offset = sc->dumper->mediaoffset;
-		attempt.ha_provider_offset = 0;
+		/*
+		 * K13-T00 fix: hibernate_marker_classify() (called via
+		 * hibernate_probe() -> hibernate_marker_result_from_
+		 * transfer()) requires its "marker_offset" argument to equal
+		 * the exact base that was added when the on-disk marker's
+		 * hm_image_offset was encoded -- the dumper's absolute
+		 * mediaoffset, matching ha_marker_offset above -- not 0.
+		 * This dumper's provider *is* the GPT partition (its
+		 * mediaoffset already encodes the partition's absolute disk
+		 * offset), so "provider-relative" here means relative to the
+		 * whole backing disk, the same frame hm_image_offset was
+		 * written in.  With 0, every genuine PENDING/CONSUMED/
+		 * STALE_CONSUMING marker misclassifies as HMC_MALFORMED and
+		 * the K-7 resume path is never entered.  This path was never
+		 * exercised with a real marker before K13-T00 (the taste-
+		 * order and CAM-periph-lock fixes, applied earlier in this
+		 * task) let the probe run to completion for the first time.
+		 */
+		attempt.ha_provider_offset = sc->dumper->mediaoffset;
 		attempt.ha_provider_size = sc->id.media_size;
 	}
 	mtx_unlock(&sc->lock);
@@ -446,8 +472,10 @@ g_hibernate_taste(struct g_class *mp, struct g_provider *pp, int flags)
 	struct g_geom *gp;
 	size_t length;
 	int error;
+	bool retryable;
 
 	(void)flags;
+	retryable = false;
 	g_topology_assert();
 	if (!g_hibernate_config.hc_enabled ||
 	    atomic_load_acq_int(&g_hibernate_complete) != 0 ||
@@ -490,8 +518,19 @@ g_hibernate_taste(struct g_class *mp, struct g_provider *pp, int flags)
 		goto fail_access;
 	}
 	error = hibernate_dumper_lookup(&sc->id, &sc->dumper);
-	if (error != 0)
+	if (error != 0) {
+		/*
+		 * K13-T00 fix: GEOM_HIBERNATE's taste always races ahead of
+		 * GEOM_DEV's for this same new-provider arrival (confirmed
+		 * empirically: g_hibernate_class precedes g_dev_class in
+		 * g_classes), so ENXIO here usually means "no dumper yet",
+		 * not a real refusal.  Defer instead of latching the
+		 * one-shot probe closed; hibernate_dumper_registered() below
+		 * retries once dumper_insert() actually registers a match.
+		 */
+		retryable = (error == ENXIO);
 		goto fail_access;
+	}
 	error = hibernate_owner_publish(&sc->id);
 	if (error != 0)
 		goto fail_dumper;
@@ -527,6 +566,18 @@ fail_geom:
 	g_destroy_consumer(cp);
 	g_destroy_geom(gp);
 fail:
+	if (retryable) {
+		mtx_destroy(&sc->lock);
+		free(sc, M_GEOM);
+		/*
+		 * Release the one-shot claim (but not g_hibernate_complete):
+		 * this was not a genuine refusal, so a later
+		 * hibernate_dumper_registered() retry must be able to
+		 * re-attempt discovery from the top of this function.
+		 */
+		atomic_store_rel_int(&g_hibernate_claimed, 0);
+		return (NULL);
+	}
 	result = g_hibernate_error_result(error);
 	sc->attempt.ha_marker_result = result;
 	/*
@@ -540,12 +591,55 @@ fail:
 }
 
 static void
-g_hibernate_init(void *arg)
+g_hibernate_retry_event(void *arg, int flag)
+{
+	struct g_provider *pp;
+
+	(void)arg;
+	if (flag == EV_CANCEL)
+		return;
+	g_topology_assert();
+	if (atomic_load_acq_int(&g_hibernate_complete) != 0 ||
+	    atomic_load_acq_int(&g_hibernate_claimed) != 0)
+		return;
+	pp = g_provider_by_name(g_hibernate_config.hc_name);
+	if (pp != NULL)
+		(void)g_hibernate_taste(&g_hibernate_class, pp, 0);
+}
+
+/*
+ * K13-T00 fix (design-039 debug addendum, option b): called by
+ * dumper_insert() (sys/kern/kern_shutdown.c) after every successful
+ * dumper registration.  This removes GEOM_HIBERNATE's dependency on
+ * tasting after GEOM_DEV for the same provider: a deferred discovery
+ * attempt (see the "retryable" ENXIO path in g_hibernate_taste() above)
+ * only needed to know a matching dumper now exists, not which GEOM
+ * class order produced it.
+ *
+ * g_post_event() is safe to call from any context (topology held or
+ * not, any lock held) and runs the callback later from the GEOM event
+ * thread with topology held, matching g_hibernate_taste()'s own
+ * precondition.
+ */
+void
+hibernate_dumper_registered(const char *devname)
+{
+	if (devname == NULL ||
+	    atomic_load_acq_int(&g_hibernate_complete) != 0 ||
+	    atomic_load_acq_int(&g_hibernate_claimed) != 0 ||
+	    !g_hibernate_config.hc_enabled ||
+	    strcmp(devname, g_hibernate_config.hc_name) != 0)
+		return;
+	(void)g_post_event(g_hibernate_retry_event, NULL, M_NOWAIT, NULL);
+}
+
+static void
+g_hibernate_init(struct g_class *mp)
 {
 	struct hibernate_marker_result result;
 	int error;
 
-	(void)arg;
+	(void)mp;
 	callout_init(&g_hibernate_deadline_callout, 1);
 	error = hibernate_config_get(&g_hibernate_config);
 	if (error != 0) {
@@ -568,8 +662,8 @@ g_hibernate_init(void *arg)
 static struct g_class g_hibernate_class = {
 	.name = "HIBERNATE",
 	.version = G_VERSION,
+	.init = g_hibernate_init,
 	.taste = g_hibernate_taste,
 };
 
 DECLARE_GEOM_CLASS(g_hibernate_class, g_hibernate);
-SYSINIT(g_hibernate_config, SI_SUB_KENV, SI_ORDER_ANY, g_hibernate_init, NULL);
