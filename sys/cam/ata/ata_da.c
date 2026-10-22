@@ -1149,8 +1149,11 @@ ada_dump_flush_periph(struct ada_softc *softc, struct cam_periph *periph)
 		ata_48bit_cmd(&ataio, ATA_FLUSHCACHE48, 0, 0, 0);
 	else
 		ata_28bit_cmd(&ataio, ATA_FLUSHCACHE, 0, 0, 0);
+	/* K13-T00 fix: see the matching comment in adadump_read(). */
+	cam_periph_lock(periph);
 	error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
 	    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+	cam_periph_unlock(periph);
 	if (error != 0)
 		xpt_print(periph->path, "Synchronize cache failed\n");
 	return (error);
@@ -1205,8 +1208,23 @@ adadump_read(void *arg, void *virtual, off_t offset, size_t length)
 	else
 		ata_28bit_cmd(&ataio, ATA_READ_DMA, 0, (uint32_t)lba,
 		    (uint8_t)count);
+	/*
+	 * K13-T00 fix: unlike every other adadump*()/ada*() entry point in
+	 * this file, this function historically ran only from a legacy
+	 * panic dump, where cam_periph_runccb()'s own
+	 * "dumping || SCHEDULER_STOPPED()" polling bypass also exempts
+	 * xpt_path_assert(path, MA_OWNED) -- so the missing lock was never
+	 * observed.  A live kernel-side hibernate-resume probe (K-4) now
+	 * calls this same dumper_read callback from an ordinary kproc, with
+	 * neither flag set, and xpt_path_assert() correctly panics without
+	 * it ("mutex CAM device lock not owned").  cam_periph_lock() is a
+	 * no-op under SCHEDULER_STOPPED() (see __mtx_lock_flags()), so
+	 * taking it here is safe for the legacy panic-dump caller too.
+	 */
+	cam_periph_lock(periph);
 	error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
 	    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+	cam_periph_unlock(periph);
 	if (error == 0 && ataio.resid != 0)
 		error = EIO;
 	if (error != 0)
@@ -1275,8 +1293,18 @@ adadump(void *arg, void *virtual, off_t offset, size_t length)
 			ata_28bit_cmd(&ataio, ATA_WRITE_DMA,
 			    0, lba, count);
 		}
+		/*
+		 * K13-T00 fix: see the matching comment in adadump_read().
+		 * The kernel-side hibernate-resume path (K-7) now writes the
+		 * marker through this same dumper callback from a live
+		 * kproc, so the periph lock cam_periph_runccb() asserts must
+		 * actually be held here, not just during a legacy,
+		 * scheduler-stopped panic dump.
+		 */
+		cam_periph_lock(periph);
 		error = cam_periph_runccb((union ccb *)&ataio, adaerror, 0,
 		    SF_NO_RECOVERY | SF_NO_RETRY, NULL);
+		cam_periph_unlock(periph);
 		if (error == 0 && ataio.resid != 0)
 			error = EIO;
 		if (error != 0)
