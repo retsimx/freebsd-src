@@ -74,13 +74,17 @@
 #include <machine/bus.h>
 #ifdef OS_HIBERNATE_SUPPORT
 #include <sys/hibernate.h>
-#include <machine/hibernate.h>
+
 #include <vm/vm_phys.h>
-#include <geom/geom_disk.h>
+
+#include <machine/hibernate.h>
+
 #include <cam/cam.h>
-#include <cam/cam_sim.h>
-#include <cam/cam_xpt_sim.h>
 #include <cam/cam_periph.h>
+#include <cam/cam_sim.h>
+#include <cam/cam_xpt.h>
+#include <cam/cam_xpt_sim.h>
+#include <geom/geom_disk.h>
 #endif
 #include <sys/rman.h>
 #include <isa/isavar.h>
@@ -4190,6 +4194,28 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 	acpi_s4_resume_scheduler_aps(sc, susp_cpus);
 	acpi_s4_resume_interrupts(intr_state);
 	acpi_s4_resume_clocks(sc);
+	/*
+	 * K13-T00 fix (corrected): every device suspended by the pre-save
+	 * DEVICE_SUSPEND(root_bus) must be resumed exactly once on this
+	 * saved-kernel continuation path, matching every other sleep path
+	 * in this file.  An earlier revision of this fix called
+	 * DEVICE_RESUME(root_bus) directly here *and* cleared
+	 * ACPI_SS_DEV_SUSPEND, but the pre-existing code below this
+	 * function (see the "Force DEVICE_RESUME via backout" comment)
+	 * unconditionally re-sets that same bit, so backout:'s own
+	 * ACPI_SS_DEV_SUSPEND-gated DEVICE_RESUME(root_bus) call (acpi.c,
+	 * near the "backout:" label) fired a second time on every resume --
+	 * confirmed as a double-DEVICE_RESUME bug by review.  The correct,
+	 * single trigger point for this path is backout's existing gated
+	 * call, exactly as the pre-existing "Force DEVICE_RESUME via
+	 * backout" re-set below was already designed to produce; no direct
+	 * call belongs here.  acpi_s4_resume_bsp() therefore leaves
+	 * ACPI_SS_DEV_SUSPEND untouched and performs no DEVICE_RESUME()
+	 * call of its own -- device resume for this path is owned solely
+	 * by backout:, which the EJUSTRETURN caller unconditionally
+	 * reaches via "goto backout" immediately after this function
+	 * returns.
+	 */
 	free(hpcb, M_TEMP);
 #ifdef INVARIANTS
 	atomic_add_int(&hibernate_pcb_releases, 1);
@@ -4552,7 +4578,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		snapshot_owned = false;
 		goto backout;
 	}
-
 	/*
 	 * F6: enforce footprint configuration/derivation status recorded at
 	 * boot.  Refuse before AP stop so refusal is clean (no APs to resume,
@@ -4843,12 +4868,14 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	}
 #endif
 	if (error != 0 || !hibernate_s4_commit_gate(image_committed)) {
-	    device_printf(sc->acpi_dev,
-		"Could not commit the hibernate image!\n");
-	    status = AE_NO_HANDLER; /* XXX - Something. */
-	    /* K-18: release snapshot ownership on dump failure. */
-	    if (snapshot_owned) {
-		    free(hpcb, M_TEMP);
+		device_printf(sc->acpi_dev,
+		    "Could not commit the hibernate image: error=%d "
+		    "image_committed=%d\n",
+		    error, image_committed);
+		status = AE_NO_HANDLER; /* XXX - Something. */
+		/* K-18: release snapshot ownership on dump failure. */
+		if (snapshot_owned) {
+			free(hpcb, M_TEMP);
 #ifdef INVARIANTS
 		    atomic_add_int(&hibernate_pcb_releases, 1);
 #endif
@@ -4857,7 +4884,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    atomic_add_int(&hibernate_hcb_releases, 1);
 #endif
 		    snapshot_owned = false;
-	    }
+		}
 	    goto backout;
 	}
 
