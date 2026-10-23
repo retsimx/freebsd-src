@@ -4138,19 +4138,44 @@ acpi_s4_resume_lapic(void)
 static void
 acpi_s4_resume_scheduler_aps(struct acpi_softc *sc, const cpuset_t *susp_cpus)
 {
+#ifdef SMP
+	cpuset_t target;
+	int error;
+#endif
 
 	/*
 	 * Single S4-path scheduler release, before any AP release.  Match
 	 * resume_other_cpus(): clear scheduler_stopped BEFORE releasing APs
 	 * so an AP returning into cpu_idle cannot mi_switch while
 	 * SCHEDULER_STOPPED.  Empty susp_cpus (true UP) skips AP wake.
-	 * No UP clamp — AP wake failure panics.
+	 *
+	 * Hibernate-resume contract (K23-T10): the AP here is not powered
+	 * off, so no ACPI/IPI startup belongs on this path -- it is already
+	 * parked in this saved kernel's own spin loop
+	 * (hibernate_resume_ap_entry(), K23-T08/K23-T09).  Release it with
+	 * hibernate_resume_park_release(); its target cpuset is re-derived
+	 * from this (saved) kernel's own live topology (all_cpus/mp_ncpus),
+	 * not the restored *susp_cpus argument, per the same
+	 * never-trust-a-restored-cpuset-record rule
+	 * hibernate_resume_park_release() itself applies (D040 SS14.2).  An
+	 * empty target (true UP) is the identical no-op
+	 * hibernate_resume_park_release() already returns for, matching
+	 * today's empty-susp_cpus skip.  A non-zero return here is
+	 * post-RESTORE and therefore terminal per resume-protocol.md's
+	 * "Refusal semantics" landmark rule ("At or after RESTORE, failure
+	 * is terminal: halt/reset") -- panic rather than continue.
 	 */
 	scheduler_stopped = false;
 #ifdef SMP
+	(void)sc;
 	if (!CPU_EMPTY(susp_cpus)) {
-		acpi_wakeup_cpus(sc, *susp_cpus);
-		resume_cpus(*susp_cpus);
+		target = all_cpus;
+		CPU_CLR(PCPU_GET(cpuid), &target);
+		error = hibernate_resume_park_release(target);
+		if (error != 0)
+			panic("hibernate: k23: acpi_s4_resume_scheduler_aps: "
+			    "park release terminal failure (error %d)",
+			    error);
 	}
 #else
 	(void)sc;
