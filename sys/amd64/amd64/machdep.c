@@ -957,6 +957,8 @@ static struct {
 	vm_paddr_t local_dump_avail[PHYS_AVAIL_ENTRIES];
 	vm_paddr_t split_phys_avail[PHYS_AVAIL_ENTRIES];
 	vm_paddr_t split_dump_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t stub_phys_avail[PHYS_AVAIL_ENTRIES];
+	vm_paddr_t stub_dump_avail[PHYS_AVAIL_ENTRIES];
 } hibernate_boot_scratch;
 
 static int
@@ -1055,6 +1057,39 @@ hibernate_arena_derive(vm_paddr_t first, quad_t dcons_addr, quad_t dcons_size,
 }
 
 static int
+hibernate_park_stub_select(const vm_paddr_t *phys_pairs, size_t phys_count,
+    const vm_paddr_t *dump_pairs, size_t dump_count, vm_paddr_t *stub_start)
+{
+	vm_paddr_t candidate, end, start;
+	size_t i, j;
+
+	if (phys_pairs == NULL || dump_pairs == NULL || stub_start == NULL ||
+	    phys_count == 0 || dump_count == 0 ||
+	    phys_count % 2 != 0 || dump_count % 2 != 0)
+		return (EINVAL);
+	for (i = 0; i < phys_count; i += 2) {
+		if (phys_pairs[i] >= phys_pairs[i + 1])
+			return (EINVAL);
+		for (j = 0; j < dump_count; j += 2) {
+			if (dump_pairs[j] >= dump_pairs[j + 1])
+				return (EINVAL);
+			start = MAX(phys_pairs[i], dump_pairs[j]);
+			end = MIN(phys_pairs[i + 1], dump_pairs[j + 1]);
+			end = MIN(end, UINT64_C(0x100000));
+			if (start >= end || end < HIBERNATE_PARK_STUB_BYTES)
+				continue;
+			candidate = trunc_page(end -
+			    HIBERNATE_PARK_STUB_BYTES);
+			if (candidate == 0 || candidate < start)
+				continue;
+			if (*stub_start == 0 || candidate > *stub_start)
+				*stub_start = candidate;
+		}
+	}
+	return (*stub_start == 0 ? ENOMEM : 0);
+}
+
+static int
 hibernate_arena_pairs_bytes(const vm_paddr_t *pairs, size_t count,
     uint64_t *bytes)
 {
@@ -1093,10 +1128,14 @@ getmemsize(u_int64_t first)
 	vm_paddr_t pa, *physmap;
 	vm_paddr_t *local_phys_avail, *local_dump_avail;
 	vm_paddr_t *split_phys_avail, *split_dump_avail;
+	vm_paddr_t *stub_phys_avail, *stub_dump_avail;
 	vm_paddr_t arena_start, arena_end, msgbuf_start, msgbuf_end;
+	vm_paddr_t stub_start, stub_end;
 	vm_size_t arena_size;
 	size_t split_phys_count, split_dump_count;
-	uint64_t dump_after, dump_before, phys_after, phys_before;
+	size_t stub_phys_count, stub_dump_count;
+	uint64_t dump_after, dump_before, dump_stub_after;
+	uint64_t phys_after, phys_before, phys_stub_after;
 	int error;
 	u_long physmem_start, physmem_tunable, memtest;
 	pt_entry_t *pte;
@@ -1110,6 +1149,9 @@ getmemsize(u_int64_t first)
 	local_dump_avail = hibernate_boot_scratch.local_dump_avail;
 	split_phys_avail = hibernate_boot_scratch.split_phys_avail;
 	split_dump_avail = hibernate_boot_scratch.split_dump_avail;
+	stub_phys_avail = hibernate_boot_scratch.stub_phys_avail;
+	stub_dump_avail = hibernate_boot_scratch.stub_dump_avail;
+	stub_start = 0;
 	bzero(local_phys_avail,
 	    sizeof(hibernate_boot_scratch.local_phys_avail));
 	bzero(local_dump_avail,
@@ -1411,15 +1453,44 @@ do_next:
 		dump_before - dump_after != arena_size))
 		error = EINVAL;
 	if (error == 0)
+		error = hibernate_park_stub_select(split_phys_avail,
+		    split_phys_count, split_dump_avail, split_dump_count,
+		    &stub_start);
+	if (error == 0 &&
+	    __builtin_add_overflow(stub_start, HIBERNATE_PARK_STUB_BYTES,
+		&stub_end))
+		error = EOVERFLOW;
+	if (error == 0)
+		error = hibernate_arena_split_pairs(split_phys_avail,
+		    split_phys_count, stub_start, stub_end, stub_phys_avail,
+		    PHYS_AVAIL_ENTRIES, &stub_phys_count);
+	if (error == 0)
+		error = hibernate_arena_split_pairs(split_dump_avail,
+		    split_dump_count, stub_start, stub_end, stub_dump_avail,
+		    PHYS_AVAIL_ENTRIES, &stub_dump_count);
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(stub_phys_avail,
+		    stub_phys_count, &phys_stub_after);
+	if (error == 0)
+		error = hibernate_arena_pairs_bytes(stub_dump_avail,
+		    stub_dump_count, &dump_stub_after);
+	if (error == 0 &&
+	    (phys_after < phys_stub_after || dump_after < dump_stub_after ||
+		phys_after - phys_stub_after != HIBERNATE_PARK_STUB_BYTES ||
+		dump_after - dump_stub_after != HIBERNATE_PARK_STUB_BYTES))
+		error = EINVAL;
+	if (error == 0)
 		error = hibernate_arena_reserve(arena_start, arena_size);
+	if (error == 0)
+		error = hibernate_park_stub_reserve(stub_start);
 
 	bzero(phys_avail, PHYS_AVAIL_ENTRIES * sizeof(phys_avail[0]));
 	bzero(dump_avail, PHYS_AVAIL_ENTRIES * sizeof(dump_avail[0]));
 	if (error == 0) {
-		bcopy(split_phys_avail, phys_avail,
-		    split_phys_count * sizeof(split_phys_avail[0]));
-		bcopy(split_dump_avail, dump_avail,
-		    split_dump_count * sizeof(split_dump_avail[0]));
+		bcopy(stub_phys_avail, phys_avail,
+		    stub_phys_count * sizeof(stub_phys_avail[0]));
+		bcopy(stub_dump_avail, dump_avail,
+		    stub_dump_count * sizeof(stub_dump_avail[0]));
 		printf("hibernate arena rule %u required %ju start %#jx "
 		    "size %ju\n", HIBERNATE_ARENA_RULE_VERSION,
 		    (uintmax_t)arena_size, (uintmax_t)arena_start,

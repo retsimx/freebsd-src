@@ -112,6 +112,40 @@ extern char hibernate_tramp_both_domain_page[];
 extern char hibernate_tramp_saved_domain_stub[];
 
 /*
+ * K-23 AP park stub (sys/amd64/amd64/hibernate_park_tramp.S).
+ * hibernate_machdep_prepare() copies [hibernate_park_tramp_start,
+ * hibernate_park_tramp_end) into the claimed below-1-MiB park-stub page
+ * (ha_park_stub_pa) and patches the fixed HIBERNATE_PARK_TRAMP_PARAM_*
+ * parameter block below at its documented offsets.
+ */
+extern char hibernate_park_tramp_start[];
+extern char hibernate_park_tramp_end[];
+extern uint32_t hibernate_park_tramp_size;
+
+/*
+ * K-23 AP park-stub parameter-block ABI.  hibernate_park_tramp.S documents
+ * and .set-defines these identical offsets (relative to
+ * hibernate_park_tramp_start); keep both definitions in sync.
+ */
+#define	HIBERNATE_PARK_TRAMP_PARAM_STATE_PA		0xf00
+#define	HIBERNATE_PARK_TRAMP_PARAM_STACK_TOP_PA	0xf08
+#define	HIBERNATE_PARK_TRAMP_PARAM_HEADER_PA		0xf10
+#define	HIBERNATE_PARK_TRAMP_PARAM_SAVED_CR3_PA	0xf18
+#define	HIBERNATE_PARK_TRAMP_PARAM_EXPECTED_SEQ	0xf20
+#define	HIBERNATE_PARK_TRAMP_PARAM_CPU			0xf24
+#define	HIBERNATE_PARK_TRAMP_PARAM_END			0xf28
+
+/*
+ * hibernate_resume_ap_entry: the park stub's post-release C entry (K23-T08).
+ * Establishes exactly the fields the K23-T00 precondition audit marks
+ * "must be established" (saved CR3 already loaded by the caller; GDTR,
+ * IDTR, FSBASE/GSBASE/KGSBASE, TR, and pc_curthread = pc_idlethread), then
+ * transfers to the existing, already-safe sched_ap_entry() tail of AP
+ * bring-up.  Never returns.
+ */
+void hibernate_resume_ap_entry(u_int cpu) __dead2;
+
+/*
  * K-6: live amd64 XSAVE fact collection and canonical PCB population.
  *
  * hibernate_amd64_xsave_collect() validates the live XCR0 against

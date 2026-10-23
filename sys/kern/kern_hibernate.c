@@ -59,8 +59,10 @@
 #include <sys/vmmeter.h>
 
 #include <machine/atomic.h>
+#include <machine/cpu.h>
 #include <machine/hibernate.h>
 #include <machine/md_var.h>
+#include <machine/smp.h>
 #include <machine/vmparam.h>
 
 #include <cam/cam.h>
@@ -266,6 +268,7 @@ hibernate_arena_required(struct hibernate_arena_sizing *sizing)
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_HEADER_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_TRAMPOLINE_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_STACK_BYTES);
+	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_PARK_STACK_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(local.has_private_page_tables);
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_HANDOFF_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(local.has_descriptor_storage);
@@ -580,6 +583,48 @@ hibernate_arena_reserve(vm_paddr_t pa, vm_size_t size)
 	g_hibernate_early_arena.hea_rule_version = HIBERNATE_ARENA_RULE_VERSION;
 	g_hibernate_early_arena.hea_claimed = false;
 	g_hibernate_early_arena.hea_valid = true;
+	return (0);
+}
+
+int
+hibernate_park_stub_reserve(vm_paddr_t pa)
+{
+	vm_paddr_t end;
+
+	if (pa == 0 ||
+	    (pa & (HIBERNATE_ARENA_ALIGNMENT - 1)) != 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(pa, HIBERNATE_PARK_STUB_BYTES, &end))
+		return (EOVERFLOW);
+	if (end > UINT64_C(0x100000))
+		return (EINVAL);
+	if (g_hibernate_early_arena.hea_stub_valid) {
+		if (g_hibernate_early_arena.hea_stub_start == pa)
+			return (0);
+		return (EBUSY);
+	}
+	g_hibernate_early_arena.hea_stub_start = pa;
+	g_hibernate_early_arena.hea_stub_valid = true;
+	return (0);
+}
+
+int
+hibernate_park_stub_claim(struct hibernate_attempt *ha)
+{
+	if (ha == NULL)
+		return (EINVAL);
+	if (ha->ha_has_park_stub || ha->ha_park_stub_pa != 0) {
+		if (ha->ha_has_park_stub &&
+		    g_hibernate_early_arena.hea_stub_valid &&
+		    ha->ha_park_stub_pa ==
+			g_hibernate_early_arena.hea_stub_start)
+			return (0);
+		return (EINVAL);
+	}
+	if (!g_hibernate_early_arena.hea_stub_valid)
+		return (EINVAL);
+	ha->ha_park_stub_pa = g_hibernate_early_arena.hea_stub_start;
+	ha->ha_has_park_stub = true;
 	return (0);
 }
 
@@ -1632,7 +1677,7 @@ static SYSCTL_NODE(_debug, OID_AUTO, hibernate, CTLFLAG_RW | CTLFLAG_MPSAFE,
     0, "Hibernate debugging");
 static int hibernate_k12_inject;
 SYSCTL_INT(_debug_hibernate, OID_AUTO, k12_inject, CTLFLAG_RW,
-    &hibernate_k12_inject, 0, "One-shot K-12 fault injection (1-8)");
+    &hibernate_k12_inject, 0, "One-shot K-12/K-23 fault injection (1-12)");
 
 static bool
 hibernate_k12_inject_once(int value)
@@ -5040,6 +5085,238 @@ hibernate_restart_cpus(cpuset_t acknowledged)
 #endif
 }
 
+/*
+ * K23-T09: phase-2 ipi_startup() dispatch/PARK_READY poll and the
+ * saved-kernel-side release call (D040 SS4.6, SS5, SS7, SS8.2; K23-T02
+ * terminality audit; K23-T06 arbitration verdict item 9).
+ */
+#ifdef _KERNEL
+static void
+hibernate_resume_park_terminal(const char *stage, int error)
+{
+	printf("hibernate: k23: %s terminal fail %d\n", stage, error);
+	panic("hibernate: k23: %s terminal failure", stage);
+}
+
+/*
+ * hibernate_park_dispatch: dispatch ipi_startup() to the phase-1-
+ * acknowledged AP set as a single, tight group operation -- no
+ * intervening long waits (D040 SS8.2) -- recording the committed subset
+ * in a stack-local cpuset_t (never persisted to *ha, matching design
+ * 038 SS7.6's D11 rule), then poll the header-resident park-state word
+ * for verified PARK_READY (matching sequence), bounded by an
+ * SMP_STOP_DEADLINE-class absolute deadline per acknowledged AP.
+ * atomic_store_rel_32()/atomic_load_acq_32() match
+ * stop_cpus_deadline()/restart_cpus_deadline()'s own idiom
+ * (sys/kern/subr_smp.c); no additional fence is needed (K23-T06
+ * arbitration verdict item 9/Q5: plain mov is TSO-sufficient here).
+ *
+ * Terminality (K23-T02): an AP never added to the committed set -- only
+ * reachable under fault injection (point 9); D040 SS8.2 notes the
+ * normal, single-group-dispatch flow makes committed == acknowledged as
+ * one unit -- is phase-1-class: its failure returns ETIMEDOUT/EIO for
+ * the existing goto cleanup path, unchanged.  A committed AP's failure
+ * is phase-2-committed and terminal: hibernate_restart_cpus() cannot
+ * recover an AP that ipi_startup() has already redirected out of
+ * cpustop_handler()'s spin loop (K23-T02 SS2).  A committed-AP terminal
+ * failure never returns.
+ *
+ * Returns 0 iff every acknowledged AP reaches verified PARK_READY;
+ * otherwise an uncommitted-AP errno (ETIMEDOUT or EIO) for the caller's
+ * existing goto cleanup path.
+ */
+static int
+hibernate_park_dispatch(struct hibernate_attempt *ha, cpuset_t acknowledged)
+{
+	cpuset_t committed;
+	volatile struct hibernate_park_state *park;
+	vm_paddr_t state_pa;
+	sbintime_t deadline;
+	int cpu, error;
+	uint32_t seq, state;
+	bool committed_cpu;
+#ifdef INVARIANTS
+	bool force_deadline, force_mismatch, force_terminal;
+#endif
+
+	CPU_ZERO(&committed);
+	if (CPU_EMPTY(&acknowledged))
+		return (0);
+	if (ha->ha_arena_start == 0 || !ha->ha_has_park_stub)
+		return (EINVAL);
+
+	state_pa = ha->ha_arena_start + HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0;
+	park = (volatile struct hibernate_park_state *)PHYS_TO_DMAP(state_pa);
+
+	/* Dispatch to the entire acknowledged set as one tight group. */
+	CPU_FOREACH_ISSET(cpu, &acknowledged) {
+		ipi_startup(cpu_apic_ids[cpu],
+		    (int)((ha->ha_park_stub_pa >> 12) & 0xff));
+		CPU_SET(cpu, &committed);
+	}
+
+	/* Poll every acknowledged AP for verified PARK_READY. */
+	CPU_FOREACH_ISSET(cpu, &acknowledged) {
+		committed_cpu = CPU_ISSET(cpu, &committed);
+#ifdef INVARIANTS
+		/*
+		 * Point 9 (phase-1-class deadline): force this AP to be
+		 * treated as never committed, exercising the existing
+		 * goto-cleanup path even though ipi_startup() was, in
+		 * reality, already sent to it.
+		 */
+		force_deadline = hibernate_k12_inject_once(9);
+		if (force_deadline)
+			committed_cpu = false;
+		/*
+		 * Point 11 (sequence mismatch): deterministic EIO on the
+		 * first check.  committed_cpu is left at its real value,
+		 * so whether this resolves via cleanup or terminal follows
+		 * the real commit-point rule (D040 SS7's dual-outcome row),
+		 * which in this single-group-dispatch implementation is
+		 * always "after commit" in practice (SS8.2).
+		 */
+		force_mismatch = hibernate_k12_inject_once(11);
+		/*
+		 * Point 12 (phase-2-committed PARK_READY failure,
+		 * terminal): force failure unconditionally on a normally
+		 * committed AP, deterministically exercising the terminal
+		 * path.
+		 */
+		force_terminal = hibernate_k12_inject_once(12);
+#endif
+		deadline = sbinuptime() + HIBERNATE_PARK_READY_SBT;
+		error = 0;
+		for (;;) {
+			seq = atomic_load_acq_32(&park->hps_sequence);
+			state = atomic_load_acq_32(&park->hps_state);
+#ifdef INVARIANTS
+			if (force_mismatch) {
+				error = EIO;
+				break;
+			}
+#endif
+			if (seq == 1 && state == HIBERNATE_PARK_READY)
+				break;
+			if (sbinuptime() >= deadline) {
+				error = ETIMEDOUT;
+				break;
+			}
+			cpu_spinwait();
+		}
+#ifdef INVARIANTS
+		if (force_deadline && error == 0)
+			error = ETIMEDOUT;
+		if (force_terminal)
+			error = ETIMEDOUT;
+#endif
+		if (error != 0) {
+			if (!committed_cpu)
+				return (error);
+			hibernate_resume_park_terminal("park-ready", error);
+			/* NOTREACHED */
+		}
+	}
+	return (0);
+}
+#endif /* _KERNEL */
+
+int
+hibernate_resume_park_release(cpuset_t target)
+{
+#ifdef _KERNEL
+	volatile struct hibernate_park_state *park;
+	vm_paddr_t state_pa;
+	sbintime_t deadline;
+	int cpu;
+	uint32_t seq, state;
+	bool found;
+
+	if (CPU_EMPTY(&target))
+		return (0);
+
+	/*
+	 * Derive the sole targeted AP from live mp_ncpus/cpu_apic_ids[],
+	 * never a restored cpuset global: this function executes in the
+	 * saved kernel's own context, where any restore-kernel-side cpuset
+	 * record (e.g. the file-static hibernate_k12_cpus) is stale,
+	 * overwritten saved-kernel bytes, not live state.  D040 SS14.2's
+	 * mp_ncpus == 2 singleton model means exactly one non-BSP CPU is
+	 * ever targeted; the single park word is not itself per-CPU
+	 * addressed, so only membership (any live non-BSP CPU in target)
+	 * matters here.
+	 */
+	found = false;
+	for (cpu = 0; cpu < mp_ncpus; cpu++) {
+		if (cpu != PCPU_GET(cpuid) && CPU_ISSET(cpu, &target)) {
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return (0);
+
+	/*
+	 * g_hibernate_early_arena is this (saved) kernel's own instance,
+	 * populated at its own original boot via hibernate_arena_derive()/
+	 * hibernate_arena_reserve().  Save and restore boots derive the
+	 * identical arena tuple deterministically from the firmware memory
+	 * map (resume-protocol.md "Arena"), so reading it directly here --
+	 * rather than any restore-kernel-side hibernate_attempt, which no
+	 * longer exists in this kernel's lifetime -- is the designed
+	 * mechanism (D040 SS4.4).
+	 */
+	if (!g_hibernate_early_arena.hea_valid ||
+	    g_hibernate_early_arena.hea_start == 0)
+		return (EINVAL);
+	state_pa = g_hibernate_early_arena.hea_start +
+	    HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0;
+	park = (volatile struct hibernate_park_state *)PHYS_TO_DMAP(state_pa);
+
+	/*
+	 * Write the incremented sequence first, then PARK_RELEASE
+	 * (sequence-before-state release ordering, D040 SS5.2 step 4),
+	 * both via atomic_store_rel_32(); no additional fence is needed
+	 * (K23-T06 arbitration verdict item 9/Q5).
+	 */
+	atomic_store_rel_32(&park->hps_sequence, 2);
+	atomic_store_rel_32(&park->hps_state, HIBERNATE_PARK_RELEASE);
+
+	/*
+	 * Bounded post-release wait: this ABI has no AP-to-BSP
+	 * acknowledgement word (D040 SS5.1-SS5.2 deliberately define
+	 * exactly three states, no fourth), so this cannot prove the AP
+	 * reached the scheduler -- that remains explicitly unverified in
+	 * this session, per D040 SS9.  What it does prove, within the
+	 * bound, is that the just-written release word was not
+	 * subsequently corrupted or overwritten; any such corruption, or
+	 * the injected test condition below, is terminal (D040 SS5.5: a
+	 * post-release failure is unrecoverable -- there is no pre-RESTORE
+	 * cleanup path left at this point).
+	 */
+	deadline = sbinuptime() + HIBERNATE_PARK_RELEASE_SBT;
+	for (;;) {
+		seq = atomic_load_acq_32(&park->hps_sequence);
+		state = atomic_load_acq_32(&park->hps_state);
+		if (seq == 2 && state == HIBERNATE_PARK_RELEASE)
+			break;
+#ifdef INVARIANTS
+		if (hibernate_k12_inject_once(10))
+			hibernate_resume_park_terminal("post-release",
+			    ETIMEDOUT);
+#endif
+		if (sbinuptime() >= deadline)
+			hibernate_resume_park_terminal("post-release",
+			    ETIMEDOUT);
+		cpu_spinwait();
+	}
+	return (0);
+#else
+	(void)target;
+	return (ENOTSUP);
+#endif
+}
+
 #ifdef _KERNEL
 static int
 hibernate_coordinator_probe(struct hibernate_attempt *ha)
@@ -5523,6 +5800,15 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		if (error == 0)
 			ha->ha_has_arena = true;
 	}
+	if (error == 0) {
+		/*
+		 * K23-T08: claim the separately reserved, below-1-MiB K-23
+		 * AP park-stub exclusion region alongside the K-9 arena.
+		 * hibernate_machdep_prepare()'s phase-1 proofs (verdict item
+		 * 4/5) require ha_park_stub_pa to already be populated.
+		 */
+		error = hibernate_park_stub_claim(ha);
+	}
 	if (error == 0)
 		error = hibernate_image_validate(ha);
 	hibernate_resume_stage_record(stage);
@@ -5606,7 +5892,21 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	if (inject_after_stop)
 		goto cleanup;
 #endif
+	/*
+	 * K23-T09 phase-2 seam (K23-T06 arbitration verdict; D040 SS4.6,
+	 * SS5, SS7, SS8.2): dispatch ipi_startup()-based AP park and poll
+	 * for verified PARK_READY, between hibernate_stop_cpus() having
+	 * succeeded and intr_disable()/hibernate_machdep_enter() below.  An
+	 * uncommitted-AP failure (phase-1-class) falls through to the
+	 * existing goto cleanup, unchanged; a committed AP's failure is
+	 * terminal inside hibernate_park_dispatch() itself and never
+	 * returns (K23-T02).
+	 */
 #ifdef _KERNEL
+	error = hibernate_park_dispatch(ha, acknowledged);
+	if (error != 0)
+		goto cleanup;
+
 	(void)intr_disable();
 #endif
 	hibernate_machdep_enter();

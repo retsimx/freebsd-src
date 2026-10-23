@@ -733,6 +733,12 @@ ATF_TC_BODY(read_metadata_nonzero_mediaoffset, tc)
 
 #define COORD_VALID_ARENA_START	UINT64_C(0x200000)
 #define COORD_VALID_ARENA_SIZE	UINT64_C(0x400000)
+/*
+ * K-23: a below-1-MiB, page-aligned, arena-disjoint park-stub page these
+ * fixtures must reserve before hibernate_resume_attempt() reaches VALIDATE,
+ * since hibernate_park_stub_claim() now runs alongside the K-9 arena claim.
+ */
+#define COORD_VALID_PARK_STUB_PA	UINT64_C(0x9000)
 
 static int
 coord_cpu_validate(const struct hibernate_pcb *pcb, bool *refuse_la57,
@@ -799,6 +805,8 @@ ATF_TC_BODY(coordinator_destination_coalescing, tc)
 	hibernate_arena_reset();
 	ATF_REQUIRE_EQ(0, hibernate_arena_reserve(COORD_VALID_ARENA_START,
 	    COORD_VALID_ARENA_SIZE));
+	ATF_REQUIRE_EQ(0,
+	    hibernate_park_stub_reserve(COORD_VALID_PARK_STUB_PA));
 
 	error = hibernate_resume_attempt(&f.ha);
 
@@ -1939,6 +1947,8 @@ full_chain_fixture_init(struct full_chain_fixture *ff, uint16_t n_loads)
 	hibernate_arena_reset();
 	ATF_REQUIRE_EQ(0, hibernate_arena_reserve(COORD_VALID_ARENA_START,
 	    COORD_VALID_ARENA_SIZE));
+	ATF_REQUIRE_EQ(0,
+	    hibernate_park_stub_reserve(COORD_VALID_PARK_STUB_PA));
 }
 
 static void
