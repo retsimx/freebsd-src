@@ -1123,13 +1123,43 @@ hibernate_md_private_leaf_requirement(const struct hibernate_attempt *ha,
 	}
 
 	/*
-	 * Scattered source pages: conservatively count every page as a
-	 * distinct 2 MiB region, matching the non-deduplicating treatment
-	 * of the other terms.
+	 * Scattered source pages: count the distinct 2 MiB regions the
+	 * vector's source PAs fall in, not the pages themselves.  The budget
+	 * (HIBERNATE_ARENA_PT_LEAF_PAGES) is a count of hmb_leaf[] entries,
+	 * and hibernate_md_private_leaf_get() allocates exactly one per
+	 * distinct 2 MiB base, so counting pages over-counts by up to the
+	 * 512-way PTE packing factor: a real 4 GiB image has ~255k source
+	 * pages but only ~0.5k regions, which made every real restore refuse
+	 * against a 4096 budget.
+	 *
+	 * hibernate_staging_source_pages() documents the vector as one
+	 * source PA per destination page, in destination order, and the
+	 * destination intervals are validated sorted and strictly
+	 * non-overlapping, so the source PAs ascend and one pass counts the
+	 * regions exactly.  If that ordering assumption is ever violated,
+	 * fall back to the previous page-counting over-count: it can only
+	 * over-state the requirement and refuse, never under-count and
+	 * overrun the budget mid-build.
 	 */
-	(void)vector;
-	if (__builtin_add_overflow(count, vector_count, &count))
-		return (EOVERFLOW);
+	if (vector_count != 0) {
+		if (vector == NULL)
+			return (EINVAL);
+		last_region = ~(vm_paddr_t)(NBPDR - 1);
+		for (i = 0; i < vector_count; i++) {
+			if (i != 0 && vector[i] < vector[i - 1]) {
+				if (__builtin_add_overflow(count, vector_count,
+					&count))
+					return (EOVERFLOW);
+				break;
+			}
+			region = vector[i] & ~(vm_paddr_t)(NBPDR - 1);
+			if (region != last_region) {
+				last_region = region;
+				if (__builtin_add_overflow(count, 1, &count))
+					return (EOVERFLOW);
+			}
+		}
+	}
 
 	/* Contiguous source-vector storage range. */
 	if (__builtin_mul_overflow(vector_pages, (uint64_t)HIB_PAGE_SIZE,
