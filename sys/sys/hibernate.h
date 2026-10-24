@@ -31,9 +31,11 @@ struct hibernate_arena_interval {
 
 struct hibernate_early_arena {
 	vm_paddr_t hea_start;
+	vm_paddr_t hea_stub_start;
 	vm_size_t hea_size;
 	uint32_t hea_rule_version;
 	bool hea_valid;
+	bool hea_stub_valid;
 	bool hea_claimed;
 };
 
@@ -54,6 +56,23 @@ struct hibernate_arena_packed_dtr {
 
 _Static_assert(sizeof(struct hibernate_arena_packed_dtr) == 10,
     "packed DTR must be 10 bytes");
+
+/*
+ * The park state occupies hah_reserved_0f0[0:8].  The sequence is monotonic
+ * and BSP-written; the state follows the HIBERNATE_PARK_* protocol below.
+ * hah_reserved_0f0[8:16] remains reserved and must be zero.
+ */
+struct hibernate_park_state {
+	uint32_t hps_sequence;
+	uint32_t hps_state;
+};
+
+#define	HIBERNATE_PARK_WAITING	0
+#define	HIBERNATE_PARK_READY	1
+#define	HIBERNATE_PARK_RELEASE	2
+
+_Static_assert(sizeof(struct hibernate_park_state) == 8,
+    "park state must occupy the first 8 reserved header bytes");
 
 struct hibernate_arena_header {
 	uint64_t hah_magic;
@@ -87,6 +106,10 @@ struct hibernate_arena_header {
 	uint64_t hah_instruction_page_pa;
 	uint64_t hah_terminal_flags;
 	uint64_t hah_saved_entry_rsp;
+	/*
+	 * Bytes [0:8] carry struct hibernate_park_state; bytes [8:16]
+	 * remain reserved and must be zero.
+	 */
 	uint8_t hah_reserved_0f0[16];
 } __aligned(64);
 
@@ -126,7 +149,12 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
 #define HIBERNATE_MAX_PHDRS	      900
 
-#define HIBERNATE_ARENA_RULE_VERSION	     2U
+/*
+ * Rule version 3 adds the arena-resident AP park stack and the header-resident
+ * park-state protocol.  Save and restore boots must agree on this version so
+ * they derive the same arena size, layout, and park-state interpretation.
+ */
+#define HIBERNATE_ARENA_RULE_VERSION	     3U
 #define HIBERNATE_ARENA_ALIGNMENT	     UINT64_C(4096)
 /*
  * Reserved arena span for the encoded transition-arena header (rule
@@ -162,6 +190,16 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_ARENA_TRAMPOLINE_BYTES \
 	(HIBERNATE_ARENA_TRAMPOLINE_PAGES * HIBERNATE_ARENA_ALIGNMENT)
 #define HIBERNATE_ARENA_STACK_BYTES	     UINT64_C(65536)
+/*
+ * Arena-resident stack used by an AP after release.  This is a real component
+ * of hibernate_arena_required()'s component sum.
+ */
+#define HIBERNATE_ARENA_PARK_STACK_BYTES     UINT64_C(4096)
+/*
+ * Separately reserved below 1 MiB for the SIPI park stub.  This exclusion
+ * region is not part of hibernate_arena_required()'s component sum.
+ */
+#define HIBERNATE_PARK_STUB_BYTES	     UINT64_C(4096)
 #define HIBERNATE_ARENA_HANDOFF_BYTES	     UINT64_C(4096)
 #define HIBERNATE_ARENA_COPY_RUN_MAX	     UINT64_C(900)
 #define HIBERNATE_ARENA_COPY_RUN_BYTES	     UINT64_C(32)
@@ -723,6 +761,14 @@ struct cam_sim;		/* Forward declaration; full type in cam/cam_sim.h. */
 #define	HIBERNATE_QS_OWNER_MASK	(HIBERNATE_QS_ARMED | HIBERNATE_QS_ROOT_SUSP)
 #define	HIBERNATE_Q_DRAIN_SBT	(5 * SBT_1S)
 #define	HIBERNATE_Q_SETTLE_SBT	(10 * SBT_1S)
+/*
+ * K23: SMP_STOP_DEADLINE-class absolute deadlines (sys/kern/subr_smp.c's
+ * own stop_cpus_deadline()/restart_cpus_deadline() idiom) for the phase-2
+ * ipi_startup()-dispatch PARK_READY poll and the post-release wait.  Not
+ * sysctl-tunable, matching SMP_STOP_DEADLINE itself.
+ */
+#define HIBERNATE_PARK_READY_SBT   (SBT_1S)
+#define HIBERNATE_PARK_RELEASE_SBT (SBT_1S)
 struct hibernate_qstate {
 	register_t qs_rflags;
 	uint32_t qs_stages;
@@ -762,7 +808,9 @@ struct hibernate_attempt {
 	uint64_t ha_dst_count;		/* Number of intervals (pairs/2). */
 	vm_paddr_t ha_arena_start;	/* Transition arena base address. */
 	uint64_t ha_arena_size;		/* Transition arena size in bytes. */
+	vm_paddr_t ha_park_stub_pa;	/* Below-1-MiB park-stub page. */
 	bool ha_dst_valid;		/* Destination view is published. */
+	bool ha_has_park_stub;		/* Park-stub exclusion is claimed. */
 
 	/*
 	 * K-5: CAM sim used for the hibernate dump path.
@@ -820,7 +868,9 @@ struct hibernate_attempt {
 		.ha_dst_count = 0,                              \
 		.ha_arena_start = 0,                            \
 		.ha_arena_size = 0,                             \
+		.ha_park_stub_pa = 0,                           \
 		.ha_dst_valid = false,                          \
+		.ha_has_park_stub = false,                      \
 		.ha_q = { 0 },                              \
 		.ha_cam_sim = NULL,                             \
 		.ha_marker_owned = HM_OWNED_NONE,               \
@@ -888,6 +938,8 @@ int hibernate_arena_split_pairs(const vm_paddr_t *input, size_t input_count,
     size_t output_capacity, size_t *output_count);
 void hibernate_arena_reset(void);
 int hibernate_arena_reserve(vm_paddr_t pa, vm_size_t size);
+int hibernate_park_stub_reserve(vm_paddr_t pa);
+int hibernate_park_stub_claim(struct hibernate_attempt *ha);
 int hibernate_arena_claim(struct hibernate_attempt *ha);
 void hibernate_arena_release(struct hibernate_attempt *ha);
 
@@ -1106,6 +1158,7 @@ int hibernate_quiesce(struct hibernate_attempt *ha);
 int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
 int hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged);
 int hibernate_restart_cpus(cpuset_t acknowledged);
+int hibernate_resume_park_release(cpuset_t target);
 
 /* K-8-owned stage functions (bodies in kern/kern_hibernate.c). */
 int hibernate_meta_read(struct hibernate_attempt *ha, void *meta_buf,
@@ -1663,6 +1716,10 @@ _Static_assert(sizeof(struct hibernate_arena_header) ==
 _Static_assert(_Alignof(struct hibernate_arena_header) ==
 	HIBERNATE_ARENA_HEADER_ALIGNMENT,
     "arena header native alignment");
+/*
+ * RESERVED_0F0 remains fully covered: its first 8 bytes carry
+ * struct hibernate_park_state and its final 8 bytes remain reserved-zero.
+ */
 _Static_assert(HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0 +
 	    HIBERNATE_ARENA_HEADER_WIDTH_RESERVED_0F0 ==
 	HIBERNATE_ARENA_HEADER_ENCODED_SIZE,

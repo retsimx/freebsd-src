@@ -22,12 +22,15 @@
  */
 #ifndef _HIBERNATE_LEAF_REQUIREMENT_TEST
 #include <sys/systm.h>
+#include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/endian.h>
 #include <sys/errno.h>
 #include <sys/hibernate.h>
 #include <sys/malloc.h>
 #include <sys/proc.h>
+#include <sys/sched.h>
+#include <sys/smp.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -44,6 +47,8 @@
 #include <machine/segments.h>
 #include <machine/specialreg.h>
 
+#include <x86/apicvar.h>
+#include <x86/mca.h>
 #include <x86/x86_var.h>
 #else
 #include <sys/hibernate.h>
@@ -405,6 +410,91 @@ hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb, bool *refuse_la57,
 }
 
 /*
+ * K23-T08: hibernate_resume_ap_entry() -- the AP park stub's post-release
+ * C entry (K23-T06 arbitration verdict item 1; K23-T00's "smallest
+ * sufficient register/field list").  Called by hibernate_park_tramp.S on
+ * the arena park stack, after CR0/CR3/CR4/EFER/PAT/XCR0 have already been
+ * restored from the saved domain and execution has reached 64-bit mode
+ * under hah_saved_cr3_pa.
+ *
+ * Establishes exactly the fields K23-T00 marks "must be established":
+ * GDTR, IDTR, FSBASE/GSBASE/KGSBASE, TR, and pc_curthread = pc_idlethread.
+ * Every other field pcpu_find(cpu) exposes is already valid post-copy,
+ * restored by the K-10 destructive copy itself, and must not be
+ * reinitialised here: this function must never call pcpu_init(),
+ * dpcpu_init(), sched_init_ap(), fpuinit(), cpu_setregs(),
+ * initializecpu(), pmap_activate_boot(), init_secondary(), or
+ * init_secondary_tail().
+ *
+ * K23-T06 arbitration verdict item 6 (and its addendum to the K23-T00
+ * audit): INIT/SIPI resets per-CPU hardware state beyond what T00's list
+ * restores.  The following idempotent, register/MSR-only writes repair
+ * that state: the SYSCALL MSRs (amd64_conf_fast_syscall()), the
+ * memory-control MSRs (amd64_cpu_init_msr_memctl()), the FRED stack/
+ * config MSRs plus CR4.FRED when the saved kernel ran with FRED
+ * (amd64_cpu_init_fred() -- the park stub deliberately withheld
+ * CR4.FRED from its own 32-bit control-state restore, per the verdict's
+ * item 2 and D040 SS14.1 item 2; amd64_cpu_init_fred() is the first and
+ * only place CR4.FRED is set), and LAPIC re-enable (lapic_xapic_mode(),
+ * lapic_setup(1) -- INIT software-disables the LAPIC) plus mca_init()
+ * (MCA banks, also reset by INIT).  Without these the AP gets no timer
+ * and no IPIs, so sched_ap_entry() cannot make progress.  None of these
+ * writes pc_sched, the idle thread's td_lock or machine context, run
+ * queues, curpcb, fpcurthread, scheduler_stopped, stopped_cpus,
+ * started_cpus, smp_cpus, or smp_started -- T00's prohibition on
+ * re-initialising those is unextended by this addition.
+ *
+ * pc_curthread is set immediately after GSBASE is valid (matching
+ * init_secondary_tail()'s own relative ordering, sys/x86/x86/mp_x86.c)
+ * so mca_init()/lapic_setup(1) observe a valid curthread, exactly as
+ * they do on ordinary AP bring-up.
+ *
+ * Also owned by K23-T09, elsewhere: the NMI window
+ * (sys/amd64/amd64/hibernate_park_tramp.S) and the acquire/release
+ * discipline on the BSP side (sys/kern/kern_hibernate.c).
+ *
+ * Never returns.
+ */
+void
+hibernate_resume_ap_entry(u_int cpu)
+{
+	struct pcpu *pc;
+	struct region_descriptor gdtr;
+
+	pc = pcpu_find(cpu);
+	if (pc == NULL)
+		panic("hibernate: resume AP %u has no pcpu", cpu);
+
+	gdtr.rd_limit = NGDT * sizeof(pc->pc_gdt[0]) - 1;
+	gdtr.rd_base = (u_long)pc->pc_gdt;
+	lgdt(&gdtr);
+
+	wrmsr(MSR_FSBASE, 0);
+	wrmsr(MSR_GSBASE, (uint64_t)pc);
+	wrmsr(MSR_KGSBASE, 0);
+
+	pc->pc_curthread = pc->pc_idlethread;
+
+	if (fred)
+		amd64_cpu_init_fred();
+	else
+		lidt(&r_idt);
+
+	amd64_cpu_init_msr_memctl();
+
+	ltr(GSEL(GPROC0_SEL, SEL_KPL));
+
+	amd64_conf_fast_syscall();
+
+	lapic_xapic_mode();
+	mca_init();
+	lapic_setup(1);
+
+	sched_ap_entry();
+	panic("hibernate: sched_ap_entry returned to %s", __func__);
+}
+
+/*
  * K-10: hibernate_machdep_prepare() (issue #12, Design 036 SS5.3-5.8).
  *
  * hibernate_tramp_entry is the no-return assembly entry point task-5 (new
@@ -477,6 +567,8 @@ struct hibernate_md_arena_layout {
 	vm_paddr_t
 	    trampoline_pa;   /* HIBERNATE_ARENA_TRAMPOLINE_BYTES: copied code. */
 	vm_paddr_t stack_pa; /* 65536 B: arena stack. */
+	/* HIBERNATE_ARENA_PARK_STACK_BYTES: AP park stack. */
+	vm_paddr_t park_stack_pa;
 	vm_paddr_t private_pt_pa; /* 29 pages: private CR3 PML4/PDPT/PD. */
 	vm_paddr_t handoff_pa;	  /* 4096 B: encoded handoff record. */
 	vm_paddr_t run_table_pa;  /* Coalesced destination run table. */
@@ -513,6 +605,8 @@ hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
 	off += HIBERNATE_ARENA_TRAMPOLINE_BYTES;
 	out->stack_pa = off;
 	off += HIBERNATE_ARENA_STACK_BYTES;
+	out->park_stack_pa = off;
+	off += HIBERNATE_ARENA_PARK_STACK_BYTES;
 	out->private_pt_pa = off;
 	off += sizing.has_private_page_tables;
 	out->handoff_pa = off;
@@ -1029,13 +1123,43 @@ hibernate_md_private_leaf_requirement(const struct hibernate_attempt *ha,
 	}
 
 	/*
-	 * Scattered source pages: conservatively count every page as a
-	 * distinct 2 MiB region, matching the non-deduplicating treatment
-	 * of the other terms.
+	 * Scattered source pages: count the distinct 2 MiB regions the
+	 * vector's source PAs fall in, not the pages themselves.  The budget
+	 * (HIBERNATE_ARENA_PT_LEAF_PAGES) is a count of hmb_leaf[] entries,
+	 * and hibernate_md_private_leaf_get() allocates exactly one per
+	 * distinct 2 MiB base, so counting pages over-counts by up to the
+	 * 512-way PTE packing factor: a real 4 GiB image has ~255k source
+	 * pages but only ~0.5k regions, which made every real restore refuse
+	 * against a 4096 budget.
+	 *
+	 * hibernate_staging_source_pages() documents the vector as one
+	 * source PA per destination page, in destination order, and the
+	 * destination intervals are validated sorted and strictly
+	 * non-overlapping, so the source PAs ascend and one pass counts the
+	 * regions exactly.  If that ordering assumption is ever violated,
+	 * fall back to the previous page-counting over-count: it can only
+	 * over-state the requirement and refuse, never under-count and
+	 * overrun the budget mid-build.
 	 */
-	(void)vector;
-	if (__builtin_add_overflow(count, vector_count, &count))
-		return (EOVERFLOW);
+	if (vector_count != 0) {
+		if (vector == NULL)
+			return (EINVAL);
+		last_region = ~(vm_paddr_t)(NBPDR - 1);
+		for (i = 0; i < vector_count; i++) {
+			if (i != 0 && vector[i] < vector[i - 1]) {
+				if (__builtin_add_overflow(count, vector_count,
+					&count))
+					return (EOVERFLOW);
+				break;
+			}
+			region = vector[i] & ~(vm_paddr_t)(NBPDR - 1);
+			if (region != last_region) {
+				last_region = region;
+				if (__builtin_add_overflow(count, 1, &count))
+					return (EOVERFLOW);
+			}
+		}
+	}
 
 	/* Contiguous source-vector storage range. */
 	if (__builtin_mul_overflow(vector_pages, (uint64_t)HIB_PAGE_SIZE,
@@ -1794,6 +1918,50 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		return (EINVAL);
 
 	/*
+	 * K23-T06 arbitration verdict, "Ordered changes required" item 4:
+	 * refuse unless this is the exact 2-vCPU topology K-23's AP park
+	 * stub is scoped to (D040 SS1; verdict Q6 item 1).  Per-AP park
+	 * slots are a separate design change this task does not implement.
+	 * This refusal, and the one that follows, run pre-jump (inside
+	 * hibernate_machdep_prepare()) and before any ipi_startup()
+	 * dispatch, so both are phase-1 "goto cleanup" refusals, never a
+	 * terminal halt/reset.
+	 */
+	if (mp_ncpus != 2) {
+		printf("hibernate: K-23 AP park stub requires exactly 2 "
+		       "CPUs (mp_ncpus %d); refusing\n",
+		    mp_ncpus);
+		return (ENOTSUP);
+	}
+
+	/*
+	 * K23-T06 arbitration verdict item 5 (Q6 item 3): prove the claimed
+	 * below-1-MiB park-stub page does not intersect any K-10 destination
+	 * run.  The stub executes from this page while the BSP's K-10 copy
+	 * is in flight; if the saved image's own destination set includes
+	 * this physical page, the copy would overwrite live, currently
+	 * executing AP code.  ha_park_stub_pa is claimed by
+	 * hibernate_park_stub_claim(), called by the resume stage machine
+	 * alongside hibernate_arena_claim() before this function runs.
+	 */
+	if (!ha->ha_has_park_stub || ha->ha_park_stub_pa == 0)
+		return (EINVAL);
+	for (di = 0; di < ha->ha_dst_count; di++) {
+		if (ha->ha_park_stub_pa <
+			ha->ha_dst_intervals[di * 2 + 1] &&
+		    ha->ha_dst_intervals[di * 2] <
+			ha->ha_park_stub_pa + HIBERNATE_PARK_STUB_BYTES) {
+			printf("hibernate: K-23 park-stub page %#jx "
+			       "intersects destination run [%#jx, %#jx); "
+			       "refusing\n",
+			    (uintmax_t)ha->ha_park_stub_pa,
+			    (uintmax_t)ha->ha_dst_intervals[di * 2],
+			    (uintmax_t)ha->ha_dst_intervals[di * 2 + 1]);
+			return (EINVAL);
+		}
+	}
+
+	/*
 	 * K-10 source-page accessor (companion amendment,
 	 * sys/kern/kern_hibernate.c).
 	 */
@@ -1936,6 +2104,52 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		return (error);
 
 	/*
+	 * K23-T06 arbitration verdict item 3 (Q3): prove, rather than
+	 * assume, that the K-23 park stub and arena park stack are both
+	 * identity-mapped V|RW under the saved domain (kernel_pmap->pm_cr3)
+	 * before the park stub can ever rely on either translation.  Both
+	 * pages are expected to be covered by hibernate_setup_identity_map()'s
+	 * PML4[0] 2 MiB identity leaves (installed on the save path and
+	 * restored verbatim by the K-10 copy), but -- exactly as this
+	 * function already does for the trampoline stub, handoff source,
+	 * saved PCB, and restore-kernel VAs above -- that coverage is proven
+	 * here, not assumed.  These are checks on the existing saved-domain
+	 * tree built by hibernate_setup_identity_map(); no new mapping is
+	 * installed for either page.  The stub page additionally must show
+	 * PG_NX clear, since the park stub executes there.
+	 */
+	if (!hibernate_md_walk_matches(kernel_pmap->pm_cr3,
+		(vm_offset_t)ha->ha_park_stub_pa, ha->ha_park_stub_pa,
+		X86_PG_V | X86_PG_RW)) {
+		printf("hibernate: K-23 park-stub page %#jx is not "
+		       "identity-mapped V|RW under the saved domain; "
+		       "refusing\n",
+		    (uintmax_t)ha->ha_park_stub_pa);
+		return (EIO);
+	}
+	{
+		struct hibernate_md_walk stub_walk;
+
+		if (!hibernate_md_tree_walk(kernel_pmap->pm_cr3,
+			(vm_offset_t)ha->ha_park_stub_pa, &stub_walk) ||
+		    (stub_walk.hmw_flags & X86_PG_NX) != 0) {
+			printf("hibernate: K-23 park-stub page %#jx is "
+			       "NX under the saved domain; refusing\n",
+			    (uintmax_t)ha->ha_park_stub_pa);
+			return (EIO);
+		}
+	}
+	if (!hibernate_md_walk_matches(kernel_pmap->pm_cr3,
+		(vm_offset_t)layout.park_stack_pa, layout.park_stack_pa,
+		X86_PG_V | X86_PG_RW)) {
+		printf("hibernate: K-23 arena park-stack page %#jx is not "
+		       "identity-mapped V|RW under the saved domain; "
+		       "refusing\n",
+		    (uintmax_t)layout.park_stack_pa);
+		return (EIO);
+	}
+
+	/*
 	 * Compare through the actual private identity and saved-domain virtual
 	 * aliases.  Mapping validation above independently proved the identity
 	 * alias resolves to layout.trampoline_pa and the saved alias resolves
@@ -2061,6 +2275,65 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	    HIBERNATE_ARENA_HEADER_ENCODED_SIZE, &hah);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * K23-T06 arbitration verdict item 6 (D040 SS8.3): write the K-23 AP
+	 * park stub image and its parameter block into the reserved,
+	 * already-claimed, already-identity-proven below-1-MiB stub page via
+	 * PHYS_TO_DMAP(), mirroring this function's own trampoline-copy
+	 * pattern above.  Initialise the park-state word -- the first 8
+	 * bytes of the just-encoded header's hah_reserved_0f0 -- to
+	 * {sequence = 1, state = WAITING}, leaving bytes [8:16] zero exactly
+	 * as hibernate_arena_header_encode() already left them via its own
+	 * initial zero-fill (that function does not itself encode
+	 * hah_reserved_0f0; this is the sole writer of its first 8 bytes).
+	 */
+	{
+		uint8_t *park_buf;
+		uint64_t park_state_pa, park_stack_top;
+		u_int park_cpu;
+
+		if (hibernate_park_tramp_size == 0 ||
+		    hibernate_park_tramp_size > HIBERNATE_PARK_STUB_BYTES)
+			return (E2BIG);
+		park_buf = (uint8_t *)PHYS_TO_DMAP(ha->ha_park_stub_pa);
+		bcopy((const void *)hibernate_park_tramp_start, park_buf,
+		    hibernate_park_tramp_size);
+
+		/*
+		 * mp_ncpus == 2 is already enforced above; the sole AP is
+		 * the one cpu id below mp_ncpus that is not this, currently
+		 * executing, BSP.
+		 */
+		for (park_cpu = 0; park_cpu < (u_int)mp_ncpus; park_cpu++) {
+			if (park_cpu != PCPU_GET(cpuid))
+				break;
+		}
+		if (park_cpu >= (u_int)mp_ncpus)
+			return (EINVAL);
+
+		park_state_pa = layout.header_pa +
+		    HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0;
+		park_stack_top = layout.park_stack_pa +
+		    HIBERNATE_ARENA_PARK_STACK_BYTES;
+
+		le64enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_STATE_PA,
+		    park_state_pa);
+		le64enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_STACK_TOP_PA,
+		    park_stack_top);
+		le64enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_HEADER_PA,
+		    layout.header_pa);
+		le64enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_SAVED_CR3_PA,
+		    kernel_pmap->pm_cr3);
+		le32enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_EXPECTED_SEQ, 1);
+		le32enc(park_buf + HIBERNATE_PARK_TRAMP_PARAM_CPU, park_cpu);
+
+		le32enc(header_buf + HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0,
+		    1);
+		le32enc(header_buf + HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0 +
+			4,
+		    HIBERNATE_PARK_WAITING);
+	}
 
 	/*
 	 * Final prepare-to-enter integrity proof.  The executable page must
