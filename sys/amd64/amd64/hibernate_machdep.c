@@ -1613,6 +1613,122 @@ hibernate_md_saved_domain_table_disjoint(const struct hibernate_attempt *ha,
 }
 
 /*
+ * K23-T13: map a destination physical page to its index in the source-vector
+ * order (one entry per destination page, in ascending destination-interval
+ * order).
+ */
+static int
+hibernate_md_dst_page_index(const struct hibernate_attempt *ha, vm_paddr_t pa,
+    uint64_t *idx)
+{
+	uint64_t i, acc, start, end;
+
+	acc = 0;
+	for (i = 0; i < ha->ha_dst_count; i++) {
+		start = ha->ha_dst_intervals[i * 2];
+		end = ha->ha_dst_intervals[i * 2 + 1];
+		if (pa >= start && pa < end) {
+			*idx = acc + (pa - start) / HIB_PAGE_SIZE;
+			return (0);
+		}
+		acc += (end - start) / HIB_PAGE_SIZE;
+	}
+	return (ENOENT);
+}
+
+/*
+ * K23-T13: make the destructive copy skip a resume-side page-table page by
+ * pointing its source-vector entry at the destination page itself.  The
+ * trampoline copies one page per entry, so a self-copy is a no-op and the
+ * page's contents survive; destination/source/run-table counts stay exactly
+ * as the image declares them.
+ */
+static int
+hibernate_md_selfcopy_page(const struct hibernate_attempt *ha,
+    vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t page, bool *did)
+{
+	uint64_t idx;
+	int error;
+
+	if (!hib_pa_in_dst_md(ha, page))
+		return (0);
+	error = hibernate_md_dst_page_index(ha, page, &idx);
+	if (error != 0)
+		return (error);
+	if (idx >= vector_count)
+		return (EINVAL);
+	if (vector[idx] != page) {
+		vector[idx] = page;
+		*did = true;
+	}
+	return (0);
+}
+
+/*
+ * K23-T13: walk va under root_pa and self-copy every page-table page
+ * traversed.  Returns the number of pages made self-referential in *countp.
+ */
+static int
+hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
+    vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t root_pa,
+    vm_offset_t va, u_int *countp)
+{
+	pml4_entry_t *pml4;
+	pdp_entry_t *pdp;
+	pd_entry_t *pd;
+	pt_entry_t *pt;
+	vm_paddr_t table_pa;
+	uint64_t entry;
+	u_int index;
+	int error;
+	bool did;
+
+	did = false;
+	table_pa = root_pa & PG_FRAME;
+	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
+	    table_pa, &did)) != 0)
+		return (error);
+	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = pml4[index];
+	if ((entry & X86_PG_V) == 0)
+		return (0);
+	table_pa = entry & PG_FRAME;
+	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
+	    table_pa, &did)) != 0)
+		return (error);
+	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdp[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (0);
+	table_pa = entry & PG_FRAME;
+	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
+	    table_pa, &did)) != 0)
+		return (error);
+	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pd[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (0);
+	table_pa = entry & PG_FRAME;
+	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
+	    table_pa, &did)) != 0)
+		return (error);
+	pt = (pt_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = pt[index];
+	if ((entry & X86_PG_V) == 0)
+		return (0);
+	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
+	    entry & PG_FRAME, &did)) != 0)
+		return (error);
+	if (did)
+		(*countp)++;
+	return (0);
+}
+
+/*
  * Independently prove every mapping the private-domain trampoline may touch.
  * All arithmetic used to enumerate runs and arena/vector pages is checked.
  */
@@ -2304,20 +2420,45 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * here, before the no-return boundary, instead of refusing nothing
 	 * and crashing silently inside it.
 	 */
-	if (!hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
-		trampoline_saved_va) ||
-	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
-		(vm_offset_t)layout.handoff_pa) ||
-	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
-		saved_handoff_va) ||
-	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
-		saved_pcb_va) ||
-	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
-		restore_kernel_va)) {
-		printf("hibernate: a saved-domain page-table page for one of "
-		       "the K-10 handoff VAs collides with the destination "
-		       "set; refusing\n");
-		return (EIO);
+	{
+		vm_paddr_t *wvec;
+		u_int selfcopied;
+
+		/*
+		 * K23-T13: the resume kernel's own page-table pages backing
+		 * the handoff VAs can fall inside the destination set, which
+		 * means the destructive copy would replace the tables the
+		 * terminal step executes under (observed: kernel_pmap's own
+		 * PML4[KPML4I] PDPT page going to an all-zero PDE, then a
+		 * silent reset on the next fetch).  Destination counts are
+		 * fixed by the image, so the pages cannot be dropped from the
+		 * view; instead each such page is made self-referential in
+		 * the source vector, which turns its copy into a no-op and
+		 * leaves both the counts and the page's contents intact.
+		 */
+		wvec = (vm_paddr_t *)(uintptr_t)vector_va;
+		selfcopied = 0;
+		error = hibernate_md_selfcopy_walk(ha, wvec, p,
+		    kernel_pmap->pm_cr3, trampoline_saved_va, &selfcopied);
+		if (error == 0)
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, (vm_offset_t)layout.handoff_pa,
+			    &selfcopied);
+		if (error == 0)
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, saved_handoff_va,
+			    &selfcopied);
+		if (error == 0)
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, saved_pcb_va, &selfcopied);
+		if (error == 0)
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, restore_kernel_va,
+			    &selfcopied);
+		if (error != 0)
+			return (error);
+		printf("hibernate: k23: %u saved-domain page-table page(s) "
+		    "self-copied\n", selfcopied);
 	}
 
 	/*
