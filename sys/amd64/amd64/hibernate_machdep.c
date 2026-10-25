@@ -1516,6 +1516,103 @@ hibernate_md_identity_walk(vm_offset_t va)
 }
 
 /*
+ * hibernate_md_saved_domain_table_disjoint: K23-T13 (criterion 13) --
+ * prove that every page-table PAGE traversed while resolving va under
+ * kernel_pmap (the saved domain) is itself disjoint from the K-10
+ * destination set, not merely that the final translation is valid.
+ *
+ * Root cause this closes: hibernate_md_saved_domain_validate() (above)
+ * already proves each of the four saved-domain VAs (trampoline stub,
+ * handoff source/destination, saved PCB, restore-kernel entry) resolves
+ * to the expected PA with the expected permissions -- but that walk reads
+ * kernel_pmap's page-table PAGES themselves only to find the next-level
+ * entry; it never checks whether those backing pages are destination-run
+ * members.  Observed directly this session: kernel_pmap's own permanent
+ * PML4[KPML4I]-rooted PDPT page (the single PDPT page backing the whole
+ * kernel .text/.data/.bss region, and therefore every one of these four
+ * VAs at once) fell inside a K-10 destination run and was destructively
+ * overwritten by the terminal copy with saved-image bytes that left that
+ * page's governing PDE entry zero -- i.e. kernel_pmap itself lost its own
+ * mapping for hibernate_restore_kernel moments after the terminal CR3
+ * reload, with no trap, panic, or double fault: the CPU simply fetched
+ * from an unmapped page immediately after jmp *%rax and reset.  This is
+ * architecturally identical to the two already-fixed defects this issue
+ * closed (K-23-T06's park-stub/park-stack identity-map backing pages,
+ * and this same K23-T13's own identity-map-backing-page fix): a resume-
+ * side structure that must survive the destructive copy was not proven
+ * disjoint from the copy's own destination set before the no-return
+ * boundary.  Unlike those two cases, the colliding structure here is not
+ * something hibernate_machdep.c itself allocates -- it is the resume
+ * kernel's own bootstrap-built kernel_pmap, whose physical page-table
+ * pages land wherever this boot's own page-table bootstrap put them, with
+ * no existing code proving them disjoint from an arbitrary saved image's
+ * destination set.  This function supplies that missing proof so a
+ * collision refuses here, before the no-return boundary, instead of
+ * crashing silently inside it.
+ *
+ * Walks root_pa (always kernel_pmap->pm_cr3 in practice) for va exactly
+ * like hibernate_md_tree_walk(), but additionally checks, at every level
+ * including the top-level root itself, whether the page-table page just
+ * read is a hib_pa_in_dst_md() member.  Returns true only if every
+ * traversed table page is disjoint from the destination set AND the
+ * final entry is valid (present); false on any collision or any missing
+ * translation.
+ */
+static bool
+hibernate_md_saved_domain_table_disjoint(const struct hibernate_attempt *ha,
+    vm_paddr_t root_pa, vm_offset_t va)
+{
+	pml4_entry_t *pml4;
+	pdp_entry_t *pdp;
+	pd_entry_t *pd;
+	pt_entry_t *pt;
+	vm_paddr_t table_pa;
+	uint64_t entry;
+	u_int index;
+
+	table_pa = root_pa & PG_FRAME;
+	if (hib_pa_in_dst_md(ha, table_pa))
+		return (false);
+	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = pml4[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	if (hib_pa_in_dst_md(ha, table_pa))
+		return (false);
+	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdp[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0)
+		return (true);
+
+	table_pa = entry & PG_FRAME;
+	if (hib_pa_in_dst_md(ha, table_pa))
+		return (false);
+	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pd[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0)
+		return (true);
+
+	table_pa = entry & PG_FRAME;
+	if (hib_pa_in_dst_md(ha, table_pa))
+		return (false);
+	pt = (pt_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = pt[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	return (true);
+}
+
+/*
  * Independently prove every mapping the private-domain trampoline may touch.
  * All arithmetic used to enumerate runs and arena/vector pages is checked.
  */
@@ -2189,6 +2286,39 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	    saved_pcb_va, restore_kernel_va);
 	if (error != 0)
 		return (error);
+
+	/*
+	 * K23-T13 (criterion 13): hibernate_md_saved_domain_validate() above
+	 * proves each saved-domain VA's final translation, but not that the
+	 * page-table PAGES kernel_pmap itself uses to reach that translation
+	 * are disjoint from the K-10 destination set.  Directly observed
+	 * this session: kernel_pmap's own permanent PML4[KPML4I]-rooted PDPT
+	 * page -- the single PDPT page backing ALL FOUR of these VAs at
+	 * once, since they are all ordinary kernel .text/.data/.bss symbols
+	 * -- fell inside a K-10 destination run and was destructively
+	 * overwritten before the terminal jump, silently losing kernel_
+	 * pmap's own mapping for hibernate_restore_kernel with no trap,
+	 * panic, or double fault (see hibernate_md_saved_domain_table_
+	 * disjoint()'s own comment for the full root-cause account).  Prove
+	 * the whole page-table path disjoint for every one of the four VAs,
+	 * here, before the no-return boundary, instead of refusing nothing
+	 * and crashing silently inside it.
+	 */
+	if (!hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
+		trampoline_saved_va) ||
+	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
+		(vm_offset_t)layout.handoff_pa) ||
+	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
+		saved_handoff_va) ||
+	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
+		saved_pcb_va) ||
+	    !hibernate_md_saved_domain_table_disjoint(ha, kernel_pmap->pm_cr3,
+		restore_kernel_va)) {
+		printf("hibernate: a saved-domain page-table page for one of "
+		       "the K-10 handoff VAs collides with the destination "
+		       "set; refusing\n");
+		return (EIO);
+	}
 
 	/*
 	 * K23-T06 arbitration verdict item 3 (Q3): prove, rather than
