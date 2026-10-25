@@ -19,13 +19,14 @@ ATF_TC_BODY(required_golden, tc)
 
 	ATF_REQUIRE_EQ(0, hibernate_arena_required(&sizing));
 	ATF_CHECK_EQ(UINT64_C(17321984), sizing.has_private_page_tables);
+	ATF_CHECK_EQ(UINT64_C(24576), sizing.has_identity_map_pages);
 	ATF_CHECK_EQ(UINT64_C(28800), sizing.has_copy_run_storage);
 	ATF_CHECK_EQ(UINT64_C(1024), sizing.has_aux_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(32768), sizing.has_descriptor_storage);
 	ATF_CHECK_EQ(UINT64_C(28665), sizing.has_alignment_allowance);
-	ATF_CHECK_EQ(UINT64_C(17539065), sizing.has_raw_required);
-	ATF_CHECK_EQ(UINT64_C(17539072), sizing.has_required);
-	ATF_CHECK_EQ(3, HIBERNATE_ARENA_RULE_VERSION);
+	ATF_CHECK_EQ(UINT64_C(17563641), sizing.has_raw_required);
+	ATF_CHECK_EQ(UINT64_C(17563648), sizing.has_required);
+	ATF_CHECK_EQ(4, HIBERNATE_ARENA_RULE_VERSION);
 	ATF_CHECK_EQ(1, HCB_VERSION);
 	ATF_CHECK_EQ(0x040, HIBERNATE_CB_OFF_ARENA_START);
 	ATF_CHECK_EQ(0x048, HIBERNATE_CB_OFF_ARENA_SIZE);
@@ -80,10 +81,11 @@ ATF_TC_WITHOUT_HEAD(selection_highest);
 ATF_TC_BODY(selection_highest, tc)
 {
 	/*
-	 * Intervals sized well above the rule-version-3 required bytes
-	 * (17,539,072, driven by HIBERNATE_ARENA_PT_LEAF_PAGES=4096 plus the
-	 * K-23 arena park-stack component; see hibernate.h), unlike rule
-	 * version 1's much smaller requirement.
+	 * Intervals sized well above the rule-version-4 required bytes
+	 * (17,563,648, driven by HIBERNATE_ARENA_PT_LEAF_PAGES=4096 plus the
+	 * K-23 arena park-stack component and the K23-T13 arena-resident
+	 * identity-map backing pages; see hibernate.h), unlike rule version
+	 * 1's much smaller requirement.
 	 */
 	struct hibernate_arena_interval intervals[] = {
 		{ 0x1000000, 0x3000000, HAIC_ELIGIBLE },
@@ -96,14 +98,14 @@ ATF_TC_BODY(selection_highest, tc)
 	ATF_REQUIRE_EQ(0,
 	    hibernate_arena_select(intervals, nitems(intervals),
 		HIBERNATE_ARENA_POLICY_DEFAULT_BYTES * 8, &pa, &size));
-	ATF_CHECK_EQ(UINT64_C(17539072), size);
-	ATF_CHECK_EQ(UINT64_C(0x8f46000), pa);
+	ATF_CHECK_EQ(UINT64_C(17563648), size);
+	ATF_CHECK_EQ(UINT64_C(0x8f40000), pa);
 	ATF_CHECK_EQ(ENOMEM,
 	    hibernate_arena_select(intervals, nitems(intervals),
-		UINT64_C(17534976), &pa, &size));
+		UINT64_C(17559552), &pa, &size));
 	ATF_CHECK_EQ(EINVAL,
 	    hibernate_arena_select(intervals, nitems(intervals),
-		UINT64_C(17539073), &pa, &size));
+		UINT64_C(17563649), &pa, &size));
 }
 
 static void
@@ -286,10 +288,11 @@ ATF_TC_WITHOUT_HEAD(selection_boundaries);
 ATF_TC_BODY(selection_boundaries, tc)
 {
 	/*
-	 * Rule version 3's required bytes (hibernate.h, PT_LEAF_PAGES=4096
-	 * plus the K-23 arena park-stack component).
+	 * Rule version 4's required bytes (hibernate.h, PT_LEAF_PAGES=4096
+	 * plus the K-23 arena park-stack component and the K23-T13
+	 * arena-resident identity-map backing pages).
 	 */
-	const uint64_t required = UINT64_C(17539072);
+	const uint64_t required = UINT64_C(17563648);
 	struct hibernate_arena_interval interval;
 	vm_paddr_t pa;
 	vm_size_t size;
@@ -339,8 +342,8 @@ ATF_TC_WITHOUT_HEAD(selection_reorder_equivalence);
 ATF_TC_BODY(selection_reorder_equivalence, tc)
 {
 	/*
-	 * Intervals sized well above the rule-version-3 required bytes
-	 * (17,539,072; see hibernate.h's HIBERNATE_ARENA_PT_LEAF_PAGES
+	 * Intervals sized well above the rule-version-4 required bytes
+	 * (17,563,648; see hibernate.h's HIBERNATE_ARENA_PT_LEAF_PAGES
 	 * rationale), unlike rule version 1's much smaller requirement.
 	 */
 	const struct hibernate_arena_interval a[] = {
