@@ -2372,6 +2372,19 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 void
 hibernate_machdep_enter(void)
 {
+	/*
+	 * hibernate_amd64_cpu_validate() deliberately excludes CR0_TS from
+	 * its saved/live CR0 comparison (ordinary lazy-FPU handling may
+	 * legitimately leave it set).  The K-10 trampoline's XRSTOR64 never
+	 * touches CR0 and has no fault recovery, so a live TS=1 here raises
+	 * #NM at that XRSTOR64 with no IDT mapped under the private tree,
+	 * producing a triple fault.  Clear it unconditionally right before
+	 * the no-return jump so the trampoline's XRSTOR64 always executes
+	 * with TS=0, regardless of what state hibernate_stop_cpus()/
+	 * intr_disable() left behind.
+	 */
+	clts();
+
 	__asm__ __volatile__("movq %0, %%rdi\n\t"
 			     "movq %1, %%rsi\n\t"
 			     "jmp *%2"
