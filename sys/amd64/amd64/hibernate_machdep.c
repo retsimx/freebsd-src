@@ -65,33 +65,119 @@
 extern struct susppcb **susppcbs;
 
 /*
+ * K23-T13 saved-tree-patch: bounded retry count for
+ * hibernate_md_identity_backing_alloc().  Generous relative to this
+ * session's own measured destination-run coverage below 4 GiB (27 runs,
+ * largest single run ~88 MiB), while still refusing closed rather than
+ * looping unboundedly if the destination set ever covers the below-4GiB
+ * free pool too densely for four single-page allocations to miss it.
+ */
+#define	HIBERNATE_MD_IDENTITY_ALLOC_RETRIES	256
+
+/*
+ * Allocate one below-4GiB page for hibernate_setup_identity_map(), proven
+ * disjoint from every K-10 destination run when ha is non-NULL and
+ * ha->ha_dst_valid (the RESUME path only).
+ *
+ * K23-T13 root cause: the destructive K-10 copy that runs later in the
+ * same no-return window (sys/kern/kern_hibernate.c,
+ * hibernate_resume_attempt() -> hibernate_machdep_enter() ->
+ * hibernate_tramp.S) overwrites every destination-run physical page with
+ * saved-image payload bytes.  hibernate_setup_identity_map()'s own
+ * PML4/PDPT/PD backing pages were previously drawn from the ordinary
+ * below-4GiB pool with no proof of disjointness from that set -- unlike
+ * every other structure that must survive the copy (trampoline, arena
+ * header, handoff record, private CR3 tree, run table), which all live
+ * inside the K-9 transition arena and are proven disjoint via
+ * hibernate_md_source_disjoint().  After the terminal CR3 reload in
+ * hibernate_tramp_both_domain_page, kernel_pmap (the tree this function
+ * builds into) is the ONLY tree in use; a backing page silently
+ * overwritten by the copy corrupts the live mapping with no crash
+ * signature pointing at the real cause.  Directly observed this session:
+ * PML4[0]'s own PDPT page (frame constant across the reload) held a
+ * correct PD-table pointer immediately before the no-return jump and an
+ * unrelated 1 GiB PG_PS entry immediately after, with identical CR3
+ * before and after -- not a tree-selection defect, a destination-
+ * disjointness gap.  ha is NULL on the SAVE path
+ * (dumpsys_hibernate_savectx_preinit()), where no destination-run
+ * concept exists and no destructive copy ever follows, so no check is
+ * performed there and behaviour is unchanged.
+ *
+ * On exhaustion returns ENOMEM.  A page already chosen in an earlier call
+ * from the same hibernate_setup_identity_map() invocation is not freed
+ * here if a LATER backing-page allocation in that same invocation then
+ * exhausts its own retry budget; hibernate_setup_identity_map() returns
+ * the failure to hibernate_machdep_prepare(), which fails hibernate_
+ * resume_attempt() closed before the no-return boundary (acceptable
+ * one-time, bounded leak on an already-terminal refusal path, consistent
+ * with this function's existing fail-closed discipline).
+ */
+static int
+hibernate_md_identity_backing_alloc(const struct hibernate_attempt *ha,
+    bool zeroed, vm_page_t *out)
+{
+	vm_page_t m;
+	u_int attempt;
+
+	for (attempt = 0; attempt < HIBERNATE_MD_IDENTITY_ALLOC_RETRIES;
+	    attempt++) {
+		m = pmap_page_alloc_below_4g(zeroed);
+		if (m == NULL)
+			return (ENOMEM);
+		if (ha == NULL || !ha->ha_dst_valid ||
+		    !hibernate_dst_interval_contains(ha,
+			VM_PAGE_TO_PHYS(m))) {
+			*out = m;
+			return (0);
+		}
+		vm_page_free(m);
+	}
+	return (ENOMEM);
+}
+
+/*
  * Setup transient 1:1 mapping of low 4 GiB in kernel_pmap
  * mirroring mp_machdep.c:355-399.
+ *
+ * ha is NULL on the SAVE path (no destination-run concept exists there);
+ * on the RESUME path ha must already have ha_dst_valid true (guaranteed
+ * by hibernate_machdep_prepare()'s own step-1 preconditions, which run
+ * before this function is called).  See hibernate_md_identity_backing_
+ * alloc() above for why every backing-page allocation below is routed
+ * through it instead of calling pmap_page_alloc_below_4g() directly.
  */
-static void
-hibernate_setup_identity_map(void)
+static int
+hibernate_setup_identity_map(const struct hibernate_attempt *ha)
 {
 	static vm_page_t m_pdp, m_pd[4], m_pml4;
 	static bool map_initialized = false;
 	pml4_entry_t *v_pml4;
 	pdp_entry_t *v_pdp;
 	pd_entry_t *v_pd;
-	int i, j;
+	int error, i, j;
 
 	if (map_initialized)
-		return;
+		return (0);
 
 	if (la57) {
-		m_pml4 = pmap_page_alloc_below_4g(true);
+		error = hibernate_md_identity_backing_alloc(ha, true,
+		    &m_pml4);
+		if (error != 0)
+			return (error);
 		v_pml4 = (pml4_entry_t *)VM_PAGE_TO_DMAP(m_pml4);
 	} else {
 		v_pml4 = &kernel_pmap->pm_pmltop[0];
 	}
-	m_pdp = pmap_page_alloc_below_4g(true);
+	error = hibernate_md_identity_backing_alloc(ha, true, &m_pdp);
+	if (error != 0)
+		return (error);
 	v_pdp = (pdp_entry_t *)VM_PAGE_TO_DMAP(m_pdp);
 
 	for (i = 0; i < 4; i++) {
-		m_pd[i] = pmap_page_alloc_below_4g(false);
+		error = hibernate_md_identity_backing_alloc(ha, false,
+		    &m_pd[i]);
+		if (error != 0)
+			return (error);
 		v_pd = (pd_entry_t *)VM_PAGE_TO_DMAP(m_pd[i]);
 		for (j = 0; j < NPDEPG; j++) {
 			v_pd[j] = ((vm_paddr_t)i * NBPDP +
@@ -115,6 +201,7 @@ hibernate_setup_identity_map(void)
 		invltlb_glob();
 
 	map_initialized = true;
+	return (0);
 }
 
 /*
@@ -138,13 +225,23 @@ static void *low_page = NULL;
 int
 dumpsys_hibernate_savectx_preinit(void)
 {
+	int error;
+
 	if (low_page == NULL) {
 		low_page = contigmalloc(PAGE_SIZE, M_DEVBUF, M_WAITOK, 0,
 		    0xfffffffful, PAGE_SIZE, 0ul);
 		if (low_page == NULL)
 			return (ENOMEM);
 	}
-	hibernate_setup_identity_map();
+	/*
+	 * K23-T13: ha is NULL on the SAVE path -- no destination-run
+	 * concept exists here and no destructive copy ever follows, so
+	 * hibernate_md_identity_backing_alloc() skips its disjointness
+	 * check unconditionally when ha == NULL.
+	 */
+	error = hibernate_setup_identity_map(NULL);
+	if (error != 0)
+		return (error);
 	return (0);
 }
 
@@ -1894,8 +1991,15 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * domain()/hibernate_md_saved_domain_validate(), which walk
 	 * kernel_pmap directly, not the private CR3) require it to already
 	 * exist.
+	 *
+	 * K23-T13: pass ha so every backing-page allocation below is
+	 * proven destination-disjoint (hibernate_md_identity_backing_
+	 * alloc()) before the K-10 destructive copy can run; see that
+	 * function's own comment for the root cause this closes.
 	 */
-	hibernate_setup_identity_map();
+	error = hibernate_setup_identity_map(ha);
+	if (error != 0)
+		return (error);
 
 	/* 2. Arena-bridge-boundary proof (Design 036 S5.8). */
 	error = hibernate_md_arena_layout_compute(ha, &layout);
