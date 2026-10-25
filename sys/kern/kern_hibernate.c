@@ -236,6 +236,10 @@ hibernate_arena_required(struct hibernate_arena_sizing *sizing)
 	    HIBERNATE_ARENA_ALIGNMENT, &local.has_private_page_tables);
 	if (error != 0)
 		goto out;
+	error = hibernate_arena_mul(HIBERNATE_ARENA_IDENTITY_MAP_PAGES,
+	    HIBERNATE_ARENA_ALIGNMENT, &local.has_identity_map_pages);
+	if (error != 0)
+		goto out;
 	error = hibernate_arena_mul(HIBERNATE_ARENA_COPY_RUN_MAX,
 	    HIBERNATE_ARENA_COPY_RUN_BYTES, &local.has_copy_run_storage);
 	if (error != 0)
@@ -270,6 +274,7 @@ hibernate_arena_required(struct hibernate_arena_sizing *sizing)
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_STACK_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_PARK_STACK_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(local.has_private_page_tables);
+	HIBERNATE_ARENA_ADD_COMPONENT(local.has_identity_map_pages);
 	HIBERNATE_ARENA_ADD_COMPONENT(HIBERNATE_ARENA_HANDOFF_BYTES);
 	HIBERNATE_ARENA_ADD_COMPONENT(local.has_descriptor_storage);
 	HIBERNATE_ARENA_ADD_COMPONENT(local.has_alignment_allowance);

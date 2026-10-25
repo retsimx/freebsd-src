@@ -41,6 +41,7 @@ struct hibernate_early_arena {
 
 struct hibernate_arena_sizing {
 	uint64_t has_private_page_tables;
+	uint64_t has_identity_map_pages;
 	uint64_t has_copy_run_storage;
 	uint64_t has_aux_descriptor_storage;
 	uint64_t has_descriptor_storage;
@@ -150,11 +151,21 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #define HIBERNATE_MAX_PHDRS	      900
 
 /*
- * Rule version 3 adds the arena-resident AP park stack and the header-resident
- * park-state protocol.  Save and restore boots must agree on this version so
- * they derive the same arena size, layout, and park-state interpretation.
+ * Rule version 4 adds the arena-resident identity-map backing pages used by
+ * hibernate_setup_identity_map() on the RESUME path (K23-T13).  Previously
+ * those PML4/PDPT/PD pages were drawn from the ordinary below-4GiB pool and
+ * proven disjoint from the K-10 destination set by retrying a bounded search
+ * (hibernate_md_identity_backing_alloc(), now removed); a full-memory
+ * hibernate's destination set covers essentially all of RAM, so that search
+ * could not succeed and deterministically returned ENOMEM at stage 6
+ * (HIB_RESUME_MD_PREPARE).  Rule version 4 instead carves these pages from
+ * the K-9 transition arena, which is excluded from the destination union by
+ * construction -- the same rule every other copy-surviving structure already
+ * follows (trampoline, handoff, private CR3 tree, run table).  Save and
+ * restore boots must agree on this version so they derive the same arena
+ * size, layout, and park-state interpretation.
  */
-#define HIBERNATE_ARENA_RULE_VERSION	     3U
+#define HIBERNATE_ARENA_RULE_VERSION	     4U
 #define HIBERNATE_ARENA_ALIGNMENT	     UINT64_C(4096)
 /*
  * Reserved arena span for the encoded transition-arena header (rule
@@ -342,6 +353,28 @@ _Static_assert(sizeof(struct hibernate_handoff_record) ==
 #define HIBERNATE_ARENA_PRIVATE_PT_PAGES                                 \
 	(HIBERNATE_ARENA_PT_PML4_PAGES + HIBERNATE_ARENA_PT_PDPT_PAGES + \
 	    HIBERNATE_ARENA_PT_PD_PAGES + HIBERNATE_ARENA_PT_LEAF_PAGES)
+/*
+ * Arena-resident backing pages for hibernate_setup_identity_map()'s
+ * low-4GiB 1:1 mapping, used on the RESUME path only (rule version 4,
+ * K23-T13).  One PML4 page (la57 only, but always reserved so the layout
+ * is identical regardless of la57), one PDPT page, and four PD pages (one
+ * per 1 GiB of the mapped low 4 GiB) -- the exact page count
+ * hibernate_setup_identity_map() allocates for the general case.  Drawing
+ * these from the transition arena instead of the ordinary below-4GiB pool
+ * makes them disjoint from the K-10 destination set by construction,
+ * closing the ENOMEM this task fixes; see hibernate_setup_identity_map()'s
+ * own comment (sys/amd64/amd64/hibernate_machdep.c) for the full root
+ * cause.
+ */
+#define HIBERNATE_ARENA_IDENTITY_PML4_PAGES UINT64_C(1)
+#define HIBERNATE_ARENA_IDENTITY_PDPT_PAGES UINT64_C(1)
+#define HIBERNATE_ARENA_IDENTITY_PD_PAGES   UINT64_C(4)
+#define HIBERNATE_ARENA_IDENTITY_MAP_PAGES                                 \
+	(HIBERNATE_ARENA_IDENTITY_PML4_PAGES +                             \
+	    HIBERNATE_ARENA_IDENTITY_PDPT_PAGES +                          \
+	    HIBERNATE_ARENA_IDENTITY_PD_PAGES)
+#define HIBERNATE_ARENA_IDENTITY_MAP_BYTES \
+	(HIBERNATE_ARENA_IDENTITY_MAP_PAGES * HIBERNATE_ARENA_ALIGNMENT)
 #define HIBERNATE_ARENA_ALIGNMENT_ALLOWANCE_BYTES \
 	(HIBERNATE_ARENA_OBJECT_ALIGNMENTS *      \
 	    (HIBERNATE_ARENA_ALIGNMENT - UINT64_C(1)))
