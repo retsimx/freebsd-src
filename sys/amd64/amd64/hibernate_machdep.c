@@ -1617,8 +1617,29 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
 	entry = pdp[index];
-	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+	if ((entry & X86_PG_V) == 0)
 		return (0);
+	if ((entry & PG_PS) != 0) {
+		/*
+		 * va resolves through a 1 GiB PDPTE.  There is no PD/PT
+		 * below a superpage, so the leaf frame IS this entry's
+		 * frame (offset by va's own low bits) -- self-copy that
+		 * exact 4 KiB page here (if copy_leaf), matching
+		 * hibernate_md_tree_walk()'s own superpage handling, then
+		 * stop: the walk has nothing further to traverse.
+		 */
+		if (copy_leaf) {
+			table_pa = ((entry & PG_PS_PDP_FRAME) |
+				       (va & PDPMASK)) &
+			    PG_FRAME;
+			if ((error = hibernate_md_selfcopy_page(ha, vector,
+				 vector_count, table_pa, &did)) != 0)
+				return (error);
+		}
+		if (did)
+			(*countp)++;
+		return (0);
+	}
 	table_pa = entry & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
 		 table_pa, &did)) != 0)
@@ -1626,8 +1647,25 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
 	entry = pd[index];
-	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+	if ((entry & X86_PG_V) == 0)
 		return (0);
+	if ((entry & PG_PS) != 0) {
+		/*
+		 * va resolves through a 2 MiB PDE.  Same reasoning as the
+		 * 1 GiB case above: self-copy the exact 4 KiB page va
+		 * falls in (if copy_leaf), then stop.
+		 */
+		if (copy_leaf) {
+			table_pa = ((entry & PG_PS_FRAME) | (va & PDRMASK)) &
+			    PG_FRAME;
+			if ((error = hibernate_md_selfcopy_page(ha, vector,
+				 vector_count, table_pa, &did)) != 0)
+				return (error);
+		}
+		if (did)
+			(*countp)++;
+		return (0);
+	}
 	table_pa = entry & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
 		 table_pa, &did)) != 0)
@@ -2383,6 +2421,71 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
 			    kernel_pmap->pm_cr3, restore_kernel_va, true,
 			    &selfcopied);
+		if (error == 0) {
+			/*
+			 * The BSP's own live GDT (pc_gdt) is read by
+			 * hibernate_restore_kernel() via the saved PCB's
+			 * pcb_gdt (lgdt(PCB_GDT(%r12))) immediately after
+			 * landing in the saved domain.  Captured and
+			 * confirmed this session: the GDT's own
+			 * governing page-table (PT) entry is present and
+			 * valid at hibernate_machdep_enter() but reads
+			 * zero (not present) by the time
+			 * hibernate_restore_kernel() executes "lgdt", with
+			 * the very next instruction ("mov %eax,%ds",
+			 * support.S's lgdt()) resetting the machine --
+			 * the GDT page-table path, not its data, falls
+			 * inside the K-10 destination set and collapses
+			 * exactly like the saved_pcb_va bug this same loop
+			 * already fixes.  Unlike saved_pcb_va, the GDT's
+			 * *data* must come from the resume kernel's own,
+			 * already-correct boot (not the saved image): the
+			 * saved PCB's pcb_gdt base/limit simply name this
+			 * CPU's one fixed GDT, which the ordinary boot
+			 * already built correctly, so copy_leaf is false
+			 * here too.
+			 */
+			struct pcpu *bsp_pc;
+
+			bsp_pc = pcpu_find(0);
+			if (bsp_pc == NULL)
+				return (EINVAL);
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, (vm_offset_t)bsp_pc->pc_gdt,
+			    false, &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * resumectx() (sys/amd64/amd64/cpu_switch.S)
+			 * unconditionally reloads %cr3 from the global
+			 * KPML4phys (not from any value this file hands it)
+			 * as its very first act.  Captured and confirmed
+			 * this session: KPML4phys's own data word changes
+			 * from the correct, live resume-boot value
+			 * (matching kernel_pmap->pm_cr3 exactly) at
+			 * hibernate_machdep_enter() to a foreign value at
+			 * resumectx() entry, after the K-10 copy has run --
+			 * i.e. unlike the GDT fix above, here it is the
+			 * LEAF (KPML4phys's own stored physical address),
+			 * not merely its page-table path, that the
+			 * destructive copy overwrites with the saved
+			 * image's own (differently-placed) KPML4 address.
+			 * That bogus %cr3 reload is consistent with the
+			 * guest resetting moments into resumectx() with no
+			 * trap.  KPML4phys must keep the resume boot's own
+			 * value (this boot's one and only correct kernel
+			 * PML4 physical address), so copy_leaf is true here,
+			 * the opposite of saved_pcb_va/pc_gdt above.
+			 * KPML5phys is not similarly protected:
+			 * hibernate_amd64_cpu_validate() already refuses any
+			 * la57 != 0 host, so resumectx()'s KPML5phys load is
+			 * never the value actually moved into %cr3 on any
+			 * restore this code can reach.
+			 */
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, (vm_offset_t)&KPML4phys, true,
+			    &selfcopied);
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
