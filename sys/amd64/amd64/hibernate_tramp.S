@@ -81,6 +81,14 @@
  *      As the design's own pseudocode note states, the implementation is
  *      free to choose any register allocation satisfying "every value is
  *      register-resident before the both-domain page is entered."
+ *      HAH_HANDOFF_LENGTH is loaded with a 32-bit zero-extending "movl"
+ *      into %ebx (not a 64-bit "movq" into %rbx): the C field is
+ *      "uint32_t hah_handoff_length", and the very next header field,
+ *      HAH_INSTRUCTION_PAGE_PA (a uint64_t), begins at the next 8-byte
+ *      slot with no padding in between.  A 64-bit load at
+ *      HAH_HANDOFF_LENGTH's offset would therefore also pull in
+ *      HAH_INSTRUCTION_PAGE_PA's low 4 bytes as %rbx's high dword,
+ *      corrupting the byte count step 10's "rep movsb" uses.
  *   7. jmp (never call) to the page-aligned both-domain stub.  Every value
  *      the stub and everything after it need is already register-resident;
  *      nothing past this point ever dereferences HAH_* through %rbp again.
@@ -100,10 +108,10 @@
  *  10. [Terminal step 4] Copy the complete scalar handoff record by value,
  *      byte for byte, from arena storage (HAH_HANDOFF_RECORD_PA, %r11) to
  *      the fixed link-time VA hibernate_saved_handoff (HAH_SAVED_HANDOFF_VA,
- *      %r13), for exactly HAH_HANDOFF_LENGTH (%rbx) bytes.  Ordinary
- *      memory access is explicitly permitted from this point on (design
- *      S5.5): the both-domain instruction invariant applies only to steps
- *      8-9 above.
+ *      %r13), for exactly HAH_HANDOFF_LENGTH (%ebx, zero-extended into
+ *      %rbx; see step 6) bytes.  Ordinary memory access is explicitly
+ *      permitted from this point on (design S5.5): the both-domain
+ *      instruction invariant applies only to steps 8-9 above.
  *  11. [Terminal step 5] %r12 = HAH_SAVED_PCB_VA (already carried in %r14):
  *      the real "struct pcb *" hibernate_restore_kernel expects.
  *  12. [Terminal step 6] jmp (never call) *%rax, loaded immediately
@@ -124,7 +132,8 @@
  *   %r13 -- HAH_SAVED_HANDOFF_VA    (preloaded step 6; consumed step 10)
  *   %r14 -- HAH_SAVED_PCB_VA        (preloaded step 6; consumed step 11)
  *   %r15 -- HAH_RESTORE_KERNEL_VA   (preloaded step 6; consumed step 12)
- *   %rbx -- HAH_HANDOFF_LENGTH      (preloaded step 6; consumed step 10)
+ *   %rbx -- HAH_HANDOFF_LENGTH      (preloaded step 6 via a 32-bit
+ *           zero-extending "movl" into %ebx, not "movq"; consumed step 10)
  *
  *   %rax, %rcx, %rdx, %rsi, %rdi, %r10, %r12 -- free scratch during the
  *           private-CR3 phase (steps 1-6); %rdi/%rsi/%rcx/%rdx/%r10/%r12
@@ -273,7 +282,7 @@ ENTRY(hibernate_tramp_entry)
 	movq	HAH_SAVED_HANDOFF_VA(%rbp), %r13
 	movq	HAH_SAVED_PCB_VA(%rbp), %r14
 	movq	HAH_RESTORE_KERNEL_VA(%rbp), %r15
-	movq	HAH_HANDOFF_LENGTH(%rbp), %rbx
+	movl	HAH_HANDOFF_LENGTH(%rbp), %ebx
 
 	/*
 	 * Step 7: enter the one-page both-domain stub.  Past this point
