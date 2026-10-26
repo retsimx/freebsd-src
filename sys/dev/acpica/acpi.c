@@ -4206,13 +4206,17 @@ acpi_s4_resume_clocks(struct acpi_softc *sc)
 static void
 acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
     const cpuset_t *susp_cpus, register_t intr_state,
-    struct hibernate_save_pcb *hpcb, struct hibernate_save_cb *hcb,
-    int saved_td_locks, int saved_td_pinned,
-    struct lock_list_entry *saved_td_sleeplocks)
+    struct hibernate_save_pcb *hpcb, struct hibernate_save_cb *hcb)
 {
 
-	acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
-	    saved_td_sleeplocks);
+	/*
+	 * acpi_s4_resume_discard_snapshot() now runs in the EJUSTRETURN
+	 * case immediately after dumpsys_hibernate_savectx() returns,
+	 * before hibernate_barrier_unwind() -- see the call site and its
+	 * comment for why.  Calling it again here would be a harmless but
+	 * redundant double-run; it is not called from this function at
+	 * all, so there is exactly one call site by construction.
+	 */
 	device_printf(sc->acpi_dev, "Resumed from hibernate image\n");
 	acpi_s4_resume_bsp_cpu();
 	acpi_s4_resume_lapic();
@@ -4840,7 +4844,24 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 *   3. acpi_s4_resume_bsp() -- AP resume + interrupt restore
 		 *   2. free the reservation array
 		 *   1. hibernate_coordinator_release() -- release lock LAST
+		 *
+		 * acpi_s4_resume_discard_snapshot() must run here, before
+		 * hibernate_barrier_unwind(), not inside acpi_s4_resume_bsp()
+		 * afterward: the restored image is a snapshot of curthread
+		 * taken mid-dump-worker, so curthread->td_critnest and
+		 * td_md.md_spinlock_count still carry that worker's deep
+		 * nesting counts the instant resumectx() returns here.
+		 * hibernate_barrier_unwind()'s own Stage 7
+		 * (vm_phys_hibernate_release()) acquires a blockable sleep
+		 * mutex; doing so while those stale nesting counts are still
+		 * in effect is exactly what WITNESS's "acquiring blockable
+		 * sleep lock with spinlock or critical section held" panic
+		 * reports (observed: vm_phys.c's "vm page free queue" mutex).
+		 * Discarding the snapshot first, before any lock acquisition
+		 * on this path, satisfies that invariant.
 		 */
+		acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
+		    saved_td_sleeplocks);
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		free(hib_res_pages, M_TEMP);
 		/*
@@ -4850,7 +4871,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		snapshot_owned = false;
 		acpi_s4_resume_bsp(sc, &slp_state, &susp_cpus, intr_state, hpcb,
-		    hcb, saved_td_locks, saved_td_pinned, saved_td_sleeplocks);
+		    hcb);
 		hibernate_coordinator_release();
 		/* H2: release periph reference. */
 		if (hib_cam_periph != NULL) {
