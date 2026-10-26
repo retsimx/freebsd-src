@@ -1667,11 +1667,25 @@ hibernate_md_selfcopy_page(const struct hibernate_attempt *ha,
 /*
  * K23-T13: walk va under root_pa and self-copy every page-table page
  * traversed.  Returns the number of pages made self-referential in *countp.
+ *
+ * copy_leaf controls whether the terminal leaf frame (the page va itself
+ * resolves to, as opposed to the page-table pages used to reach it) is also
+ * made self-referential.  This must be false for saved_pcb_va: that leaf is
+ * the live struct pcb page resumectx() reads to resume the saved context,
+ * and it must come back from the image's own saved content, not the resume
+ * kernel's current, meaningless bytes at that physical address.  Making the
+ * leaf self-referential there silently discards the saved PCB and produces
+ * a bogus resume context with no trap.  Every other VA's leaf is either
+ * arena-owned (categorically outside the destination set already),
+ * overwritten again by the trampoline's own handoff copy regardless of its
+ * pre-existing content, or an ordinary .text page whose bytes are expected
+ * identical between the saved and resume kernel images, so self-copying
+ * those leaves is harmless and keeps the fix narrowly scoped.
  */
 static int
 hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
     vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t root_pa,
-    vm_offset_t va, u_int *countp)
+    vm_offset_t va, bool copy_leaf, u_int *countp)
 {
 	pml4_entry_t *pml4;
 	pdp_entry_t *pdp;
@@ -1686,7 +1700,7 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 	did = false;
 	table_pa = root_pa & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
-	    table_pa, &did)) != 0)
+		 table_pa, &did)) != 0)
 		return (error);
 	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
@@ -1695,7 +1709,7 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 		return (0);
 	table_pa = entry & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
-	    table_pa, &did)) != 0)
+		 table_pa, &did)) != 0)
 		return (error);
 	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
@@ -1704,7 +1718,7 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 		return (0);
 	table_pa = entry & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
-	    table_pa, &did)) != 0)
+		 table_pa, &did)) != 0)
 		return (error);
 	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
@@ -1713,16 +1727,18 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 		return (0);
 	table_pa = entry & PG_FRAME;
 	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
-	    table_pa, &did)) != 0)
+		 table_pa, &did)) != 0)
 		return (error);
 	pt = (pt_entry_t *)PHYS_TO_DMAP(table_pa);
 	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
 	entry = pt[index];
 	if ((entry & X86_PG_V) == 0)
 		return (0);
-	if ((error = hibernate_md_selfcopy_page(ha, vector, vector_count,
-	    entry & PG_FRAME, &did)) != 0)
-		return (error);
+	if (copy_leaf) {
+		if ((error = hibernate_md_selfcopy_page(ha, vector,
+			 vector_count, entry & PG_FRAME, &did)) != 0)
+			return (error);
+	}
 	if (did)
 		(*countp)++;
 	return (0);
@@ -2439,21 +2455,30 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		wvec = (vm_paddr_t *)(uintptr_t)vector_va;
 		selfcopied = 0;
 		error = hibernate_md_selfcopy_walk(ha, wvec, p,
-		    kernel_pmap->pm_cr3, trampoline_saved_va, &selfcopied);
+		    kernel_pmap->pm_cr3, trampoline_saved_va, true,
+		    &selfcopied);
 		if (error == 0)
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
 			    kernel_pmap->pm_cr3, (vm_offset_t)layout.handoff_pa,
+			    true, &selfcopied);
+		if (error == 0)
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, saved_handoff_va, true,
+			    &selfcopied);
+		if (error == 0)
+			/*
+			 * saved_pcb_va's leaf is the live struct pcb page
+			 * resumectx() reads to resume the saved context: it
+			 * must come back from the image, not be discarded in
+			 * favour of the resume kernel's own current bytes at
+			 * that PA.  Prove/self-copy its page-table path only.
+			 */
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, saved_pcb_va, false,
 			    &selfcopied);
 		if (error == 0)
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
-			    kernel_pmap->pm_cr3, saved_handoff_va,
-			    &selfcopied);
-		if (error == 0)
-			error = hibernate_md_selfcopy_walk(ha, wvec, p,
-			    kernel_pmap->pm_cr3, saved_pcb_va, &selfcopied);
-		if (error == 0)
-			error = hibernate_md_selfcopy_walk(ha, wvec, p,
-			    kernel_pmap->pm_cr3, restore_kernel_va,
+			    kernel_pmap->pm_cr3, restore_kernel_va, true,
 			    &selfcopied);
 		if (error != 0)
 			return (error);
