@@ -2453,7 +2453,8 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * already built correctly, so copy_leaf is false
 			 * here too.
 			 */
-			struct pcpu *bsp_pc;
+			struct pcpu *bsp_pc, *ap_pc;
+			u_int ap_cpu;
 
 			bsp_pc = pcpu_find(0);
 			if (bsp_pc == NULL)
@@ -2461,6 +2462,31 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
 			    kernel_pmap->pm_cr3, (vm_offset_t)bsp_pc->pc_gdt,
 			    false, &selfcopied);
+			/*
+			 * hibernate_resume_ap_entry() loads the AP's own
+			 * pc_gdt via lgdt() on the release path.  Each CPU's
+			 * pc_gdt lives in that CPU's own per-CPU page, so the
+			 * BSP's walk above does not cover it: protect its
+			 * page-table path under the same rule.  The
+			 * mp_ncpus == 2 refusal above leaves exactly one
+			 * such CPU.
+			 */
+			if (error == 0) {
+				for (ap_cpu = 0; ap_cpu < (u_int)mp_ncpus;
+				    ap_cpu++) {
+					if (ap_cpu != PCPU_GET(cpuid))
+						break;
+				}
+				if (ap_cpu >= (u_int)mp_ncpus)
+					return (EINVAL);
+				ap_pc = pcpu_find(ap_cpu);
+				if (ap_pc == NULL)
+					return (EINVAL);
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3,
+				    (vm_offset_t)ap_pc->pc_gdt, false,
+				    &selfcopied);
+			}
 		}
 		if (error == 0) {
 			/*
