@@ -553,6 +553,14 @@ hibernate_resume_ap_entry(u_int cpu)
 
 	amd64_cpu_init_msr_memctl();
 
+	/*
+	 * LTR sets the loaded TSS descriptor's busy bit, and this CPU's
+	 * descriptor was already ltr()'d once by init_secondary() at its own
+	 * cold boot: INIT resets the processor, not the GDT page.  Clear the
+	 * busy bit first, matching cpu_switch.S's "Clear task busy bit and
+	 * reload TR" idiom, or this second LTR raises #GP.
+	 */
+	pc->pc_tss->sd_type = SDT_SYSTSS;
 	ltr(GSEL(GPROC0_SEL, SEL_KPL));
 
 	amd64_conf_fast_syscall();
