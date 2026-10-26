@@ -98,6 +98,36 @@ ENTRY(hibernate_restore_kernel)
 	leaq	PCB_GDT(%r12), %rdi
 	call	lgdt
 
+	/*
+	 * resumectx() (sys/amd64/amd64/cpu_switch.S) unconditionally reloads
+	 * %cr3 from PCB_CR3(%rdi) as its very first act, on the ordinary
+	 * suspend/resume path where the saved and live kernel are the exact
+	 * same running instance and that physical address is still valid.
+	 * Across a hibernate image restore the saved PCB's pcb_cr3 is a
+	 * save-time physical address of the suspended thread's own PML4,
+	 * captured on a prior boot whose physical memory layout need not
+	 * match this one: reloading it verbatim can point %cr3 at an
+	 * unrelated or incoherent page, losing the kernel-half mappings
+	 * every subsequent instruction fetch depends on, with no trap
+	 * deliverable because the fault happens before any consistent IDT
+	 * is guaranteed under the bogus tree.  Captured and confirmed this
+	 * session: with the saved pcb_cr3 reloaded as-is, the very next
+	 * kernel-half PML4 entries read back incoherent relative to the
+	 * live, correct kernel_pmap tree, and the guest resets with no
+	 * trap moments into resumectx().
+	 *
+	 * %cr3 right here is already the correct, live, resume-boot
+	 * kernel_pmap->pm_cr3 (the K-10 trampoline's terminal CR3 load
+	 * before the jump into this function): overwrite the saved PCB's
+	 * pcb_cr3 with that live value so resumectx()'s own reload is a
+	 * safe no-op, exactly mirroring how hibernate_machdep_prepare()
+	 * already substitutes the live kernel_pmap->pm_cr3 for
+	 * hah_saved_cr3_pa rather than trusting the saved image's own
+	 * captured CR3 value.
+	 */
+	movq	%cr3, %rax
+	movq	%rax, PCB_CR3(%r12)
+
 	movq	%r12, %rdi
 	call	resumectx
 	/* NOTREACHED - resumectx returns directly to .Lhibernate_resumed */
