@@ -2486,6 +2486,41 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			    kernel_pmap->pm_cr3, (vm_offset_t)&KPML4phys, true,
 			    &selfcopied);
 		}
+		if (error == 0) {
+			/*
+			 * resumectx() (sys/amd64/amd64/cpu_switch.S)'s final
+			 * act is "movq PCB_RSP(%rdi),%rsp; ... ; movq
+			 * PCB_RIP(%rdi),%rax; movq %rax,(%rsp)" -- it switches
+			 * onto the SUSPENDED thread's own saved kernel stack
+			 * (pcb_rsp) and writes the saved return address onto
+			 * it, immediately before the final jmp/ret back into
+			 * .Lhibernate_resumed.  That stack is a page this file
+			 * never adds to the protected VA set: like saved_pcb_va
+			 * and pc_gdt, its own page-table path can fall inside
+			 * the K-10 destination set and collapse.  Captured and
+			 * confirmed this session: a double fault with
+			 * rip inside resumectx() at exactly this
+			 * "movq %rax,(%rsp)" instruction, gsbase pointing at
+			 * the (already-fixed) GDT KVA rather than this CPU's
+			 * own pcpu, and a separate run's WITNESS panic
+			 * (td_critnest nonzero at the real, live curthread,
+			 * confirmed non-zero only AFTER my own diagnostic read
+			 * it as zero moments earlier) both trace back to the
+			 * same root cause: the suspended thread's own stack
+			 * page's page-table path was never proven disjoint.
+			 * Its *content* must come from the saved image (it
+			 * holds the actual suspended register/stack-frame
+			 * state resumectx() restores), so copy_leaf is false
+			 * here, exactly like saved_pcb_va/pc_gdt above.
+			 */
+			register_t kstack_va;
+
+			kstack_va = susppcbs[0]->sp_pcb.pcb_rsp;
+			kstack_va &= ~(register_t)PAGE_MASK;
+			error = hibernate_md_selfcopy_walk(ha, wvec, p,
+			    kernel_pmap->pm_cr3, (vm_offset_t)kstack_va, false,
+			    &selfcopied);
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
