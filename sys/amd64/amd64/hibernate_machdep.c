@@ -2450,8 +2450,31 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * already-correct boot (not the saved image): the
 			 * saved PCB's pcb_gdt base/limit simply name this
 			 * CPU's one fixed GDT, which the ordinary boot
-			 * already built correctly, so copy_leaf is false
-			 * here too.
+			 * already built correctly, so this leaf's *data*
+			 * must be the resume kernel's own current bytes,
+			 * not the saved image's -- copy_leaf is therefore
+			 * true here, exactly mirroring the KPML4phys case
+			 * below (also "must keep the resume boot's own
+			 * value", also copy_leaf=true), not saved_pcb_va's
+			 * case above (whose content must come FROM the
+			 * saved image, hence copy_leaf=false there).  A
+			 * prior version of this call passed copy_leaf=false,
+			 * which contradicted this exact comment's own stated
+			 * intent and, because pc_gdt shares its one-page
+			 * struct pcpu with pc_curthread/pc_idlethread, let
+			 * the K-10 destructive copy overwrite the BSP's
+			 * entire live pcpu leaf (not just the GDT) with the
+			 * saved image's snapshot of it -- confirmed by a
+			 * live GDB capture at vm_phys_hibernate_release()'s
+			 * entry showing curthread resolved to an unrelated,
+			 * stale thread (a WITNESS "spinlock or critical
+			 * section held" panic followed, since that stale
+			 * thread's td_critnest was never the one
+			 * acpi_s4_resume_discard_snapshot() had just
+			 * zeroed).  Making this leaf self-copied (a no-op
+			 * under the destructive copy) keeps the whole BSP
+			 * pcpu page -- GDT included -- as this boot's own,
+			 * already-correct, already-running state.
 			 */
 			struct pcpu *bsp_pc, *ap_pc;
 			u_int ap_cpu;
@@ -2461,13 +2484,17 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				return (EINVAL);
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
 			    kernel_pmap->pm_cr3, (vm_offset_t)bsp_pc->pc_gdt,
-			    false, &selfcopied);
+			    true, &selfcopied);
 			/*
 			 * hibernate_resume_ap_entry() loads the AP's own
 			 * pc_gdt via lgdt() on the release path.  Each CPU's
 			 * pc_gdt lives in that CPU's own per-CPU page, so the
 			 * BSP's walk above does not cover it: protect its
-			 * page-table path under the same rule.  The
+			 * leaf under the same corrected rule (copy_leaf=true;
+			 * see the comment above) -- the AP's own pcpu page,
+			 * including its pc_curthread/pc_idlethread, must
+			 * likewise survive the destructive copy as this
+			 * boot's own state, not the saved image's.  The
 			 * mp_ncpus == 2 refusal above leaves exactly one
 			 * such CPU.
 			 */
@@ -2484,7 +2511,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					return (EINVAL);
 				error = hibernate_md_selfcopy_walk(ha, wvec, p,
 				    kernel_pmap->pm_cr3,
-				    (vm_offset_t)ap_pc->pc_gdt, false,
+				    (vm_offset_t)ap_pc->pc_gdt, true,
 				    &selfcopied);
 			}
 		}
