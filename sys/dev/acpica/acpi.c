@@ -4794,6 +4794,21 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	int saved_td_locks = curthread->td_locks;
 	int saved_td_pinned = curthread->td_pinned;
 	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
+	/*
+	 * K24-T00: capture the hibernating thread's own identity now, on the
+	 * SAVE side, where curthread is unambiguously correct.  This pointer
+	 * survives in the saved image as an ordinary stack local (the same
+	 * protection mechanism already proven correct for hib_res_pages: the
+	 * kstack self-copy fix in hibernate_machdep.c keeps this entire
+	 * stack frame's bytes intact across the destructive copy).  It is
+	 * used below, in the EJUSTRETURN branch, to re-establish
+	 * PCPU(curthread)/PCPU(curpcb) explicitly -- see that branch's own
+	 * comment for the full root-cause account (resumectx() never writes
+	 * pc_curthread, and the pc_gdt copy_leaf=true fix now preserves
+	 * whatever thread the RESUME kernel's own cold boot had scheduled,
+	 * not the saved image's).
+	 */
+	struct thread *saved_td = curthread;
 	struct hibernate_dump_args dargs = {
 		.sc = sc,
 		.hcb = hcb,
@@ -4845,6 +4860,51 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 *   2. free the reservation array
 		 *   1. hibernate_coordinator_release() -- release lock LAST
 		 *
+		 * K24-T00: re-establish PCPU(curthread)/PCPU(curpcb) FIRST,
+		 * before any other resume-path code runs, including
+		 * acpi_s4_resume_discard_snapshot() immediately below.
+		 *
+		 * Root cause, established this session with direct in-kernel
+		 * evidence (not inference): resumectx() (sys/amd64/amd64/
+		 * cpu_switch.S) restores %cr3, segment selectors, and
+		 * FSBASE/GSBASE/KGSBASE from the saved PCB, but never writes
+		 * PCPU(curthread) or PCPU(curpcb) -- grep confirms no call on
+		 * this entire resume path ever does.  Before the pc_gdt
+		 * copy_leaf=true fix (this same session, commit
+		 * 247fb4c738a), the K-10 destructive copy silently overwrote
+		 * the whole BSP pcpu leaf page -- pc_curthread included --
+		 * with the SAVED image's snapshot of it, which accidentally
+		 * (if fragile-ly) carried a plausible thread pointer through.
+		 * That fix correctly protects pc_gdt's own data (a real,
+		 * independent bug, see that commit), but as an unintended
+		 * side effect it now makes the ENTIRE pcpu leaf -- including
+		 * pc_curthread/pc_curpcb/pc_idlethread -- self-copied, i.e.
+		 * preserved as the RESUME kernel's own cold-boot value, never
+		 * updated to the resumed thread.  Direct evidence: a
+		 * diagnostic printf at acpi_s4_resume_bsp() entry (this
+		 * session) read curthread=0xfffff80003650000 tid=100067
+		 * ("logger"/"syslogd") on this run, the EXACT SAME fixed
+		 * pointer value multiple independent earlier sessions'
+		 * captures also recorded (round 3/4 above, several different
+		 * physical boots) -- conclusive proof this is a frozen,
+		 * resume-kernel-boot-time constant, not the actual resumed
+		 * thread (ground truth saved_td->td_tid=100080 on this same
+		 * run, read directly from the SAVE side immediately before
+		 * dumpsys_hibernate_savectx(), confirming the two never
+		 * matched).  This explains every prior round's "td_critnest
+		 * mysteriously nonzero despite being zeroed moments earlier"
+		 * finding: discard_snapshot() was zeroing a DIFFERENT
+		 * thread's counters the whole time, not the resumed thread's
+		 * own.
+		 *
+		 * Fix: restore the actual resumed thread's identity from
+		 * saved_td (captured on the SAVE side, before
+		 * dumpsys_hibernate_savectx(), and preserved via the ordinary
+		 * stack-frame self-copy already in place) before any other
+		 * code on this path reads or writes curthread.
+		 */
+		PCPU_SET(curthread, saved_td);
+		PCPU_SET(curpcb, saved_td->td_pcb);
 		 * acpi_s4_resume_discard_snapshot() must run here, before
 		 * hibernate_barrier_unwind(), not inside acpi_s4_resume_bsp()
 		 * afterward: the restored image is a snapshot of curthread
