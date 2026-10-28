@@ -31,6 +31,7 @@
 #include <sys/proc.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
+#include <sys/timetc.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
@@ -2581,6 +2582,50 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			error = hibernate_md_selfcopy_walk(ha, wvec, p,
 			    kernel_pmap->pm_cr3, (vm_offset_t)kstack_va, false,
 			    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00: ths[]'s (timehands ring buffer,
+			 * sys/kern/kern_tc.c) own page-table path can fall
+			 * inside the K-10 destination set and collapse,
+			 * exactly like pc_gdt/vm_page_array/kstack above.
+			 * Every time-reading primitive built on
+			 * GETTHBINTIME() (binuptime()/sbinuptime()/etc.)
+			 * loops until it observes th_generation nonzero and
+			 * stable across two consecutive loads; if that
+			 * generation field is left unreadable/unstable by a
+			 * collapsed mapping, the loop spins forever with no
+			 * escape -- confirmed this session: execution hangs
+			 * silently, with no further output at all,
+			 * immediately after the first unbracketed
+			 * sbinuptime() call on the resume path
+			 * (hibernate_resume_park_release(),
+			 * sys/kern/kern_hibernate.c), before clock resume
+			 * (resumeclock()/resume_TSC()) has even run -- exactly
+			 * where this analysis predicts, since nothing upstream
+			 * of this fix ever protected this structure.  The
+			 * array's *content* must be the RESUME kernel's own,
+			 * correctly cold-booted clock state (ths[0]'s own
+			 * static initializer sets th_generation = 1), not the
+			 * saved image's cross-boot snapshot of a different
+			 * boot's clock hardware/calibration -- so copy_leaf is
+			 * true here, the same rule as pc_gdt/KPML4phys, not
+			 * vm_page_array/kstack's copy_leaf=false.
+			 */
+			uintptr_t ths_va;
+			size_t ths_len;
+			vm_offset_t ths_pg, ths_end;
+
+			tc_hibernate_selfcopy_range(&ths_va, &ths_len);
+			ths_pg = trunc_page((vm_offset_t)ths_va);
+			ths_end = round_page((vm_offset_t)ths_va + ths_len);
+			for (; ths_pg < ths_end; ths_pg += PAGE_SIZE) {
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, ths_pg, true,
+				    &selfcopied);
+				if (error != 0)
+					break;
+			}
 		}
 		if (error != 0)
 			return (error);

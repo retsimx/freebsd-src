@@ -97,6 +97,43 @@ static struct timehands *volatile timehands = &ths[0];
 struct timecounter *timecounter = &dummy_timecounter;
 static struct timecounter *timecounters = &dummy_timecounter;
 
+/*
+ * K24-T00: expose ths[]'s byte range so hibernate_machdep_prepare()
+ * (sys/amd64/amd64/hibernate_machdep.c) can self-copy its page-table path
+ * before the K-10 destructive copy runs.  Root cause this fixes: every
+ * time-reading primitive built on GETTHBINTIME() (binuptime()/
+ * sbinuptime()/etc., this file) loops `do { ... } while (gen == 0 || gen
+ * != th->th_generation)` against whichever struct timehands `timehands`
+ * (a file-static pointer, always &ths[N] for some N, never anywhere else)
+ * currently references.  Like every other kernel global this session has
+ * found unprotected (pc_gdt, vm_page_array, the suspended thread's
+ * kstack), ths[]'s own page-table path can fall inside the K-10
+ * destination set and collapse; if the active slot's th_generation then
+ * reads a value that is never both nonzero and stable across two
+ * consecutive loads (e.g. 0, from a collapsed/zeroed page, or a page that
+ * continues to change under the destructive copy's own ongoing effects),
+ * this loop spins forever with no escape -- it is not bounded by any
+ * deadline, since it IS the primitive every deadline in this kernel is
+ * built on.  Captured and confirmed this session: execution hangs
+ * silently, with no further output of any kind, immediately after the
+ * first unbracketed sbinuptime() call on the resume path
+ * (hibernate_resume_park_release(), sys/kern/kern_hibernate.c), exactly
+ * where this analysis predicts.  The array's *content* (th_generation,
+ * th_offset, etc.) must come from the RESUME kernel's own, correctly
+ * initialized cold-boot state (ths[0]'s own static initializer sets
+ * th_generation = 1), not the saved image's cross-boot snapshot -- the
+ * saved image's timehands state describes a different boot's clock
+ * hardware/calibration entirely -- so this is copy_leaf=true, exactly
+ * like pc_gdt/KPML4phys, not copy_leaf=false like vm_page_array/kstack.
+ */
+void
+tc_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+
+	*va_out = (uintptr_t)ths;
+	*len_out = sizeof(ths);
+}
+
 /* Mutex to protect the timecounter list. */
 static struct mtx tc_lock;
 
