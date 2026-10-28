@@ -546,6 +546,25 @@ hibernate_resume_ap_entry(u_int cpu)
 	wrmsr(MSR_KGSBASE, 0);
 
 	pc->pc_curthread = pc->pc_idlethread;
+	/*
+	 * K24-T00: the same stale-nesting-counter defect fixed on the BSP
+	 * side (acpi_s4_resume_bsp_cpu(), acpi.c; hibernate_barrier_unwind()
+	 * Stage 7, kern_hibernate.c) applies symmetrically here.
+	 * pc_idlethread's own td_critnest/td_md.md_spinlock_count are
+	 * whatever this field happened to hold inside the SAVED image this
+	 * CPU's idle thread struct was captured from (or whatever the K-10
+	 * destructive copy left there) -- never proven zero on this path.
+	 * mca_init()/lapic_setup(1) below are reached before any opportunity
+	 * to reset these counters otherwise, and (by the same WITNESS rule
+	 * already fixed on the BSP) any blockable sleep-lock acquisition
+	 * downstream of here with a stale nonzero counter either panics or,
+	 * if WITNESS's own check itself is gated behind a lock this thread
+	 * now incorrectly believes it already holds, can wedge silently
+	 * instead.  Zero both before any further code runs, mirroring the
+	 * BSP's own already-proven-correct fix.
+	 */
+	curthread->td_critnest = 0;
+	curthread->td_md.md_spinlock_count = 0;
 
 	if (fred)
 		amd64_cpu_init_fred();
