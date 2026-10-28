@@ -2030,6 +2030,34 @@ hibernate_barrier_unwind(struct hibernate_attempt *ha,
 	/* Stage 7: release page reservation. */
 	if (s & HIB_STAGE_RESERVED) {
 		hibernate_barrier_retract_attempt();
+		/*
+		 * K24-T00: acpi_s4_resume_discard_snapshot() zeroes
+		 * curthread->td_critnest and td_md.md_spinlock_count on the
+		 * EJUSTRETURN resume path before this function is reached
+		 * (sys/dev/acpica/acpi.c), precisely because the restored
+		 * image is a snapshot of curthread taken mid-dump-worker and
+		 * those counters still carry that worker's nesting depth the
+		 * instant resumectx() returns.  vm_phys_hibernate_release()
+		 * immediately below acquires a blockable sleep mutex
+		 * (vm_domain_free_lock()); WITNESS panics
+		 * ("acquiring blockable sleep lock with spinlock or critical
+		 * section held") if either counter is nonzero at that point.
+		 * Diagnostic instrumentation this session measured both
+		 * counters as 0 immediately before this exact call on most
+		 * runs, but also measured them nonzero (1) on others with no
+		 * difference in the surrounding code -- consistent with a
+		 * timing-sensitive path (also correlated with an
+		 * intermittent "timeout stopping cpus" AP rendezvous
+		 * message seen on the same runs) occasionally leaving stale
+		 * nesting state here despite discard_snapshot()'s own reset.
+		 * This mirrors discard_snapshot()'s own reset, applied again
+		 * at the point that actually needs the invariant, as a
+		 * narrow, local safety net rather than chasing the AP race
+		 * further; it is a no-op on the SAVE-side call to this same
+		 * function (both counters are always genuinely 0 there).
+		 */
+		curthread->td_critnest = 0;
+		curthread->td_md.md_spinlock_count = 0;
 		vm_phys_hibernate_release(res);
 		s &= ~HIB_STAGE_RESERVED;
 	}
