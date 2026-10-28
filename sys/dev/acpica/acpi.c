@@ -4115,6 +4115,26 @@ acpi_s4_resume_bsp_cpu(void)
 {
 
 	pmap_init_pat();
+	/*
+	 * K24-T00: the same stale-nesting-counter WITNESS panic class fixed
+	 * at hibernate_barrier_unwind()'s Stage 7 call site recurs here, one
+	 * call further down this same EJUSTRETURN resume chain:
+	 * initializecpu() -> getenv_int() -> getenv_quad() -> kenv_acquire()
+	 * acquires a blockable sleep mutex ("kernel environment"), and
+	 * WITNESS panics on the restored thread's td_critnest/
+	 * td_md.md_spinlock_count, observed nonzero at this exact call
+	 * despite acpi_s4_resume_discard_snapshot()'s own zeroing several
+	 * calls earlier in the same unwind -- the same resume-path pattern
+	 * (stale nesting state reappearing between calls, not a single
+	 * fixed point) already documented at the Stage 7 call site in
+	 * acpi_EnterSleepState().  Apply the identical, narrowly-scoped
+	 * reset immediately before the first call on this path that
+	 * acquires a blockable sleep lock, rather than only at the first
+	 * one found; this mirrors hibernate_barrier_unwind()'s own
+	 * comment and fix for the identical defect.
+	 */
+	curthread->td_critnest = 0;
+	curthread->td_md.md_spinlock_count = 0;
 	initializecpu();
 	/*
 	 * Restore the BSP FPU state, including XCR0.  This must happen
