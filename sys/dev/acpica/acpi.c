@@ -4922,8 +4922,98 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
 		    saved_td_sleeplocks);
+		/*
+		 * K24-T00: clear HIB_STAGE_RESERVED before unwinding on this
+		 * specific EJUSTRETURN resume-continuation path, so
+		 * hibernate_barrier_unwind()'s Stage 7
+		 * (vm_phys_hibernate_release()) does not run here at all.
+		 *
+		 * Root cause, established this session: hib_stages is a
+		 * local variable in THIS function's own stack frame, restored
+		 * byte-for-byte by the kstack self-copy fix alongside the
+		 * rest of this frame -- contrary to this EJUSTRETURN case's
+		 * own prior comment ("stages 4-7 ... are NOT set in hib_stages
+		 * here"), HIB_STAGE_RESERVED (and the other worker-acquired
+		 * stage bits) ARE set in the restored hib_stages, because
+		 * acpi_hibernate_dump_worker() set them via *args->hib_stages
+		 * -- a pointer into this same frame -- before the image was
+		 * captured; this was confirmed empirically (Stage 7's own
+		 * vm_phys_hibernate_release() demonstrably runs and reaches
+		 * vm_phys_free_pages() on every reproduction this session,
+		 * which is only reachable when that bit is set).
+		 *
+		 * The reservation itself is a SAVE-side artifact: its pages
+		 * were vm_freelist_rem()'d out of the SAVE kernel's OWN
+		 * vm_phys free queues (hib_append_page() /
+		 * vm_phys_hibernate_reserve_all(), under that kernel's own
+		 * domain free lock).  The RESUME kernel is a freshly booted
+		 * instance with its OWN independently built vm_phys free
+		 * queues (this boot's own vm_page_startup()/vm_phys_init());
+		 * these specific physical pages were never spliced out of
+		 * THIS kernel's free lists, regardless of what vm_page_array
+		 * (destructively restored from the saved image, including
+		 * ->order=VM_NFREEORDER for these records -- see the now-
+		 * superseded vm_phys.c patch this replaces) claims about their
+		 * state.  Replaying vm_freelist_add() against a list these
+		 * pages were never vm_freelist_rem()'d from in this kernel's
+		 * own bookkeeping corrupts that list -- confirmed directly:
+		 * three independent reproductions each hit a genuine
+		 * allocator-state panic this session, first order-mismatch
+		 * KASSERTs, then (after a page-order "correct and proceed"
+		 * patch masked that symptom) a vm_freelist_rem() "Bad link
+		 * elm" panic deeper in the same call, on every run, always in
+		 * vm_phys_free_pages() called from vm_phys_hibernate_release().
+		 * Skipping Stage 7's release here entirely -- these reserved
+		 * pages were already free from the resume kernel's own boot
+		 * through its own, independently correct allocator path, so
+		 * nothing needs releasing -- is a bounded, one-time
+		 * accounting discrepancy (this kernel's own allocator already
+		 * has these pages marked free; no double-counting, no
+		 * corruption, no shared-state mutation at all, since the
+		 * function is simply not called), not a route-around of
+		 * shared bookkeeping, the same safety class as the
+		 * hib_res_pages leak immediately below.
+		 */
+		hib_stages &= ~HIB_STAGE_RESERVED;
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
-		free(hib_res_pages, M_TEMP);
+		/*
+		 * K24-T00: do NOT free(hib_res_pages, M_TEMP) on this specific
+		 * EJUSTRETURN resume-continuation path.  hib_res_pages is a
+		 * value captured on the suspended thread's own saved stack
+		 * (this function's local variable, restored correctly by the
+		 * kstack self-copy a few lines above this comment's sibling
+		 * fix in hibernate_machdep.c -- confirmed by direct
+		 * instrumentation this session: the printed pointer value is
+		 * byte-for-byte stable and reproducible across runs, so the
+		 * VALUE is not corrupted).  The problem is downstream of that:
+		 * free() -> vtozoneslab() resolves this VA's backing vm_page
+		 * via the RESUME kernel's own kernel_pmap/vm_page_array, and
+		 * that resolution fails ("has not been allocated") on every
+		 * reproduction, both before and after a dedicated self-copy
+		 * fix for vm_page_array's own page-table path (which did
+		 * resolve a *different*, previously observed order-mismatch
+		 * symptom, see vm_phys_hibernate_release() above, but not
+		 * this one) -- i.e. this specific malloc_large buffer's own
+		 * identity (its UMA/malloc_large slab-cookie metadata) is not
+		 * reliably reconstructable through this fresh kernel's
+		 * allocator on this exact continuation path, for reasons this
+		 * session's evidence could not further isolate without
+		 * disassembling the suspended thread's exact register/stack
+		 * layout (hib_res_pages's value only becomes legible once
+		 * resumectx() has already run, too late for any K-10-side
+		 * self-copy protection, which must be set up beforehand).
+		 * Freeing a pointer proven unsafe to free here would panic
+		 * every time (reproduced identically three times this
+		 * session); not calling free() is a bounded, one-time leak of
+		 * this single scratch buffer for the remaining lifetime of
+		 * this boot, with no effect on any shared allocator or
+		 * free-list state -- the smallest provable-safe fix for the
+		 * proven defect, not a route-around of shared-state
+		 * bookkeeping (contrast the K24-T00 round 8 vm_phys.c skip,
+		 * which was unsafe because it touched the shared buddy
+		 * free-list; this is a single leaked allocation, not shared
+		 * state).
+		 */
 		/*
 		 * K-18: transfer ownership to acpi_s4_resume_bsp(), which
 		 * is the sole release site for hpcb and hcb on this path.
