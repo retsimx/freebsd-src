@@ -2720,6 +2720,127 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					break;
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Each live CPU's own DPCPU (dynamic per-CPU) region.
+			 * Confirmed by direct testing: once the AP idle-thread
+			 * reseed above lets the continuation run further, a NEW
+			 * panic appears inside resumeclock()'s own configtimer()
+			 * call ("spin lock held too long", ET_HW_LOCK).  This is
+			 * the same bug class as pc_gdt/KPML4phys/ths[] above: a
+			 * resume-kernel-owned structure whose backing physical
+			 * pages can fall inside the K-10 destination set.  Each
+			 * live CPU's own DPCPU area is a separate
+			 * kmem_malloc_domainset() allocation, disjoint from the
+			 * shared template and from every other CPU's own area, so
+			 * each is walked independently via DPCPU_START/DPCPU_SIZE
+			 * from the CPU's own pc_dynamic base.  copy_leaf is true:
+			 * this is live resume-kernel state (et_hw_mtx, the
+			 * scheduler's own tdq_lock/run queue, timer bookkeeping)
+			 * every live CPU keeps using for the remainder of this
+			 * boot, not saved-image content worth restoring.
+			 */
+			vm_offset_t dpcpu_va, dpcpu_end;
+			u_int dp_cpu;
+
+			CPU_FOREACH(dp_cpu) {
+				struct pcpu *dp_pc = pcpu_find(dp_cpu);
+				if (dp_pc == NULL)
+					return (EINVAL);
+				dpcpu_va = trunc_page((vm_offset_t)
+				    (dp_pc->pc_dynamic + DPCPU_START));
+				dpcpu_end = dpcpu_va + DPCPU_SIZE;
+				for (; dpcpu_va < dpcpu_end;
+				    dpcpu_va += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    dpcpu_va, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+				if (error != 0)
+					break;
+			}
+		}
+		if (error == 0) {
+			/*
+			 * dpcpu_off[]/cpuid_to_pcpu[]: the two BSS-global lookup
+			 * tables the per-CPU DPCPU protection above does not
+			 * cover, found by live register capture of a genuine,
+			 * reproducible hang: CPU0 stuck spinning forever inside
+			 * configtimer()'s own restart: loop, which resolves every
+			 * other live CPU's own DPCPU_ID_PTR() -- expanding to
+			 * dpcpu_off[cpu] as its base -- while CPU1 (the AP) was
+			 * simultaneously observed genuinely idle, having already
+			 * cleared its own action flag.  If the K-10 copy
+			 * overwrites dpcpu_off[]/cpuid_to_pcpu[] with the saved
+			 * image's own (different-boot) offsets, CPU0 computes the
+			 * wrong physical address for CPU1's action/handle flags,
+			 * spinning on memory that is never CPU1's own live
+			 * pcpu_state.  copy_leaf is true for both: these are this
+			 * boot's own, already-correct lookup tables, populated
+			 * once at cold SMP bring-up and read continuously by
+			 * every CPU_FOREACH/IPI caller thereafter.
+			 */
+			vm_offset_t tbl_va, tbl_end;
+
+			tbl_va = trunc_page((vm_offset_t)dpcpu_off);
+			tbl_end = round_page((vm_offset_t)dpcpu_off +
+			    sizeof(dpcpu_off[0]) * MAXCPU);
+			for (; tbl_va < tbl_end && error == 0;
+			    tbl_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, tbl_va, true,
+				    &selfcopied);
+			if (error == 0) {
+				tbl_va = trunc_page(
+				    (vm_offset_t)cpuid_to_pcpu);
+				tbl_end = round_page(
+				    (vm_offset_t)cpuid_to_pcpu +
+				    sizeof(cpuid_to_pcpu[0]) * MAXCPU);
+				for (; tbl_va < tbl_end && error == 0;
+				    tbl_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    tbl_va, true, &selfcopied);
+			}
+		}
+		if (error == 0) {
+			/*
+			 * vm_dom[] (sys/vm/vm_page.c), the per-NUMA-domain array
+			 * whose vmd_pagequeues[] embed each struct vm_pagequeue's
+			 * own pq_pl (TAILQ_HEAD).  Found after the DPCPU fix above
+			 * resolved the configtimer() panic on three consecutive
+			 * fresh runs, exposing a new, perfectly deterministic
+			 * panic further downstream: vm_pageout_init_scan()'s own
+			 * TAILQ_INSERT into pq->pq_pl trips "Bad link elm ...
+			 * next->prev != elm" -- the exact signature of a TAILQ
+			 * whose prev/next pointers were overwritten by the K-10
+			 * destructive copy with the saved image's own vm_dom[]
+			 * snapshot, not built by this boot's own
+			 * vm_page_startup().  copy_leaf is true: vm_dom's own
+			 * pq_pl/pq_cnt/pq_mutex are live, in-use allocator/pageout
+			 * state this boot's own vm_page_startup() already built
+			 * correctly, not saved-image content worth restoring.
+			 * Walked over vm_ndomains (the actual populated domain
+			 * count for this boot), not the MAXMEMDOM upper bound.
+			 */
+			vm_offset_t vmd_va, vmd_end;
+			int dom;
+
+			for (dom = 0; dom < vm_ndomains && error == 0; dom++) {
+				vmd_va = trunc_page(
+				    (vm_offset_t)&vm_dom[dom]);
+				vmd_end = round_page(
+				    (vm_offset_t)&vm_dom[dom] +
+				    sizeof(vm_dom[dom]));
+				for (; vmd_va < vmd_end && error == 0;
+				    vmd_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    vmd_va, true, &selfcopied);
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
