@@ -547,24 +547,34 @@ hibernate_resume_ap_entry(u_int cpu)
 
 	pc->pc_curthread = pc->pc_idlethread;
 	/*
-	 * K24-T00: the same stale-nesting-counter defect fixed on the BSP
-	 * side (acpi_s4_resume_bsp_cpu(), acpi.c; hibernate_barrier_unwind()
-	 * Stage 7, kern_hibernate.c) applies symmetrically here.
-	 * pc_idlethread's own td_critnest/td_md.md_spinlock_count are
-	 * whatever this field happened to hold inside the SAVED image this
-	 * CPU's idle thread struct was captured from (or whatever the K-10
-	 * destructive copy left there) -- never proven zero on this path.
-	 * mca_init()/lapic_setup(1) below are reached before any opportunity
-	 * to reset these counters otherwise, and (by the same WITNESS rule
-	 * already fixed on the BSP) any blockable sleep-lock acquisition
-	 * downstream of here with a stale nonzero counter either panics or,
-	 * if WITNESS's own check itself is gated behind a lock this thread
-	 * now incorrectly believes it already holds, can wedge silently
-	 * instead.  Zero both before any further code runs, mirroring the
-	 * BSP's own already-proven-correct fix.
+	 * The idle thread entering here is not continuing a captured
+	 * snapshot context -- unlike the BSP's own continuing thread,
+	 * which does carry a stale, mid-dump-worker nesting count that
+	 * must be discarded (acpi_s4_resume_bsp_cpu(), acpi.c;
+	 * hibernate_barrier_unwind() Stage 7, kern_hibernate.c) -- this AP
+	 * is deliberately treated as entering fresh, exactly like
+	 * init_secondary_tail()'s own cold-boot path, and should inherit
+	 * that path's own invariant instead of the BSP's.  A direct,
+	 * physical-marker-based comparison of a genuine cold-boot AP
+	 * against this resumed AP, both captured at the identical point
+	 * (sched_ap_entry() entry), found every other field identical
+	 * except these two: a working cold-boot AP reads td_critnest == 1
+	 * and td_md.md_spinlock_count == 1 here, matching the universal
+	 * thread-creation invariant every idle thread is given at
+	 * cpu_fork() time ("Setup to release spin count in fork_exit()",
+	 * sys/amd64/amd64/vm_machdep.c) and which persists untouched until
+	 * the thread's own first real scheduler entry.  sched_ap_entry()
+	 * (called a few lines below) ends in sched_throw(NULL), whose
+	 * first-CPU-entry path unconditionally asserts
+	 * KASSERT(curthread->td_md.md_spinlock_count == 1, ...) -- not
+	 * optional cleanup, but the exact precondition this call requires.
+	 * Confirmed by direct test: with these fields at 0, "panic: invalid
+	 * count 0" fired inside this exact first-entry path on a genuine,
+	 * physically-verified correct AP; with 1, the assert is satisfied
+	 * by construction.
 	 */
-	curthread->td_critnest = 0;
-	curthread->td_md.md_spinlock_count = 0;
+	curthread->td_critnest = 1;
+	curthread->td_md.md_spinlock_count = 1;
 
 	if (fred)
 		amd64_cpu_init_fred();
