@@ -5867,11 +5867,45 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		goto cleanup;
 
 	/*
+	 * hibernate_resume_attempt() runs on an ordinary, unbound GEOM
+	 * worker kproc thread (sys/geom/geom_hibernate.c), which the
+	 * scheduler is free to run on either CPU on an mp_ncpus==2 harness.
+	 * hibernate_machdep_prepare()'s own park_cpu computation ("the one
+	 * cpu id below mp_ncpus that is not this, currently executing,
+	 * BSP") silently computes the complement of whichever CPU happens
+	 * to be running it -- if this worker thread is scheduled onto the
+	 * AP rather than the BSP, it embeds HPK_CPU = 0 into the park
+	 * stub's parameter block.  At resume time the released AP (always
+	 * physical cpu-index 1 on this harness) reads back this stale
+	 * HPK_CPU = 0 and calls pcpu_find(0), resolving the BSP's OWN
+	 * struct pcpu, then writes pc_curthread = pc_idlethread into the
+	 * BSP's pcpu leaf instead of its own -- the mechanism behind the
+	 * intr_resume() "mtx_lock() by idle thread" panic: the scheduler's
+	 * run-queue still correctly credits the resumed thread to CPU0,
+	 * but CPU0's own PCPU(curthread) has been overwritten by the AP's
+	 * entry code acting on a wrong cpu index.
+	 *
+	 * Bind this thread to CPU0 before hibernate_machdep_prepare() runs,
+	 * matching the SAVE side's own already-correct idiom (sys/dev/
+	 * acpica/acpi.c, AcpiEnterSleepState()'s sched_bind(curthread, 0)
+	 * immediately before the equivalent save-time work).  Unbind
+	 * immediately after: nothing downstream of the MD_PREPARE seam
+	 * depends on this thread's own CPU affinity.
+	 */
+	thread_lock(curthread);
+	sched_bind(curthread, 0);
+	thread_unlock(curthread);
+
+	/*
 	 * MD_PREPARE: K-10 inserts hibernate_machdep_prepare() at this seam.
 	 */
 	stage = HIB_RESUME_MD_PREPARE;
 	hibernate_resume_stage_record(stage);
 	error = hibernate_machdep_prepare(ha);
+
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
 	if (error != 0)
 		goto cleanup;
 
