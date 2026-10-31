@@ -599,6 +599,70 @@ hibernate_resume_ap_entry(u_int cpu)
 	mca_init();
 	lapic_setup(1);
 
+	/*
+	 * The idle thread's td_pcb still holds the switch-out context
+	 * recorded in the saved image.  At save time the AP was stopped by
+	 * IPI while running its idle thread (that context went to
+	 * stoppcbs/susppcbs, not td_pcb), so td_pcb names an older
+	 * cpu_switch() return inside sched_switch() whose stack frames the
+	 * idle loop has since reused; cpu_throw() would resume there.
+	 * Re-seed the pcb as cpu_fork() + cpu_fork_kthread_handler() did at
+	 * idle-thread creation, so the AP enters sched_idletd() fresh via
+	 * fork_trampoline, as a cold-boot AP does.
+	 */
+	{
+		struct thread *itd;
+		struct pcb *ipcb;
+
+		itd = pc->pc_idlethread;
+		ipcb = itd->td_pcb;
+		ipcb->pcb_r12 = (register_t)sched_idletd;
+		ipcb->pcb_rbx = 0;
+		ipcb->pcb_rbp = 0;
+		ipcb->pcb_rsp = (register_t)itd->td_frame - sizeof(void *);
+		ipcb->pcb_rip = (register_t)fork_trampoline;
+		clear_pcb_flags(ipcb, PCB_FPUINITDONE | PCB_USERFPUINITDONE |
+		    PCB_KERNFPU | PCB_KERNFPU_THR);
+	}
+	/*
+	 * Sibling defect to the pcb reseed above.  pc_monitorbuf.idle_state
+	 * lives in this same one-page per-CPU leaf as pc_gdt, which this
+	 * file's own copy_leaf=true fix correctly preserves as this boot's
+	 * own, already-live value -- but that value is whatever this exact
+	 * physical AP's idle_state held at the instant
+	 * hibernate_park_dispatch()'s ipi_startup() (an INIT-SIPI-SIPI,
+	 * which resets the AP's registers but not its pcpu memory) pulled
+	 * it out of its own normal cpu_idle_acpi()/cpu_idle_mwait() loop on
+	 * this same boot -- not necessarily STATE_RUNNING.
+	 * cpu_idle_enter()'s own KASSERT requires STATE_RUNNING on entry;
+	 * the path below is, matching the pcb reseed just above, a fresh
+	 * scheduler entry exactly like init_secondary_tail()'s own
+	 * cold-boot path, which never calls cpu_idle_enter() with anything
+	 * but a freshly zero-initialized (STATE_RUNNING) monitorbuf.
+	 * Confirmed by direct test: "panic: cpu_idle_enter: state 2" fired
+	 * immediately downstream of the pcb reseed above succeeding --
+	 * state 2 is STATE_SLEEPING, consistent with this AP having been
+	 * mid-"hlt" in its own pre-park cpu_idle_acpi() call when the SIPI
+	 * redirected it.
+	 */
+	pc->pc_monitorbuf.idle_state = 0; /* STATE_RUNNING, cpu_machdep.c */
+	/*
+	 * Reproduce the cold-boot scheduler-entry invariant this path was
+	 * missing: init_secondary_tail() calls sched_init_ap() immediately
+	 * before sched_ap_entry(), which (via sched_ule_init_ap())
+	 * establishes PCPU(sched) and derives the idle thread's own
+	 * td_lock from it (TDQ_LOCKPTR(TDQ_SELF())).  td_lock is per-thread
+	 * saved-image content, restored byte-for-byte by the K-10 copy,
+	 * carrying whichever lock (if any) the SAVE kernel's own idle
+	 * thread happened to be blocked on at suspend time, not this
+	 * boot's own tdq lock -- sched_ule_ap_entry()'s own comment
+	 * documents this exact precondition ("This should have been setup
+	 * in sched_init_ap()") immediately before an assert that otherwise
+	 * fails.  sched_init_ap() is two idempotent pointer writes with no
+	 * allocation and no hardware side effect; calling it here, once,
+	 * before sched_ap_entry(), reproduces the missing cold-boot step.
+	 */
+	sched_init_ap();
 	sched_ap_entry();
 	panic("hibernate: sched_ap_entry returned to %s", __func__);
 }
