@@ -2841,6 +2841,62 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					    vmd_va, true, &selfcopied);
 			}
 		}
+		if (error == 0) {
+			/*
+			 * sleepq_chains[SC_TABLESIZE] (sys/kern/subr_sleepqueue.c)
+			 * is live, continuously-read-and-written kernel lock/queue
+			 * state this boot's own init_sleepqueues() already built
+			 * correctly at startup, never previously added to this
+			 * file's protected-VA set.  copy_leaf is true: this boot's
+			 * own sc_lock must be unlocked (or correctly held by this
+			 * boot's own thread) exactly as this boot's own SYSINIT
+			 * left it; there is no saved-image sleepq_chains content
+			 * worth restoring, since a resume kernel's own sleeping-
+			 * thread population is necessarily different from the
+			 * save kernel's own.  This self-copy protects the page-
+			 * table path; the content itself is independently
+			 * reinitialised at resume time
+			 * (sleepq_hibernate_reinit_chains(), sys/dev/acpica/acpi.c).
+			 */
+			uintptr_t sq_va;
+			size_t sq_len;
+			vm_offset_t sq_pg, sq_end;
+
+			sleepq_hibernate_selfcopy_range(&sq_va, &sq_len);
+			sq_pg = trunc_page((vm_offset_t)sq_va);
+			sq_end = round_page((vm_offset_t)sq_va + sq_len);
+			for (; sq_pg < sq_end && error == 0;
+			    sq_pg += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, sq_pg, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * turnstile_chains[TC_TABLESIZE]
+			 * (sys/kern/subr_turnstile.c) is the identical bug shape
+			 * as sleepq_chains[] above: priority-propagating lock
+			 * contention is reached from numerous points in this
+			 * continuation, including inside DEVICE_RESUME(root_bus)'s
+			 * own driver resume callbacks.  copy_leaf is true, same
+			 * rule as sleepq_chains[] above; content is independently
+			 * reinitialised at resume time
+			 * (turnstile_hibernate_reinit_chains(), sys/dev/acpica/
+			 * acpi.c).
+			 */
+			uintptr_t ts_va;
+			size_t ts_len;
+			vm_offset_t ts_pg, ts_end;
+
+			turnstile_hibernate_selfcopy_range(&ts_va, &ts_len);
+			ts_pg = trunc_page((vm_offset_t)ts_va);
+			ts_end = round_page((vm_offset_t)ts_va + ts_len);
+			for (; ts_pg < ts_end && error == 0;
+			    ts_pg += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, ts_pg, true,
+				    &selfcopied);
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "

@@ -4943,6 +4943,57 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
 		    saved_td_sleeplocks);
 		/*
+		 * This file has no public header for any of these three
+		 * accessors, matching this file's own existing convention
+		 * (e.g. "extern struct susppcb **susppcbs" in
+		 * sys/amd64/amd64/hibernate_machdep.c, declared the same
+		 * way there).
+		 */
+		extern void sleepq_hibernate_reinit_chains(void);
+		extern void turnstile_hibernate_reinit_chains(void);
+		extern void callout_cpu_hibernate_reinit_chains(int cpu);
+		/*
+		 * After the K-10 destructive copy the machine is a hybrid
+		 * of saved-image and resume-kernel state.  sleepq_chains[]/
+		 * turnstile_chains[]/cc_callwheel[] are registries of
+		 * currently-pending operations (sleep, lock-contention,
+		 * armed-timer) keyed by thread/lock identity; every thread
+		 * other than the two that continue past this exact point
+		 * (this BSP thread, just discarded-and-reset above; the
+		 * AP's own fresh idle thread, reset separately by
+		 * hibernate_resume_ap_entry()) never runs again on this
+		 * resume path, so no entry in any of these three
+		 * registries can ever be legitimately claimed again.  Per
+		 * design-docs/resume-protocol.md's own K-13
+		 * hibernate_resume_owner_verify() contract (explicitly
+		 * fail-closed on "callout/clock state" as a named,
+		 * independently-verified field, not silently inherited),
+		 * the correct disposition for this class of structure is
+		 * REINITIALIZE, not adopt-wholesale: empty every chain's
+		 * own LIST_HEAD and re-mtx_init() every chain's own lock,
+		 * exactly as this boot's own cold SYSINIT already did
+		 * before the K-10 copy overwrote them, WITHOUT touching
+		 * either UMA zone or thread0's own fields (unsafe to
+		 * re-create).  This runs exactly once, here, strictly
+		 * before any sleep/lock-contention/callout operation this
+		 * continuation performs, and strictly before
+		 * acpi_s4_resume_scheduler_aps() (several lines below)
+		 * releases any AP, so no CPU can be concurrently touching
+		 * these registries while they are reinitialised -- a
+		 * two-writer race was directly tested and confirmed to
+		 * recur identically under a per-CPU-self-administered form,
+		 * so every CPU's own cc_callwheel is reinitialised here, on
+		 * the BSP, not by each AP for itself.
+		 */
+		sleepq_hibernate_reinit_chains();
+		turnstile_hibernate_reinit_chains();
+		{
+			int reinit_cpu;
+
+			CPU_FOREACH(reinit_cpu)
+				callout_cpu_hibernate_reinit_chains(reinit_cpu);
+		}
+		/*
 		 * K24-T00: clear HIB_STAGE_RESERVED before unwinding on this
 		 * specific EJUSTRETURN resume-continuation path, so
 		 * hibernate_barrier_unwind()'s Stage 7

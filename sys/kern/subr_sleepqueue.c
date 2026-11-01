@@ -160,6 +160,54 @@ static struct sleepqueue_chain sleepq_chains[SC_TABLESIZE];
 static uma_zone_t sleepq_zone;
 
 /*
+ * K24-T00 (round 42): expose sleepq_chains[]'s own byte range for
+ * hibernate_machdep_prepare()'s self-copy protection, matching the
+ * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
+ * file has no public header to declare a prototype in otherwise.
+ */
+void	sleepq_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out);
+void
+sleepq_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+
+	*va_out = (uintptr_t)sleepq_chains;
+	*len_out = sizeof(sleepq_chains);
+}
+
+/*
+ * K24-T00 (round 44): structural fix, replacing round 42/43's own
+ * per-structure copy_leaf toggling. sleepq_chains[] is a REGISTRY of
+ * currently-pending sleep operations; every entry names a thread that
+ * was asleep AT SAVE TIME. Every such thread, except the resumed BSP
+ * thread and the AP's own fresh idle thread (both handled elsewhere),
+ * never runs again on this resume path -- so any registry entry is
+ * permanently stale, and its own sc_lock may read as "owned" by a
+ * thread identity from a different kernel instance (the exact
+ * mechanism behind every assertion variant observed this round: "not
+ * owned", "(null) not owned", "Bad link elm", "sq != NULL"). Per
+ * design-docs/resume-protocol.md's own K-13 hibernate_resume_owner_
+ * verify() contract (explicitly fail-closed on "callout/clock state"),
+ * this class of structure must be independently re-established, not
+ * inherited. Re-init every chain's own LIST_HEAD (correctly empty) and
+ * re-mtx_init() every sc_lock, WITHOUT touching sleepq_zone or
+ * thread0.td_sleepqueue (both already correct from this boot's own
+ * cold SYSINIT; init_sleepqueues() itself is unsafe to re-call, since
+ * it unconditionally uma_zcreate()s a new zone).
+ */
+void	sleepq_hibernate_reinit_chains(void);
+void
+sleepq_hibernate_reinit_chains(void)
+{
+	int i;
+
+	for (i = 0; i < SC_TABLESIZE; i++) {
+		LIST_INIT(&sleepq_chains[i].sc_queues);
+		mtx_init(&sleepq_chains[i].sc_lock, "sleepq chain", NULL,
+		    MTX_SPIN | MTX_NEW);
+	}
+}
+
+/*
  * Prototypes for non-exported routines.
  */
 static int	sleepq_catch_signals(const void *wchan, int pri);

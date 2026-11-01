@@ -149,6 +149,47 @@ SYSCTL_UINT(_debug_turnstile, OID_AUTO, max_depth, CTLFLAG_RD,
 #endif
 static struct mtx td_contested_lock;
 static struct turnstile_chain turnstile_chains[TC_TABLESIZE];
+
+/*
+ * K24-T00 (round 42): expose turnstile_chains[]'s own byte range for
+ * hibernate_machdep_prepare()'s self-copy protection, matching the
+ * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
+ * file has no public header to declare a prototype in otherwise.
+ */
+void	turnstile_hibernate_selfcopy_range(uintptr_t *va_out,
+	    size_t *len_out);
+void
+turnstile_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+
+	*va_out = (uintptr_t)turnstile_chains;
+	*len_out = sizeof(turnstile_chains);
+}
+
+/*
+ * K24-T00 (round 44): structural fix, matching
+ * sleepq_hibernate_reinit_chains()'s own reasoning exactly --
+ * turnstile_chains[] is the identical shape of registry (pending
+ * priority-propagating lock contention, keyed by the lock object, not
+ * by a currently-running thread), with the same stale-owner exposure.
+ * Re-init every chain's own LIST_HEAD and re-mtx_init() every tc_lock,
+ * WITHOUT touching td_contested_lock or thread0.td_contested/
+ * td_turnstile (all already correct from this boot's own cold
+ * SYSINIT; init_turnstiles() itself is unsafe to re-call for the same
+ * reason as init_sleepqueues()).
+ */
+void	turnstile_hibernate_reinit_chains(void);
+void
+turnstile_hibernate_reinit_chains(void)
+{
+	int i;
+
+	for (i = 0; i < TC_TABLESIZE; i++) {
+		LIST_INIT(&turnstile_chains[i].tc_turnstiles);
+		mtx_init(&turnstile_chains[i].tc_lock, "turnstile chain",
+		    NULL, MTX_SPIN | MTX_NEW);
+	}
+}
 static uma_zone_t turnstile_zone;
 
 /*
