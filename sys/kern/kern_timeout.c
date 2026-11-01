@@ -362,6 +362,40 @@ callout_callwheel_init(void *dummy)
 SYSINIT(callwheel_init, SI_SUB_CPU, SI_ORDER_ANY, callout_callwheel_init, NULL);
 
 /*
+ * cc_callwheel[]'s own buckets register currently-armed callouts;
+ * every struct callout embedded in a thread or softc OTHER than the
+ * two continuing threads (the resumed BSP thread, the AP's own fresh
+ * idle thread) is, on this resume path, never going to be legitimately
+ * dequeued or fired by its own owning code again -- the same
+ * stale-registry exposure already fixed for sleepq_chains/
+ * turnstile_chains (sys/kern/subr_sleepqueue.c,
+ * sys/kern/subr_turnstile.c).  Re-init this one CPU's own bucket
+ * LIST_HEADs and re-mtx_init() its own cc_lock, without touching
+ * cc_callwheel's own backing allocation (already correctly placed and
+ * sized by this boot's own cold callout_cpu_init()) or any other
+ * struct callout_cpu field this function does not own.  This array's
+ * own backing pages are not separately self-copy-protected here: an
+ * attempt to do so was tested directly and found not to explain or
+ * affect the callout_process() corruption this reinit fixes, in
+ * either disposition (copy_leaf true or false); this reinit alone was
+ * confirmed sufficient.
+ */
+void	callout_cpu_hibernate_reinit_chains(int cpu);
+void
+callout_cpu_hibernate_reinit_chains(int cpu)
+{
+	struct callout_cpu *cc;
+	int i;
+
+	cc = CC_CPU(cpu);
+	if (cc->cc_callwheel == NULL)
+		return;
+	for (i = 0; i < callwheelsize; i++)
+		LIST_INIT(&cc->cc_callwheel[i]);
+	mtx_init(&cc->cc_lock, "callout", NULL, MTX_SPIN | MTX_NEW);
+}
+
+/*
  * Initialize the per-cpu callout structures.
  */
 static void
