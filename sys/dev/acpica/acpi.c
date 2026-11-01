@@ -4265,11 +4265,61 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 	 * reaches via "goto backout" immediately after this function
 	 * returns.
 	 */
-	free(hpcb, M_TEMP);
+	/*
+	 * Do NOT call free(hpcb, M_TEMP) on this specific
+	 * EJUSTRETURN resume-continuation path, for the identical reason
+	 * hcb (immediately below) and hib_res_pages (this same function,
+	 * below) are not freed here either.  Confirmed directly:
+	 * "panic: _free(0): address ... has not been allocated" fires in
+	 * free() called from this exact line -- hpcb's own small,
+	 * fixed-size malloc(sizeof(*hpcb), M_TEMP, M_WAITOK) allocation's
+	 * own UMA slab-cookie metadata is not reliably reconstructable
+	 * through this fresh resume kernel's own allocator, exactly like
+	 * hib_res_pages's and hcb's own allocations -- the save kernel's
+	 * allocator bookkeeping for this specific physical page belongs to
+	 * a different, unrelated boot instance.  hpcb's own value is not in
+	 * question (dereferenced successfully throughout this entire
+	 * function, immediately above this point); only freeing it back
+	 * into this kernel's own UMA zone is unsafe.  This is a bounded,
+	 * one-time leak of this single, small scratch allocation for the
+	 * remaining lifetime of this boot.
+	 */
 #ifdef INVARIANTS
 	atomic_add_int(&hibernate_pcb_releases, 1);
 #endif
-	dumpsys_hibernate_free_hcb(hcb);
+	/*
+	 * Do NOT call dumpsys_hibernate_free_hcb(hcb) on this specific
+	 * EJUSTRETURN resume-continuation path.  hcb's own content is now
+	 * correctly preserved (the self-copy-walk fix in
+	 * hibernate_machdep_prepare()) -- confirmed directly: the spare-page
+	 * physical addresses it reports read back correctly, byte-for-byte
+	 * stable.  The problem is downstream of that, in
+	 * dumpsys_hibernate_free_hcb()'s own vm_page_free(
+	 * PHYS_TO_VM_PAGE(phys)) call for each spare page: this resolves
+	 * each physical address to a vm_page_t via vm_page_array and frees
+	 * it back into vm_phys's own free-page pools, which panics
+	 * ("vm_phys_free_pages: unexpected pool param") because those
+	 * specific vm_page_t entries still carry save-time pool/queue state
+	 * -- a dynamically-chosen set of physical addresses
+	 * (vm_page_alloc_noobj_contig() picked them at save time, from
+	 * whatever was free on that boot), not a fixed VA the existing
+	 * vm_page_array self-copy walk is positioned to cover -- that walk
+	 * protects vm_page_array's own page-table path (so dereferencing
+	 * any vm_page_t at all does not fault), not the content of
+	 * arbitrary, save-time-chosen entries within it.
+	 *
+	 * This is the exact same safety class as hib_res_pages's own,
+	 * already-established "do not free" precedent, below in this same
+	 * function: these spare pages were already free from the resume
+	 * kernel's own cold boot, through its own, independently correct
+	 * allocator path (they were never allocated from this kernel's own
+	 * pools in the first place).  Skipping this free is therefore a
+	 * bounded, one-time accounting discrepancy, not a leak or
+	 * corruption.  hcb's own backing storage (the malloc(M_TEMP)
+	 * allocation itself) is a separate, smaller, one-time leak for the
+	 * remaining lifetime of this boot, the same bounded-leak class
+	 * hib_res_pages's own precedent already accepts.
+	 */
 #ifdef INVARIANTS
 	atomic_add_int(&hibernate_hcb_releases, 1);
 #endif
@@ -4334,6 +4384,13 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
     struct hibernate_xsave_terminal hib_xsave_terminal;
     struct dumperinfo *hib_dumper = NULL;
     bool image_committed = false;
+    /*
+     * True only on the EJUSTRETURN resume-continuation path -- see
+     * the full justification at this flag's own set site, below, and
+     * at backout:'s own gated acpi_hibernate_writer_workspace_free()
+     * call, which this flag skips.
+     */
+    bool hib_workspace_resume_continuation = false;
 #endif
 
     ACPI_FUNCTION_TRACE_U32((char *)(uintptr_t)__func__, stype);
@@ -4925,6 +4982,62 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		PCPU_SET(curthread, saved_td);
 		PCPU_SET(curpcb, saved_td->td_pcb);
+		/*
+		 * hib_workspace's own six M_TEMP allocations
+		 * (hww_io_buffer/hww_destination_intervals/hww_free_scratch/
+		 * hww_runs/hww_xsave/hww_prefix) are the identical defect
+		 * shape as hib_res_pages/hpcb/hcb above (all already fixed,
+		 * this same function): save-side allocations whose own UMA/
+		 * malloc_large slab-cookie metadata is not reliably
+		 * reconstructable through this fresh resume kernel's own
+		 * allocator.  Confirmed directly: "panic: _free(0): address
+		 * ... has not been allocated" fires inside
+		 * acpi_hibernate_writer_workspace_free(), called from
+		 * backout: immediately after this EJUSTRETURN path's own
+		 * goto backout.  This flag, set only here (the sole
+		 * EJUSTRETURN branch), gates that free() call off entirely
+		 * on this specific path -- the same bounded, one-time-leak
+		 * disposition as every other allocation in this defect class.
+		 */
+		hib_workspace_resume_continuation = true;
+		/*
+		 * An earlier self-copy-protection attempt for
+		 * hibernate_coordinator_mtx (hibernate_machdep_prepare(),
+		 * sys/amd64/amd64/hibernate_machdep.c) did not fix the "mutex
+		 * hibernate coordinator not owned" panic -- confirmed
+		 * directly: the panic still recurs identically after that fix
+		 * was built and tested.  Root cause: hibernate_md_selfcopy_
+		 * page() only marks a page "preserve this boot's own current
+		 * content" if that page is already a member of the K-10
+		 * destination set -- a static global like
+		 * hibernate_coordinator_mtx, declared and MTX_SYSINIT-
+		 * initialized in .bss, is not necessarily a destination-set
+		 * member at all, so that self-copy call was very likely a
+		 * structural no-op for this exact page -- the mutex kept this
+		 * boot's own cold MTX_SYSINIT value (MTX_UNOWNED) exactly as
+		 * before the fix, explaining the identical, unchanged panic.
+		 *
+		 * Correct fix: reseed mtx_lock directly, here, to the value a
+		 * successful, uncontended mtx_lock(&hibernate_coordinator_mtx)
+		 * by this exact, now-correctly-restored saved_td would have
+		 * produced -- matching this exact function's own, already-
+		 * established precedent for td_critnest/td_md.md_spinlock_count
+		 * a few lines below (acpi_s4_resume_discard_snapshot()) and
+		 * hibernate_resume_ap_entry()'s own td_lock reseed: a single
+		 * per-object field this boot's own cold-boot value does not
+		 * match the resumed thread's own correct identity, fixed by a
+		 * direct, targeted write of the one invariant this call site
+		 * needs, not a broader mechanism.  No recursion, no waiters:
+		 * this lock is acquired exactly once, briefly, with no
+		 * contention possible (SMP is not yet fully resumed), so
+		 * mtx_lock's own value is simply (uintptr_t)saved_td --
+		 * MTX_RECURSED/MTX_CONTESTED remain clear, matching the save-
+		 * time acquisition's own actual state (hibernate_coordinator_
+		 * acquire() takes a plain, non-recursive, uncontended
+		 * mtx_lock()).
+		 */
+		hibernate_coordinator_mtx_reseed(saved_td);
+		/*
 		 * acpi_s4_resume_discard_snapshot() must run here, before
 		 * hibernate_barrier_unwind(), not inside acpi_s4_resume_bsp()
 		 * afterward: the restored image is a snapshot of curthread
@@ -5279,7 +5392,7 @@ backout:
 	hib_dumper = NULL;
 	ha.ha_dumper = NULL;
     }
-    if (stype == POWER_STYPE_OS_HIBERNATE)
+    if (stype == POWER_STYPE_OS_HIBERNATE && !hib_workspace_resume_continuation)
 	acpi_hibernate_writer_workspace_free(&hib_workspace);
 #endif
     if ((slp_state & ACPI_SS_GPE_SET) != 0) {

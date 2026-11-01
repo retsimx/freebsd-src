@@ -1192,6 +1192,13 @@ int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
 int hibernate_stop_cpus(cpuset_t target, cpuset_t *acknowledged);
 int hibernate_restart_cpus(cpuset_t acknowledged);
 int hibernate_resume_park_release(cpuset_t target);
+/*
+ * Direct reseed of hibernate_coordinator_mtx's own mtx_lock field --
+ * see the full justification at this function's own definition,
+ * sys/kern/kern_hibernate.c.
+ */
+struct thread;
+void hibernate_coordinator_mtx_reseed(struct thread *td);
 
 /* K-8-owned stage functions (bodies in kern/kern_hibernate.c). */
 int hibernate_meta_read(struct hibernate_attempt *ha, void *meta_buf,

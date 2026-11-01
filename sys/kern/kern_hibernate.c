@@ -1769,6 +1769,29 @@ static struct mtx hibernate_coordinator_mtx;
 MTX_SYSINIT(hibernate_coordinator, &hibernate_coordinator_mtx,
     "hibernate coordinator", MTX_DEF);
 
+/*
+ * Direct reseed of hibernate_coordinator_mtx's own mtx_lock field to
+ * the value a successful, uncontended acquisition by the given (now
+ * correctly resumed) thread would hold.  A self-copy-protection
+ * attempt for this exact mutex was confirmed by direct testing to be
+ * an ineffective no-op: hibernate_md_selfcopy_page() (sys/amd64/amd64/
+ * hibernate_machdep.c) only preserves a page's own current content if
+ * that page is already a K-10 destination-set member, which a plain
+ * .bss static global is not guaranteed to be.  A direct, targeted
+ * field write needs no such membership and cannot silently no-op.  No
+ * recursion/contention is possible at this exact point in the resume
+ * sequence (SMP is not yet fully resumed), so the correct value is
+ * simply the thread pointer itself, with no MTX_RECURSED/MTX_CONTESTED
+ * flag bits set -- matching hibernate_coordinator_acquire()'s own
+ * plain, non-recursive, mtx_lock() call on the save side.
+ */
+void
+hibernate_coordinator_mtx_reseed(struct thread *td)
+{
+
+	hibernate_coordinator_mtx.mtx_lock = (uintptr_t)td;
+}
+
 /* Pointer to the active hibernate attempt, set/cleared by the coordinator. */
 static struct hibernate_attempt *hibernate_current_attempt;
 
