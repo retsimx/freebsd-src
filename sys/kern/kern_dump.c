@@ -327,6 +327,39 @@ SYSCTL_INT(_debug_acpi, OID_AUTO, hibernate_spare_mb, CTLFLAG_RWTUN,
 const uint64_t contig_spare_pages_nb = howmany(HIBERNATE_CONTIG_SPARE_SIZE,
     PAGE_SIZE);
 
+/*
+ * The save-side hcb allocation (below) is a large, dynamically-sized
+ * kmem_malloc()-backed allocation (hcb_size_spec() can run into
+ * hundreds of KB for the default spare-page budget) -- unlike the
+ * small, fixed-size hpcb, its own page-table path was never added to
+ * hibernate_machdep_prepare()'s self-copy-protected VA set.  Confirmed
+ * by direct QMP register capture: a page fault at a kmem-range VA
+ * (outside DMAP) inside dumpsys_hibernate_free_hcb() on the resume
+ * path, "fault code = supervisor read data, page not present" -- the
+ * resume-booted kernel's own page tables simply never mapped this VA
+ * at all, because nothing established that mapping on this (different)
+ * boot.
+ *
+ * hcb's own content must be the exact bytes the save-side allocation
+ * captured (the spare-page physical addresses it reserved, read back
+ * on resume to free them) -- not the resume kernel's own, unrelated
+ * bytes at the same physical address -- so this is the saved_pcb_va/
+ * kstack rule (copy_leaf=false).
+ *
+ * Exposed via a minimal va_out/len_out accessor rather than widening
+ * struct hibernate_attempt: hcb's own size is runtime-variable
+ * (hcb_size_spec()), known only at the allocation site below.
+ */
+static struct hibernate_save_cb *g_hibernate_hcb;
+static size_t g_hibernate_hcb_size;
+
+void
+dumpsys_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+	*va_out = (uintptr_t)g_hibernate_hcb;
+	*len_out = g_hibernate_hcb_size;
+}
+
 int
 dumpsys_hibernate_create_hcb(uint64_t hardware_signature,
     struct hibernate_save_cb **hcb_out)
@@ -419,6 +452,14 @@ dumpsys_hibernate_create_hcb(uint64_t hardware_signature,
 	}
 
 	hcb->hc_hardware_signature = hardware_signature;
+
+	/*
+	 * Remember this allocation's own VA/size for
+	 * dumpsys_hibernate_selfcopy_range() above, exactly once, at the
+	 * single real allocation site.
+	 */
+	g_hibernate_hcb = hcb;
+	g_hibernate_hcb_size = hcb_size_spec(spare_pages_nb);
 
 	*hcb_out = hcb;
 	return (0);

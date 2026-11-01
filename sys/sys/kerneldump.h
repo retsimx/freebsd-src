@@ -222,6 +222,11 @@ struct vm_phys_reservation;
 int dumpsys_hibernate_create_hcb(uint64_t _hardware_signature,
     struct hibernate_save_cb **_hcb_out);
 void dumpsys_hibernate_free_hcb(struct hibernate_save_cb *);
+/*
+ * Exposes the single, most-recently-created hcb allocation's own
+ * VA/size, for hibernate_machdep_prepare()'s self-copy protection.
+ */
+void dumpsys_hibernate_selfcopy_range(uintptr_t *_va_out, size_t *_len_out);
 
 /*
  * Build and commit one canonical ABI-1 image through the attempt-bound

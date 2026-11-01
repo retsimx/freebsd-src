@@ -2930,6 +2930,41 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				    kernel_pmap->pm_cr3, wm_pg, true,
 				    &selfcopied);
 		}
+		if (error == 0) {
+			/*
+			 * The save-side hcb allocation (sys/kern/kern_dump.c) is a
+			 * large, dynamically-sized kmem_malloc()-backed allocation
+			 * whose own page-table path was never added to this
+			 * protected-VA set.  Confirmed by direct QMP register
+			 * capture: a page fault at a kmem-range VA (outside DMAP)
+			 * inside dumpsys_hibernate_free_hcb() on the resume path.
+			 * Content must be the save-time captured bytes (the
+			 * reserved spare-page physical addresses
+			 * dumpsys_hibernate_free_hcb() reads back on resume to
+			 * release them), so copy_leaf is false here -- the same
+			 * rule as saved_pcb_va/the suspended kstack above, not
+			 * pc_gdt/ths[]'s copy_leaf=true.  A zero VA (no hcb was
+			 * ever created this boot) is a silent no-op.
+			 */
+			uintptr_t hcb_va;
+			size_t hcb_len;
+			vm_offset_t hcb_pg, hcb_end;
+
+			dumpsys_hibernate_selfcopy_range(&hcb_va, &hcb_len);
+			if (hcb_va != 0) {
+				hcb_pg = trunc_page((vm_offset_t)hcb_va);
+				hcb_end = round_page((vm_offset_t)hcb_va +
+				    hcb_len);
+				for (; hcb_pg < hcb_end;
+				    hcb_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    hcb_pg, false, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
