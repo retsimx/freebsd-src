@@ -469,6 +469,24 @@ SYSCTL_PROC(_debug_witness, OID_AUTO, badstacks,
 
 static struct mtx w_mtx;
 
+/*
+ * K24-T00 (round 42): expose w_mtx's own byte range for
+ * hibernate_machdep_prepare()'s self-copy protection, matching the
+ * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
+ * file has no public header to declare a prototype in otherwise.
+ * This file is only ever compiled into a WITNESS-enabled kernel (this
+ * build's own boot banner confirms "WITNESS option enabled"), so no
+ * conditional guard is needed around this accessor's own definition.
+ */
+void	witness_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out);
+void
+witness_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+
+	*va_out = (uintptr_t)&w_mtx;
+	*len_out = sizeof(w_mtx);
+}
+
 /* w_list */
 static struct witness_list w_free = STAILQ_HEAD_INITIALIZER(w_free);
 static struct witness_list w_all = STAILQ_HEAD_INITIALIZER(w_all);

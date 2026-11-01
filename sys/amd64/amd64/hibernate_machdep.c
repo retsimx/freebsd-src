@@ -2897,6 +2897,39 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				    kernel_pmap->pm_cr3, ts_pg, true,
 				    &selfcopied);
 		}
+		if (error == 0) {
+			/*
+			 * w_mtx (sys/kern/subr_witness.c) is the single spin mutex
+			 * protecting WITNESS's own lock-order graph, acquired by
+			 * witness_checkorder()/witness_lock() on every mtx/sx lock
+			 * acquire anywhere in the kernel -- active for literally
+			 * every lock operation this entire continuation performs,
+			 * from acpi_s4_resume_bsp_cpu() through
+			 * DEVICE_RESUME(root_bus) and beyond.  Same exposure class
+			 * as sleepq_chains/turnstile_chains above: an ordinary
+			 * struct mtx whose raw mtx_lock owner-pointer field, if
+			 * overwritten by the K-10 copy with the saved image's own
+			 * byte content, would corrupt every subsequent lock/unlock
+			 * this boot performs through witness's own checking path.
+			 * copy_leaf is true: this boot's own w_mtx must be unlocked
+			 * (or correctly held) exactly as this boot's own
+			 * witness_initialize() left it; the saved image's own
+			 * witness lock state belongs to a different boot's own
+			 * lock-order graph and is meaningless here.
+			 */
+			uintptr_t wm_va;
+			size_t wm_len;
+			vm_offset_t wm_pg, wm_end;
+
+			witness_hibernate_selfcopy_range(&wm_va, &wm_len);
+			wm_pg = trunc_page((vm_offset_t)wm_va);
+			wm_end = round_page((vm_offset_t)wm_va + wm_len);
+			for (; wm_pg < wm_end && error == 0;
+			    wm_pg += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, wm_pg, true,
+				    &selfcopied);
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
