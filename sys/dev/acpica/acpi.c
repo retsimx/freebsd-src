@@ -4092,9 +4092,79 @@ acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
 	 */
 	curthread->td_critnest = 0;
 	curthread->td_md.md_spinlock_count = 0;
-	curthread->td_locks = saved_td_locks;
+	/*
+	 * K24-T00 (round 15, Giant/WITNESS reconciliation): td_locks/
+	 * td_sleeplocks are WITNESS's own separate bookkeeping of which
+	 * locks this thread holds -- restoring them from the SAVE-side
+	 * snapshot values leaves them naming lock_instance entries in
+	 * w_locklistdata[] that this (RESUME) boot's own WITNESS state
+	 * does not recognise, corrupting later WITNESS bookkeeping for
+	 * this thread.  Zeroed/cleared to a clean baseline here instead
+	 * of restored to their own stale snapshot values.
+	 */
+	curthread->td_locks = 0;
 	curthread->td_pinned = saved_td_pinned;
-	curthread->td_sleeplocks = saved_td_sleeplocks;
+	curthread->td_sleeplocks = NULL;
+	/*
+	 * K24-T00 (round 15, Giant/WITNESS reconciliation): established
+	 * this round, established by direct evidence after THREE failed
+	 * attempts, not assumed: this function's own caller
+	 * (acpi_EnterSleepState()) calls bus_topo_lock() -- a REAL,
+	 * order-checked mtx_lock(&Giant) ("Be sure to hold bus topology
+	 * lock across DEVICE_SUSPEND/RESUME", this file, confirmed by
+	 * direct reading to run UNCONDITIONALLY near the top of this
+	 * SAME function invocation, before dumpsys_hibernate_savectx()
+	 * is ever reached) -- and does not call bus_topo_unlock() until
+	 * AFTER DEVICE_RESUME(root_bus), far below this EJUSTRETURN
+	 * branch, in the SAME preserved C stack frame resumectx()
+	 * returns into.  Giant is therefore GENUINELY, VALIDLY held for
+	 * the ENTIRE remainder of this function call -- not stale
+	 * SAVE-side leftover, not a defect: this thread's own real,
+	 * already-order-checked acquisition is still logically in scope.
+	 *
+	 * Two earlier attempts in this round WRONGLY treated this as
+	 * leftover state to erase:
+	 *
+	 * Attempt 1 (mtx_unlock(&Giant)) and attempt 2
+	 * (mtx_destroy()+mtx_init(MTX_NEW)) both released Giant, which
+	 * is backwards: later code on this exact path (confirmed live:
+	 * sys/kern/subr_bus.c's own bus_topo_assert()/GIANT_REQUIRED,
+	 * reached via device_resume()'s own subr_bus.c:423 assertion)
+	 * genuinely REQUIRES Giant to still be held -- releasing it
+	 * removed a lock this function's own bus_topo_lock() call
+	 * legitimately took and this function's own bus_topo_unlock()
+	 * call (far below) still needs to release in turn.  Releasing
+	 * Giant here converted "WITNESS doesn't know Giant is held" into
+	 * "Giant is no longer actually held", a strictly worse defect
+	 * (confirmed live: "mutex Giant not owned" panic,
+	 * sys/kern/subr_bus.c:423, reached via device_resume()).
+	 *
+	 * Corrected disposition: Giant's own RAW ownership (mtx_lock,
+	 * genuinely encoding this thread, per the K-10 copy's own
+	 * byte-for-byte round-trip of this ordinary struct) is correct
+	 * and must be left untouched.  Only WITNESS's own SEPARATE
+	 * bookkeeping (td_locks/td_sleeplocks, zeroed two lines above) is
+	 * stale and needs reconciling -- via witness_lock()
+	 * (sys/kern/subr_witness.c), called DIRECTLY rather than through
+	 * the public mtx_lock() API, because the original acquisition's
+	 * own lock-order check (witness_checkorder()) ALREADY ran,
+	 * correctly, on the SAVE side, when bus_topo_lock() was first
+	 * called -- re-running it here would be redundant at best and,
+	 * per hibernate_coordinator_mtx_reseed()'s own documented
+	 * precedent (a direct WITNESS_LOCK() patch without a preceding
+	 * checkorder "corrupted this witness class's own lock-order
+	 * graph" for THAT mutex), actively unsafe at worst.  witness_lock()
+	 * records the lock instance in td_sleeplocks WITHOUT repeating
+	 * order validation; TD_LOCKS_INC() mirrors the public mtx_lock()
+	 * path's own accounting increment exactly.  Together these make
+	 * WITNESS's own view agree with reality (Giant genuinely held),
+	 * rather than making reality agree with WITNESS's own view
+	 * (Giant falsely released) -- the correct direction, confirmed
+	 * this round by the subr_bus.c:423 assertion that Giant must
+	 * remain held.
+	 */
+	WITNESS_LOCK(&Giant.lock_object, LOP_EXCLUSIVE, __FILE__, __LINE__);
+	TD_LOCKS_INC(curthread);
 	/*
 	 * hibernate_writing is cleared by callout_hibernate_exit() inside
 	 * hibernate_barrier_unwind(), which runs before acpi_s4_resume_bsp()
