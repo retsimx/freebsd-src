@@ -2242,6 +2242,49 @@ hib_append_page(struct vm_phys_reservation *res, vm_page_t m,
 }
 
 /*
+ * K24-T00 (reconciliation round 2): hibernate_md_vm_phys_free_queues_va()
+ * -- a narrow accessor exposing vm_phys_free_queues's own VA and total
+ * byte size to sys/amd64/amd64/hibernate_machdep.c, whose self-copy-walk
+ * fix needs this address but cannot see the file-static array directly
+ * (matching this file's own existing convention of declaring hibernate
+ * cross-file accessors locally at the call site, with no public header
+ * of their own).
+ */
+void
+hibernate_md_vm_phys_free_queues_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)vm_phys_free_queues;
+	*len = sizeof(vm_phys_free_queues);
+}
+
+/*
+ * K24-T00: vm_phys_segs[], the per-segment physical-memory descriptor
+ * array -- sibling to vm_phys_free_queues and vm_reserv_array (both
+ * already self-copy protected in hibernate_machdep_prepare()), and
+ * read by the identical allocator call chain
+ * (vm_phys_alloc_freelist_pages()/PHYS_TO_VM_PAGE() via
+ * vm_phys_paddr_to_seg()) that the "page ... has object"/"uma-wrong-
+ * zone"/"refcount ... wraparound" family of panics all trace to.
+ * Confirmed by direct grep: unlike vm_phys_free_queues and
+ * vm_reserv_array, this array had NO self-copy protection anywhere in
+ * this epic before this fix -- each struct vm_phys_seg's own
+ * first_page/free_queues/domain fields are exactly the kind of
+ * allocator-consulted, cold-boot-correct, cross-boot-stale content
+ * this epic's established "protect vm_page_array/vm_dom/vm_phys_free_
+ * queues" rule already covers for every sibling structure. copy_leaf
+ * is true: this boot's own vm_phys_init()/vm_phys_add_seg() already
+ * built every segment descriptor correctly; there is no saved-image
+ * content worth restoring, identical reasoning to vm_phys_free_queues
+ * and vm_reserv_array.
+ */
+void
+hibernate_md_vm_phys_segs_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)vm_phys_segs;
+	*len = sizeof(vm_phys_segs);
+}
+
+/*
  * vm_phys_hibernate_release: return all captured pages to the physical
  * allocator in reverse acquisition order.
  *

@@ -2843,6 +2843,245 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (reconciliation round 2): vm_phys_free_queues
+			 * (sys/vm/vm_phys.c), the per-domain/per-freelist/
+			 * per-pool array of struct vm_freelist, each embedding
+			 * a TAILQ_HEAD of free vm_page_t's at every buddy
+			 * order. Direct testing this round confirmed the
+			 * sibling "page ... has object" panic
+			 * (vm_page_alloc_check(), reached via
+			 * vm_page_alloc_noobj_domain() allocating a page it
+			 * believes free) recurs even after vm_page_array
+			 * (round 59) and hs_src/hs_aux's own vr_pages arrays
+			 * (this round, above) are both already correctly
+			 * protected -- this is the remaining, genuinely
+			 * authoritative source vm_phys_alloc_freelist_pages()/
+			 * vm_page_alloc_noobj_domain() actually consult to find
+			 * a "free" page in the first place: if THIS boot's own
+			 * free-page accounting (built correctly at this boot's
+			 * own vm_page_startup()) is overwritten by the K-10
+			 * copy with the SAVED kernel's own, unrelated free-list
+			 * snapshot, the allocator can be handed a vm_page_t
+			 * that this boot never actually freed (and whose own,
+			 * correctly-reinitialized vm_page_t.object/ref_count/
+			 * a.queue fields -- round 59's own fix -- therefore
+			 * still reflect genuine, in-use content), tripping
+			 * exactly the observed assertion. Same bug class as
+			 * vm_dom[]/tdq/sleepq_chains[] above: ordinary BSS
+			 * global, live allocator state this boot's own startup
+			 * already built correctly, never previously added to
+			 * this file's protected-VA set. copy_leaf is true:
+			 * there is no saved-image free-list content worth
+			 * restoring, since a resume-kernel's own free-page
+			 * population bears no relationship to the save-kernel's
+			 * own (identical reasoning to vm_dom[]). The array is
+			 * file-static in sys/vm/vm_phys.c, so its VA/size come
+			 * from a narrow accessor there
+			 * (hibernate_md_vm_phys_free_queues_va()), matching this
+			 * file's own existing convention for such cross-file
+			 * hibernate accessors.
+			 */
+			extern void hibernate_md_vm_phys_free_queues_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t vpfq_raw, vpfq_va, vpfq_end;
+			size_t vpfq_len;
+
+			hibernate_md_vm_phys_free_queues_va(&vpfq_raw, &vpfq_len);
+			vpfq_va = trunc_page(vpfq_raw);
+			vpfq_end = round_page(vpfq_raw + vpfq_len);
+			for (; vpfq_va < vpfq_end && error == 0;
+			    vpfq_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, vpfq_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (lead 2, this round): vm_reserv_array
+			 * (sys/vm/vm_reserv.c), the per-superpage reservation
+			 * array -- functionally parallel to vm_page_array
+			 * (round 59) and allocated the same way (a single,
+			 * large, file-static mapping established once at
+			 * boot by vm_reserv_startup(), never reallocated).
+			 * Confirmed by direct inspection this round to be the
+			 * ONE sibling structure in this class (vm_page_array,
+			 * vm_dom[], vm_phys_free_queues, all already protected
+			 * above) that had NO self-copy protection of its own
+			 * anywhere in this file -- every other structure
+			 * vm_phys_alloc_pages()'s own call chain can reach was
+			 * already covered; this one was not.
+			 *
+			 * Each struct vm_reserv embeds its own "object"
+			 * (vm_object_t) and "popcnt" fields identifying which
+			 * object currently owns that reservation's pages, read
+			 * by vm_reserv_to_superpage()/vm_reserv_from_page() and
+			 * the reservation-level allocation/reclaim paths. If
+			 * the K-10 copy overwrites this array with the SAVED
+			 * kernel's own, unrelated reservation snapshot, these
+			 * per-reservation object/popcnt fields can disagree
+			 * with vm_page_array's own (round 59, already correct)
+			 * per-page object/ref_count/queue fields -- the same
+			 * disagreement-between-siblings shape as every other
+			 * defect in this class, just not yet proven to fire
+			 * through this exact field (the observed "page ...
+			 * has object" panic's own call chain,
+			 * vm_page_alloc_noobj_domain() via
+			 * pmap_alloc_pt_page()/pmap_growkernel(), does not
+			 * itself branch through vm_reserv in the ordinary,
+			 * non-VM_NRESERVLEVEL-reclaim case -- this fix closes
+			 * the one remaining unprotected sibling structure in
+			 * this class regardless, since an allocator-consulted,
+			 * file-static, cross-boot-stale array is exactly the
+			 * established defect shape this epic has repeatedly
+			 * found and fixed, and leaving the sole unprotected
+			 * instance in place is not a sound resting point).
+			 *
+			 * copy_leaf is true: this boot's own cold
+			 * vm_reserv_startup() already built every reservation
+			 * correctly (every "object" field NULL, every "popcnt"
+			 * zero, matching this boot's own, genuinely-empty
+			 * reservation state at this early point in the resume
+			 * continuation); there is no saved-image reservation
+			 * content worth restoring, since a resume-kernel's own
+			 * reservation population bears no relationship to the
+			 * save-kernel's own -- identical reasoning to
+			 * vm_dom[]/vm_phys_free_queues above. The array is
+			 * file-static in sys/vm/vm_reserv.c, so its VA/size
+			 * come from a narrow accessor there
+			 * (hibernate_md_vm_reserv_array_va()), matching this
+			 * file's own existing convention for every other such
+			 * cross-file hibernate accessor.
+			 */
+			extern void hibernate_md_vm_reserv_array_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t vra_raw, vra_va, vra_end;
+			size_t vra_len;
+
+			hibernate_md_vm_reserv_array_va(&vra_raw, &vra_len);
+			vra_va = trunc_page(vra_raw);
+			vra_end = round_page(vra_raw + vra_len);
+			for (; vra_va < vra_end && error == 0;
+			    vra_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, vra_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00: vm_phys_segs[] (sys/vm/vm_phys.c), the
+			 * per-segment physical-memory descriptor array --
+			 * functionally parallel to vm_phys_free_queues and
+			 * vm_reserv_array (both already protected above) and
+			 * read by the identical allocator call chain
+			 * (vm_phys_alloc_freelist_pages() via
+			 * vm_phys_paddr_to_seg()/PHYS_TO_VM_PAGE()) that the
+			 * "page ... has object"/"uma-wrong-zone"/"refcount
+			 * ... wraparound" family of panics all trace to
+			 * (acpi_pwr_register_consumer() -> malloc() ->
+			 * zone_import() -> keg_alloc_slab() ->
+			 * uma_small_alloc() -> vm_page_alloc_noobj_domain()).
+			 * Confirmed by direct grep this round: unlike its two
+			 * siblings, vm_phys_segs[] had NO self-copy
+			 * protection anywhere in this file before this fix --
+			 * each struct vm_phys_seg's own first_page/
+			 * free_queues/domain fields are exactly the kind of
+			 * allocator-consulted, cold-boot-correct,
+			 * cross-boot-stale content this epic's established
+			 * rule already covers for every sibling structure.
+			 * copy_leaf is true: this boot's own vm_phys_init()/
+			 * vm_phys_add_seg() already built every segment
+			 * descriptor correctly; there is no saved-image
+			 * content worth restoring, identical reasoning to
+			 * vm_phys_free_queues/vm_reserv_array. The array is
+			 * file-static in sys/vm/vm_phys.c, so its VA/size come
+			 * from a narrow accessor there
+			 * (hibernate_md_vm_phys_segs_va()), matching this
+			 * file's own existing convention for every other such
+			 * cross-file hibernate accessor.
+			 */
+			extern void hibernate_md_vm_phys_segs_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t vps_raw, vps_va, vps_end;
+			size_t vps_len;
+
+			hibernate_md_vm_phys_segs_va(&vps_raw, &vps_len);
+			vps_va = trunc_page(vps_raw);
+			vps_end = round_page(vps_raw + vps_len);
+			for (; vps_va < vps_end && error == 0;
+			    vps_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, vps_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (exhaustive sweep): vm_rvd[] (sys/vm/
+			 * vm_reserv.c), the per-domain reservation-queue
+			 * lock/partpop-list/scan-marker array -- sibling to
+			 * vm_reserv_array above, same disposition and
+			 * reasoning. See sys/vm/vm_reserv.c for the full
+			 * comment.
+			 */
+			extern void hibernate_md_vm_rvd_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t rvd_raw, rvd_va, rvd_end;
+			size_t rvd_len;
+
+			hibernate_md_vm_rvd_va(&rvd_raw, &rvd_len);
+			rvd_va = trunc_page(rvd_raw);
+			rvd_end = round_page(rvd_raw + rvd_len);
+			for (; rvd_va < rvd_end && error == 0;
+			    rvd_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, rvd_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (exhaustive sweep): vm_reserv_object_mtx[]
+			 * (sys/vm/vm_reserv.c), the hashed per-object lock
+			 * array -- sibling to vm_rvd[] above, same
+			 * disposition. See sys/vm/vm_reserv.c for the full
+			 * comment.
+			 */
+			extern void hibernate_md_vm_reserv_object_mtx_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t vrom_raw, vrom_va, vrom_end;
+			size_t vrom_len;
+
+			hibernate_md_vm_reserv_object_mtx_va(&vrom_raw,
+			    &vrom_len);
+			vrom_va = trunc_page(vrom_raw);
+			vrom_end = round_page(vrom_raw + vrom_len);
+			for (; vrom_va < vrom_end && error == 0;
+			    vrom_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, vrom_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (exhaustive sweep): vm_domainset_lock plus
+			 * the domain-state fields it protects (sys/vm/
+			 * vm_page.c). See sys/vm/vm_page.c for the full
+			 * comment.
+			 */
+			extern void hibernate_md_vm_domainset_lock_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t vdl_raw, vdl_va, vdl_end;
+			size_t vdl_len;
+
+			hibernate_md_vm_domainset_lock_va(&vdl_raw, &vdl_len);
+			vdl_va = trunc_page(vdl_raw);
+			vdl_end = round_page(vdl_raw + vdl_len);
+			for (; vdl_va < vdl_end && error == 0;
+			    vdl_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, vdl_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
 			 * sleepq_chains[SC_TABLESIZE] (sys/kern/subr_sleepqueue.c)
 			 * is live, continuously-read-and-written kernel lock/queue
 			 * state this boot's own init_sleepqueues() already built

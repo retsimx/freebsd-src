@@ -127,6 +127,28 @@ static int vm_min_waiters;
 static int vm_severe_waiters;
 static int vm_pageproc_waiters;
 
+/*
+ * K24-T00 (exhaustive sweep): vm_domainset_lock plus the domain-state
+ * fields it protects (vm_min_domains/vm_severe_domains, this file,
+ * directly above) -- ordinary BSS globals the vm_wait()/vm_wait_min()/
+ * vm_wakeup() family locks and reads on every low-memory wait/wake
+ * cycle, never on this epic's protected-VA set before this round.
+ * Same bug shape as vm_dom[]. copy_leaf is true: this boot's own
+ * vm_page_startup() builds this lock and these domain sets fresh; no
+ * saved-image content applies. The waiter counters
+ * (vm_min_waiters/vm_severe_waiters/vm_pageproc_waiters) are adjacent,
+ * file-static, and covered by the same contiguous page range as a
+ * byproduct -- not separately walked, since they are smaller than a
+ * page and already within vm_domainset_lock's own page(s).
+ */
+void
+hibernate_md_vm_domainset_lock_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&vm_domainset_lock;
+	*len = (vm_offset_t)&vm_pageproc_waiters + sizeof(vm_pageproc_waiters) -
+	    (vm_offset_t)&vm_domainset_lock;
+}
+
 static SYSCTL_NODE(_vm_stats, OID_AUTO, page, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "VM page statistics");
 

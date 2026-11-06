@@ -463,6 +463,14 @@ extern long first_page;			/* first physical page number */
 vm_page_t PHYS_TO_VM_PAGE(vm_paddr_t pa);
 
 #define	DMAP_TO_VM_PAGE(va)	PHYS_TO_VM_PAGE(DMAP_TO_PHYS(va))
+
+/*
+ * K24-T00 (exhaustive sweep): narrow accessor for vm_domainset_lock and
+ * the domain-state fields it protects, mirroring
+ * hibernate_md_vm_reserv_array_va()'s own convention. See
+ * sys/vm/vm_page.c for the full comment.
+ */
+void	hibernate_md_vm_domainset_lock_va(vm_offset_t *va, size_t *len);
 #define	VM_PAGE_TO_DMAP(entry)	PHYS_TO_DMAP(VM_PAGE_TO_PHYS(entry))
 
 /*

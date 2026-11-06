@@ -202,6 +202,20 @@ TAILQ_HEAD(vm_reserv_queue, vm_reserv);
 static vm_reserv_t vm_reserv_array;
 
 /*
+ * K24-T00 (lead 2): the byte size of vm_reserv_array's own backing
+ * allocation, computed once in vm_reserv_startup() and stored here so
+ * sys/amd64/amd64/hibernate_machdep.c's own self-copy walk can protect
+ * this array's page-table path the same way it already protects every
+ * sibling structure (vm_page_array, vm_dom[], vm_phys_free_queues).
+ * vm_reserv_array itself has no stored count/size field of its own
+ * (the local "size" in vm_reserv_startup() is a stack variable,
+ * discarded on return), so this is the minimal addition needed to
+ * expose it -- mirroring hibernate_md_vm_phys_free_queues_va()'s own
+ * convention in sys/vm/vm_phys.c exactly.
+ */
+static size_t vm_reserv_array_size;
+
+/*
  * The per-domain partially populated reservation queues
  *
  * These queues enable the fast recovery of an unused free small page from a
@@ -1465,6 +1479,7 @@ vm_reserv_startup(vm_offset_t *vaddr, vm_paddr_t end)
 	 * than the number of superpages.
 	 */
 	size = count * sizeof(struct vm_reserv);
+	vm_reserv_array_size = size;
 
 	/*
 	 * Allocate and map the physical memory for the reservation array.  The
@@ -1479,6 +1494,61 @@ vm_reserv_startup(vm_offset_t *vaddr, vm_paddr_t end)
 	 * Return the next available physical address.
 	 */
 	return (new_end);
+}
+
+/*
+ * K24-T00 (lead 2): narrow accessor exposing vm_reserv_array's own VA
+ * and byte size to sys/amd64/amd64/hibernate_machdep.c, matching this
+ * file's own existing convention (vm_reserv_array is file-static;
+ * sys/vm/vm_phys.c's own hibernate_md_vm_phys_free_queues_va() is the
+ * precedent this mirrors exactly). vm_reserv_array is allocated once,
+ * at vm_reserv_startup() time, and never reallocated or resized for
+ * the remaining lifetime of this boot, so a zero-length result would
+ * only occur if this function is somehow called before startup, which
+ * cannot happen on the resume path (this accessor is only reachable
+ * after the kernel is already fully up).
+ */
+void
+hibernate_md_vm_reserv_array_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)vm_reserv_array;
+	*len = vm_reserv_array_size;
+}
+
+/*
+ * K24-T00 (exhaustive sweep): vm_rvd[] (struct vm_reserv_domain, this
+ * file), the per-domain reservation-queue lock/partpop-list/scan-marker
+ * array -- read and locked directly by vm_reserv_alloc_page()/
+ * vm_reserv_reclaim()/vm_reserv_break() on every reservation-level
+ * allocation, reachable from the same vm_phys_alloc_pages() family this
+ * epic's own UMA/allocator-consistency defect family traces to. An
+ * ordinary BSS global, never on this file's protected-VA set before
+ * this round -- same bug shape as vm_dom[]/vm_phys_free_queues/
+ * vm_reserv_array. copy_leaf is true: this boot's own vm_reserv_init()
+ * already built every domain's lock/partpop queue/marker correctly;
+ * there is no saved-image vm_rvd content worth restoring.
+ */
+void
+hibernate_md_vm_rvd_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)vm_rvd;
+	*len = sizeof(vm_rvd);
+}
+
+/*
+ * K24-T00 (exhaustive sweep): vm_reserv_object_mtx[] (this file), the
+ * hashed per-object lock array vm_reserv_from_object()/
+ * vm_reserv_object_lock()/vm_reserv_object_unlock() index into for
+ * every reservation-to-object association -- the identical "ordinary
+ * BSS global lock array, never protected" shape as vm_rvd[] above.
+ * copy_leaf is true: these locks are reinitialised fresh by this
+ * boot's own vm_reserv_init(); no saved-image content applies.
+ */
+void
+hibernate_md_vm_reserv_object_mtx_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)vm_reserv_object_mtx;
+	*len = sizeof(vm_reserv_object_mtx);
 }
 
 /*
