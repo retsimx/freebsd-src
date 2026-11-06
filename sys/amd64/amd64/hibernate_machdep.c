@@ -3171,6 +3171,102 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (measurement-method fix round):
+			 * eventhandler_lists/eventhandler_mutex/
+			 * eventhandler_lists_initted (sys/kern/
+			 * subr_eventhandler.c) -- confirmed by direct, live
+			 * backtrace capture to be the exact, sole remaining
+			 * blocker to DEVICE_RESUME(root_bus): the
+			 * acpi_pre_dev_resume EVENTHANDLER_INVOKE()
+			 * immediately preceding it faults in
+			 * eventhandler_find_list(). See
+			 * sys/kern/subr_eventhandler.c for the full comment.
+			 */
+			extern void hibernate_md_eventhandler_lists_va(
+			    vm_offset_t *va, size_t *len);
+			extern void hibernate_md_eventhandler_mutex_va(
+			    vm_offset_t *va, size_t *len);
+			extern void hibernate_md_eventhandler_lists_initted_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t eh_raw, eh_va, eh_end;
+			size_t eh_len;
+
+			hibernate_md_eventhandler_lists_va(&eh_raw, &eh_len);
+			eh_va = trunc_page(eh_raw);
+			eh_end = round_page(eh_raw + eh_len);
+			for (; eh_va < eh_end && error == 0;
+			    eh_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, eh_va, true,
+				    &selfcopied);
+			if (error == 0) {
+				hibernate_md_eventhandler_mutex_va(&eh_raw,
+				    &eh_len);
+				eh_va = trunc_page(eh_raw);
+				eh_end = round_page(eh_raw + eh_len);
+				for (; eh_va < eh_end && error == 0;
+				    eh_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha, wvec,
+					    p, kernel_pmap->pm_cr3, eh_va, true,
+					    &selfcopied);
+			}
+			if (error == 0) {
+				hibernate_md_eventhandler_lists_initted_va(
+				    &eh_raw, &eh_len);
+				eh_va = trunc_page(eh_raw);
+				eh_end = round_page(eh_raw + eh_len);
+				for (; eh_va < eh_end && error == 0;
+				    eh_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha, wvec,
+					    p, kernel_pmap->pm_cr3, eh_va, true,
+					    &selfcopied);
+			}
+			/*
+			 * K24-T00 (round 12, eventhandler subsystem sweep):
+			 * per this round's own explicit instruction, every
+			 * structure this subsystem's resume-path consumers
+			 * touch was enumerated once, not rediscovered by
+			 * panic. The STATIC head (above) is a BSS global this
+			 * boot's own eventhandler_init() SYSINIT already
+			 * builds correctly -- the "adopt this boot's fresh
+			 * content" rule applies, matching every sibling. But
+			 * EVERY struct eventhandler_list node AND every struct
+			 * eventhandler_entry node hanging off it is a SEPARATE
+			 * malloc(M_EVENTHANDLER) allocation this boot's own
+			 * EVENTHANDLER_REGISTER()/_LIST_DEFINE() calls make
+			 * during ordinary SYSINIT device-attach processing,
+			 * BEFORE the hibernate ioctl ever runs -- this is LIVE
+			 * RESUME-KERNEL STATE by this epic's own established
+			 * rule (continuously read-and-written, this boot's
+			 * own, never the saved image's), not saved-image
+			 * content, exactly like sleepq_chains[]'s own
+			 * per-bucket LIST_HEAD entries. Unlike a fixed-size
+			 * static array, these nodes' OWN addresses are chosen
+			 * fresh each boot by the allocator and cannot be named
+			 * by one fixed VA/len pair; they must be discovered by
+			 * walking the (already-protected) list head and its
+			 * own entries, protecting each node found. This is
+			 * what was missing: the head was protected, but the
+			 * nodes reachable from it were not, so the K-10 copy
+			 * could still overwrite an eventhandler_list/
+			 * eventhandler_entry node's own backing page with the
+			 * SAVE kernel's own unrelated content -- a direct
+			 * explanation for eventhandler_find_list()'s own
+			 * strcmp() GPF (a node's el_name pointer, or the bytes
+			 * it points to, reading as foreign/poisoned content).
+			 */
+			if (error == 0) {
+				extern int
+				eventhandler_hibernate_selfcopy_nodes(
+				    const struct hibernate_attempt *ha,
+				    vm_paddr_t *wvec, uint64_t p,
+				    u_int *countp);
+				error = eventhandler_hibernate_selfcopy_nodes(
+				    ha, wvec, p, &selfcopied);
+			}
+		}
+		if (error == 0) {
+			/*
 			 * The save-side hcb allocation (sys/kern/kern_dump.c) is a
 			 * large, dynamically-sized kmem_malloc()-backed allocation
 			 * whose own page-table path was never added to this

@@ -43,6 +43,118 @@ static TAILQ_HEAD(, eventhandler_list)	eventhandler_lists;
 static int				eventhandler_lists_initted = 0;
 static struct mtx			eventhandler_mutex;
 
+/*
+ * K24-T00 (measurement-method fix round): eventhandler_lists (this
+ * file)/eventhandler_mutex/eventhandler_lists_initted, the global
+ * registry every EVENTHANDLER_INVOKE()/eventhandler_find_list() call
+ * anywhere in the kernel walks and locks. None of the three were ever
+ * self-copy protected in this epic. Confirmed by direct, live
+ * backtrace capture this round to be the exact, sole remaining
+ * blocker to DEVICE_RESUME(root_bus) (sys/dev/acpica/acpi.c): the
+ * acpi_pre_dev_resume EVENTHANDLER_INVOKE() immediately preceding
+ * DEVICE_RESUME(root_bus) calls eventhandler_find_list(), which
+ * faults (general protection fault, identical RIP across multiple
+ * independent captures) walking eventhandler_lists if the K-10 copy
+ * has overwritten it with the SAVE kernel's own, unrelated
+ * eventhandler-list content -- the same defect shape as every other
+ * sibling in this epic's own established class (a live, allocator/
+ * registry-consulted BSS global never previously added to the
+ * protected-VA set). copy_leaf is true: this boot's own
+ * eventhandler_init()/EVENTHANDLER_REGISTER() calls already built
+ * every list/lock/counter correctly; there is no saved-image content
+ * worth restoring, identical reasoning to every other sibling
+ * structure already protected (vm_page_array/vm_dom/kmemzones/etc).
+ */
+void	hibernate_md_eventhandler_lists_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_eventhandler_lists_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&eventhandler_lists;
+	*len = sizeof(eventhandler_lists);
+}
+
+void	hibernate_md_eventhandler_mutex_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_eventhandler_mutex_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&eventhandler_mutex;
+	*len = sizeof(eventhandler_mutex);
+}
+
+void	hibernate_md_eventhandler_lists_initted_va(vm_offset_t *va,
+	    size_t *len);
+void
+hibernate_md_eventhandler_lists_initted_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&eventhandler_lists_initted;
+	*len = sizeof(eventhandler_lists_initted);
+}
+
+/*
+ * K24-T00 (round 12, eventhandler subsystem sweep): per explicit
+ * instruction, every structure this subsystem's own resume-path
+ * consumers touch was enumerated once by direct source reading, not
+ * rediscovered by panic. eventhandler_lists/_mutex/_lists_initted
+ * (above) are the only file-scope globals in this file; everything
+ * else this file's own data model consists of is dynamically
+ * malloc(M_EVENTHANDLER)'d: every `struct eventhandler_list` node
+ * (eventhandler_find_or_create_list()) and every `struct
+ * eventhandler_entry`-derived node (eventhandler_register_internal())
+ * hanging off its own el_entries TAILQ. These are LIVE RESUME-KERNEL
+ * STATE by this epic's own established rule: every one of them was
+ * allocated during THIS boot's own ordinary SYSINIT/device-attach
+ * processing (EVENTHANDLER_REGISTER() calls throughout the tree),
+ * strictly before the hibernate ioctl can run, so there is no
+ * saved-image content worth preserving for any of them -- exactly the
+ * same rule already applied to eventhandler_lists itself, just one
+ * level further down the data structure than a fixed-size static
+ * array can reach. Unlike eventhandler_lists's own fixed VA/len, each
+ * node's address is chosen by the allocator fresh each boot and can
+ * only be discovered by walking the (already protected) list under
+ * the SAME lock ordinary consumers use (eventhandler_mutex, then
+ * each list's own el_lock), protecting each node found via
+ * hibernate_md_selfcopy_range() (sys/amd64/amd64/hibernate_machdep.c).
+ * This closes the gap the live backtrace capture pointed at: the head
+ * was protected but a node it points to was not, so the K-10 copy
+ * could still leave a `struct eventhandler_list`'s own el_name
+ * pointer (or the bytes it addresses) as the SAVE kernel's own,
+ * unrelated content -- exactly matching the observed strcmp() GPF
+ * inside eventhandler_find_list().
+ */
+struct hibernate_attempt;
+int	eventhandler_hibernate_selfcopy_nodes(
+	    const struct hibernate_attempt *ha, vm_paddr_t *wvec, uint64_t p,
+	    u_int *countp);
+int
+eventhandler_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, u_int *countp)
+{
+	struct eventhandler_list *list;
+	struct eventhandler_entry *ep;
+	int error;
+
+	extern int hibernate_md_selfcopy_range(const struct hibernate_attempt *,
+	    vm_paddr_t *, uint64_t, vm_offset_t, size_t, u_int *);
+
+	error = 0;
+	if (!eventhandler_lists_initted)
+		return (0);
+	TAILQ_FOREACH(list, &eventhandler_lists, el_link) {
+		error = hibernate_md_selfcopy_range(ha, wvec, p,
+		    (vm_offset_t)list, sizeof(*list) + strlen(list->el_name) + 1,
+		    countp);
+		if (error != 0)
+			return (error);
+		TAILQ_FOREACH(ep, &list->el_entries, ee_link) {
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)ep, sizeof(*ep), countp);
+			if (error != 0)
+				return (error);
+		}
+	}
+	return (0);
+}
+
 struct eventhandler_entry_generic 
 {
     struct eventhandler_entry	ee;
