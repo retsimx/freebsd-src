@@ -110,6 +110,96 @@ static TAILQ_HEAD(, intr_event) event_list =
 static struct mtx event_lock;
 MTX_SYSINIT(intr_event_list, &event_lock, "intr event list", MTX_DEF);
 
+/*
+ * K24-T00 (round 17, corrected classification): round 16's own
+ * sweep of this subsystem concluded "no unprotected static global"
+ * because it looked for a registry-style list and found none directly
+ * reachable from intr_event_resume_handler()'s own call chain -- but
+ * missed event_list/event_lock (above) themselves, the ACTUAL static
+ * registry every struct intr_event is linked onto at creation time
+ * (intr_event_create(), this file). This round's own corrected
+ * re-reading: "live, cold-boot-allocated" does not mean "cannot be
+ * overwritten by the K-10 copy" -- the opposite is true. Every
+ * intr_event/intr_handler node is ordinary heap memory (malloc(9),
+ * M_ITHREAD); the K-10 copy's own destructive semantics replace
+ * EVERY destination-set page's content with the SAVE kernel's own
+ * bytes, REGARDLESS of whether the resume kernel's own allocator
+ * considers that page "allocated to a live object" -- the two
+ * allocators (SAVE-side and RESUME-side) have no relationship to each
+ * other, so a page the RESUME kernel's own cold boot allocated for
+ * this exact intr_event can, and per the observed live fault DOES,
+ * get overwritten with the SAVE kernel's own, unrelated content at
+ * that same physical address. This is the IDENTICAL defect shape as
+ * every ACPI power-resource/eventhandler node this epic has already
+ * fixed -- "live" and "needs protection" are not mutually exclusive;
+ * every one of those prior fixes protects exactly this kind of live,
+ * dynamically-allocated node. The correct test was never "is there an
+ * unprotected static global", it was "is every node reachable from
+ * the EXISTING protected static global (event_list, now itself
+ * protected below) also protected" -- the same test
+ * eventhandler_hibernate_selfcopy_nodes() already applies one level
+ * down from eventhandler_lists.
+ */
+void	hibernate_md_intr_event_list_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_intr_event_list_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&event_list;
+	*len = sizeof(event_list);
+}
+
+void	hibernate_md_intr_event_lock_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_intr_event_lock_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&event_lock;
+	*len = sizeof(event_lock);
+}
+
+/*
+ * K24-T00 (round 17): walks event_list (now protected, above) and
+ * protects every struct intr_event node and every struct intr_handler
+ * hanging off its own ie_handlers list -- the exact node-protection
+ * walk eventhandler_hibernate_selfcopy_nodes() (sys/kern/
+ * subr_eventhandler.c) already performs for the analogous
+ * eventhandler_lists/eventhandler_list/eventhandler_entry chain. This
+ * closes the gap confirmed live this round: ie_lock's own backing
+ * page (part of its containing struct intr_event's own malloc()
+ * allocation) was never protected, so the K-10 copy could -- and did,
+ * per the identical, repeated 0x0f00000100a9c1ed fault value captured
+ * across five independent runs -- overwrite it with the SAVE kernel's
+ * own, unrelated intr_event content at that physical address.
+ */
+struct hibernate_attempt;
+int	intr_event_hibernate_selfcopy_nodes(
+	    const struct hibernate_attempt *ha, vm_paddr_t *wvec, uint64_t p,
+	    u_int *countp);
+int
+intr_event_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, u_int *countp)
+{
+	struct intr_event *ie;
+	struct intr_handler *ih;
+	int error;
+	extern int hibernate_md_selfcopy_range(const struct hibernate_attempt *,
+	    vm_paddr_t *, uint64_t, vm_offset_t, size_t, u_int *);
+
+	error = 0;
+	TAILQ_FOREACH(ie, &event_list, ie_list) {
+		error = hibernate_md_selfcopy_range(ha, wvec, p,
+		    (vm_offset_t)ie, sizeof(*ie), countp);
+		if (error != 0)
+			return (error);
+		CK_SLIST_FOREACH(ih, &ie->ie_handlers, ih_next) {
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)ih, sizeof(*ih), countp);
+			if (error != 0)
+				return (error);
+		}
+	}
+	return (0);
+}
+
 static void	intr_event_update(struct intr_event *ie);
 static int	intr_event_schedule_thread(struct intr_event *ie, struct trapframe *frame);
 static struct intr_thread *ithread_create(const char *name);

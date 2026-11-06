@@ -3267,6 +3267,112 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (round 17, corrected classification):
+			 * event_list/event_lock (sys/kern/kern_intr.c) --
+			 * the static registry every struct intr_event is
+			 * linked onto -- and every intr_event/intr_handler
+			 * node reachable from it. Confirmed by live capture
+			 * (round 15/16, five independent runs) to be the
+			 * exact, previously-misclassified gap: round 16's
+			 * own sweep wrongly concluded "no unprotected static
+			 * global reachable" because it looked only at the
+			 * immediate call chain into intr_event_resume_
+			 * handler(), not at the registry these nodes are
+			 * THEMSELVES linked onto at creation time. See
+			 * sys/kern/kern_intr.c for the full corrected
+			 * classification argument.
+			 */
+			extern void hibernate_md_intr_event_list_va(
+			    vm_offset_t *va, size_t *len);
+			extern void hibernate_md_intr_event_lock_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t ie_raw, ie_va, ie_end;
+			size_t ie_len;
+
+			hibernate_md_intr_event_list_va(&ie_raw, &ie_len);
+			ie_va = trunc_page(ie_raw);
+			ie_end = round_page(ie_raw + ie_len);
+			for (; ie_va < ie_end && error == 0;
+			    ie_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, ie_va, true,
+				    &selfcopied);
+			if (error == 0) {
+				hibernate_md_intr_event_lock_va(&ie_raw,
+				    &ie_len);
+				ie_va = trunc_page(ie_raw);
+				ie_end = round_page(ie_raw + ie_len);
+				for (; ie_va < ie_end && error == 0;
+				    ie_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    ie_va, true, &selfcopied);
+			}
+			if (error == 0) {
+				extern int
+				intr_event_hibernate_selfcopy_nodes(
+				    const struct hibernate_attempt *ha,
+				    vm_paddr_t *wvec, uint64_t p,
+				    u_int *countp);
+				error = intr_event_hibernate_selfcopy_nodes(
+				    ha, wvec, p, &selfcopied);
+			}
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (disposition b, live-captured root cause):
+			 * rman_head/rman_mtx (sys/kern/subr_rman.c) -- the
+			 * static registry every struct rman (irq_rman et al)
+			 * is linked onto -- and every struct resource_i node
+			 * (including shared-allocation siblings reachable
+			 * only via r_sharehead) reachable from it. This is
+			 * the upstream source of the r_irq_cookie value
+			 * nexus_resume_intr() passes into the (already
+			 * protected, above) intr_event graph: live capture
+			 * (hardware breakpoint on intr_event_resume_
+			 * handler(), this round) proved the intr_event
+			 * protection alone was insufficient because THIS
+			 * node -- not the intr_event graph -- was the one
+			 * left holding the SAVE kernel's own stale content.
+			 * See sys/kern/subr_rman.c for the full argument.
+			 */
+			extern void hibernate_md_rman_head_va(
+			    vm_offset_t *va, size_t *len);
+			extern void hibernate_md_rman_mtx_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t rm_raw, rm_va, rm_end;
+			size_t rm_len;
+
+			hibernate_md_rman_head_va(&rm_raw, &rm_len);
+			rm_va = trunc_page(rm_raw);
+			rm_end = round_page(rm_raw + rm_len);
+			for (; rm_va < rm_end && error == 0;
+			    rm_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, rm_va, true,
+				    &selfcopied);
+			if (error == 0) {
+				hibernate_md_rman_mtx_va(&rm_raw, &rm_len);
+				rm_va = trunc_page(rm_raw);
+				rm_end = round_page(rm_raw + rm_len);
+				for (; rm_va < rm_end && error == 0;
+				    rm_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    rm_va, true, &selfcopied);
+			}
+			if (error == 0) {
+				extern int
+				rman_hibernate_selfcopy_nodes(
+				    const struct hibernate_attempt *ha,
+				    vm_paddr_t *wvec, uint64_t p,
+				    u_int *countp);
+				error = rman_hibernate_selfcopy_nodes(
+				    ha, wvec, p, &selfcopied);
+			}
+		}
+		if (error == 0) {
+			/*
 			 * The save-side hcb allocation (sys/kern/kern_dump.c) is a
 			 * large, dynamically-sized kmem_malloc()-backed allocation
 			 * whose own page-table path was never added to this

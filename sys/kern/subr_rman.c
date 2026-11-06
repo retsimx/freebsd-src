@@ -106,6 +106,120 @@ struct rman_head rman_head = TAILQ_HEAD_INITIALIZER(rman_head);
 static struct mtx rman_mtx; /* mutex to protect rman_head */
 MTX_SYSINIT(rman_mtx, &rman_mtx, "rman head", MTX_DEF);
 
+/*
+ * K24-T00 (disposition b, live-captured root cause): rman_head/rman_mtx
+ * -- the static registry every struct rman (irq_rman, drq_rman,
+ * port_rman, mem_rman, and every bus-specific rman created via
+ * rman_init()) is linked onto -- and every struct resource_i node
+ * reachable from it, were never self-copy protected. This is the
+ * SAME defect shape as event_list/intr_event (sys/kern/kern_intr.c,
+ * round 17), one level further down the call chain.
+ *
+ * Live-captured root cause (hardware breakpoint on
+ * intr_event_resume_handler(), handler->ih_event inspected before the
+ * fault): the `cookie` argument nexus_resume_intr() passes via
+ * rman_get_irq_cookie(irq) is read from irq->__r_i->r_irq_cookie --
+ * i.e. from THIS struct resource_i's own field. When that resource_i
+ * node's backing page is left as the SAVE kernel's own, unrelated
+ * content (because resource_i is ordinary heap memory, M_RMAN,
+ * reached only by walking rman_head/rm_list -- never previously
+ * protected), r_irq_cookie reads back as the SAVE kernel's own stale
+ * value instead of a valid struct intr_handler *. Confirmed by direct
+ * capture: the faulting `handler` pointer resolved to kernel .text
+ * (shutdown_resettodr, sys/kern/kern_ntptime.c) -- not a heap address
+ * at all -- and walking handler+0x30 (ih_event offset) then +0x40
+ * (ie_lock offset) then +0x18 (mtx_lock field offset) reproduces the
+ * exact 0x0f00000100a9c1ed value this epic has captured identically
+ * on every occurrence: proof the POINTER (r_irq_cookie, hence
+ * `handler`) is wrong, not that the intr_event graph itself (already
+ * protected, round 17) is unreachable. This settles the round 16/17
+ * open question as disposition (a)+(b) combined: the intr_event
+ * protection was correct and necessary but insufficient on its own,
+ * because the upstream resource_i node supplying the cookie into
+ * that correctly-protected graph was itself unprotected.
+ *
+ * copy_leaf is true for the same reason as every sibling in this
+ * epic's established class: every struct rman and struct resource_i
+ * reachable here was built fresh by THIS boot's own rman_init()/
+ * nexus_identify()-time resource allocation, strictly before the
+ * hibernate ioctl can run -- there is no saved-image content worth
+ * restoring, only this resume kernel's own live state that must
+ * survive the K-10 destructive copy unchanged.
+ */
+void	hibernate_md_rman_head_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_rman_head_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&rman_head;
+	*len = sizeof(rman_head);
+}
+
+void	hibernate_md_rman_mtx_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_rman_mtx_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&rman_mtx;
+	*len = sizeof(rman_mtx);
+}
+
+/*
+ * Walks rman_head (now protected, above) -> each struct rman's own
+ * rm_list -> each struct resource_i, protecting every node found.
+ * Shared-allocation resource_i nodes (created by the RF_SHAREABLE
+ * path in int_rman_reserve_resource(), this file) are NOT inserted
+ * into rm_list -- confirmed by direct reading, the only
+ * TAILQ_INSERT_*(&rm->rm_list, ...) call sites in this file are the
+ * unshared-allocation paths -- so for every resource_i with a
+ * non-NULL r_sharehead, the r_sharehead LIST itself (a separate
+ * M_RMAN allocation) and every resource_i hanging off it via
+ * r_sharelink are walked and protected too. Missing this second path
+ * would leave shared IRQ resources (the common case for legacy PCI
+ * interrupt-line sharing) exactly as unprotected as the defect this
+ * sweep closes.
+ */
+struct hibernate_attempt;
+int	rman_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
+	    vm_paddr_t *wvec, uint64_t p, u_int *countp);
+int
+rman_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, u_int *countp)
+{
+	struct rman *rm;
+	struct resource_i *r, *shr;
+	int error;
+	extern int hibernate_md_selfcopy_range(const struct hibernate_attempt *,
+	    vm_paddr_t *, uint64_t, vm_offset_t, size_t, u_int *);
+
+	error = 0;
+	TAILQ_FOREACH(rm, &rman_head, rm_link) {
+		error = hibernate_md_selfcopy_range(ha, wvec, p,
+		    (vm_offset_t)rm, sizeof(*rm), countp);
+		if (error != 0)
+			return (error);
+		TAILQ_FOREACH(r, &rm->rm_list, r_link) {
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)r, sizeof(*r), countp);
+			if (error != 0)
+				return (error);
+			if (r->r_sharehead == NULL)
+				continue;
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)r->r_sharehead,
+			    sizeof(*r->r_sharehead), countp);
+			if (error != 0)
+				return (error);
+			LIST_FOREACH(shr, r->r_sharehead, r_sharelink) {
+				error = hibernate_md_selfcopy_range(ha, wvec,
+				    p, (vm_offset_t)shr, sizeof(*shr),
+				    countp);
+				if (error != 0)
+					return (error);
+			}
+		}
+	}
+	return (0);
+}
+
 static int int_rman_release_resource(struct rman *rm, struct resource_i *r);
 
 static __inline struct resource_i *
