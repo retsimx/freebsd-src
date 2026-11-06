@@ -5166,6 +5166,33 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    saved_td_sleeplocks);
 		/*
 		 * This file has no public header for any of these three
+		extern void uma_hibernate_reinit_plinks(void);
+		extern void uma_hibernate_reinit_cache_buckets(void);
+		/*
+		 * K24-T00 (reconciliation, Defect A): rebuild UMA's own
+		 * plinks.uma reverse-lookup index (vm_page_t's own
+		 * slab/zone-identity fields, stale/zero after round 59's
+		 * own vm_page_array reinit, while each keg's own slab
+		 * lists are the saved image's correct content) BEFORE any
+		 * malloc()/free() this continuation performs -- including
+		 * the reinit calls immediately below, none of which
+		 * themselves allocate through a VTOSLAB zone, but every
+		 * later device-resume callee (acpi_pwr_register_consumer()
+		 * et al.) does. See sys/vm/uma_core.c's own
+		 * uma_hibernate_reinit_plinks() for the full root-cause
+		 * account and disposition.
+		 */
+		uma_hibernate_reinit_plinks();
+		/*
+		 * K24-T00 (Job 2, exhaustive sweep): per-CPU cache-bucket
+		 * identity reinit -- see sys/vm/uma_core.c's own
+		 * uma_hibernate_reinit_cache_buckets() for the full
+		 * root-cause account. Called immediately after
+		 * uma_hibernate_reinit_plinks(), same reasoning: before any
+		 * malloc()/free() this continuation or any later
+		 * device-resume callee performs.
+		 */
+		uma_hibernate_reinit_cache_buckets();
 		 * accessors, matching this file's own existing convention
 		 * (e.g. "extern struct susppcb **susppcbs" in
 		 * sys/amd64/amd64/hibernate_machdep.c, declared the same

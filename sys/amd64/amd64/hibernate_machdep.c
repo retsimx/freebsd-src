@@ -3454,6 +3454,29 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (exhaustive sweep): bucket_zones[]
+			 * (sys/vm/uma_core.c), the per-size cache-bucket
+			 * zone descriptor table, each entry's own ubz_zone
+			 * an identity pointer into this boot's own,
+			 * bucket_init()-created zone. See sys/vm/uma_core.c
+			 * for the full comment.
+			 */
+			extern void hibernate_md_bucket_zones_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t bz_raw, bz_va, bz_end;
+			size_t bz_len;
+
+			hibernate_md_bucket_zones_va(&bz_raw, &bz_len);
+			bz_va = trunc_page(bz_raw);
+			bz_end = round_page(bz_raw + bz_len);
+			for (; bz_va < bz_end && error == 0;
+			    bz_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, bz_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
 			 * K24-T00 (measurement-method fix round): kmemzones[]
 			 * (sys/kern/kern_malloc.c) -- the table EVERY malloc(9)
 			 * call anywhere resolves through to find its backing

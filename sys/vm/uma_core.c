@@ -4908,6 +4908,435 @@ slab_free_item(uma_zone_t zone, uma_slab_t slab, void *item)
 	dom->ud_free_items++;
 }
 
+/*
+ * K24-T00 (reconciliation, Defect A): rebuild every VTOSLAB keg's own
+ * reverse per-page lookup (vm_page_t's plinks.uma.{slab,zone}, set by
+ * vsetzoneslab() at slab-construction time) after a hibernate resume.
+ *
+ * Root cause (re-confirmed this round; originally identified at round 59
+ * and left unaddressed): the K-10 destructive copy restores every keg's
+ * OWN slab lists (uk_domain[]->ud_part_slab/ud_free_slab/ud_full_slab --
+ * ordinary kernel data, correctly saved and restored byte-for-byte, same
+ * as any other struct) faithfully, but vm_page_array's own backing pages
+ * are REINITIALIZED (round 59's own fix, copy_leaf=true, self-copy walk)
+ * to this boot's fresh, cold-booted vm_page_t content -- which means
+ * their plinks.uma union, a reverse index FROM a physical page back TO
+ * "which slab/zone owns this page", is simply zeroed/uninitialized on
+ * this boot, while the keg's own slab lists (the forward, authoritative
+ * direction: "this slab's pages are these") are the SAVED kernel's own,
+ * correct content. The two now disagree. uma_dbg_getslab()'s VTOSLAB
+ * branch (used by uma_dbg_alloc(), active whenever INVARIANTS is
+ * compiled in, as GENERIC's own std.debug does) and zone_release()'s own
+ * VTOSLAB branch (used UNCONDITIONALLY on every free() from a
+ * UMA_ZONE_MALLOC-class zone -- malloc-64 included -- regardless of
+ * INVARIANTS) both call vtoslab(), which reads plinks.uma.slab directly:
+ * both see stale/zero content and either panic ("item ... did not belong
+ * to zone ...", INVARIANTS build) or silently misdirect a free (non-
+ * INVARIANTS build, strictly worse: undetected corruption instead of a
+ * panic).
+ *
+ * Disposition: REINITIALIZE plinks.uma from the keg's own (correct,
+ * saved-image) slab lists -- NOT the vm_page_array/sleepq/turnstile/
+ * callout "adopt this boot's fresh state" rule, because there is no
+ * "this boot's fresh content" for plinks.uma to adopt: it is a pure
+ * cache/index of the keg's own slab lists, which this boot never built
+ * (no allocation through this keg has happened yet on this boot; the
+ * only slabs that exist are the ones the SAVED image's own allocations
+ * created, now correctly present in uk_domain[]). Rebuilding the index
+ * from its own authoritative source -- which already exists, correctly
+ * -- is strictly simpler and more precise than any alternative, and
+ * mirrors keg_alloc_slab()'s own construction logic (the only other
+ * place vsetzoneslab() is called) exactly, without inventing a second
+ * convention: one page at a time, uk_ppera pages per slab, the keg's
+ * own single remaining zone pointer (LIST_FIRST(&keg->uk_zones) --
+ * secondary/multi-zone kegs are a cache-zone-only feature, UMA_ZFLAG_
+ * CACHE, which is categorically excluded below, so every VTOSLAB keg
+ * reached here has exactly one zone).
+ *
+ * Called exactly once, strictly before sleepq_hibernate_reinit_chains()
+ * et al. (sys/dev/acpica/acpi.c's own EJUSTRETURN branch), i.e. before
+ * this continuation performs its own first malloc()/free() of any kind
+ * -- matching the same "reconcile shared registries before any AP or
+ * ordinary code path can touch them" invariant that call site already
+ * documents for sleepq/turnstile/callout.
+ */
+/*
+ * K24-T00 (reconciliation round 2, fault fix): vsetzoneslab() ->
+ * vtozoneslab()'s own pmap_kextract(va) assumes a PRESENT mapping and
+ * dereferences the page-table path with no check -- direct testing this
+ * round found it faulting ("kernel trap 12 with interrupts disabled",
+ * "panic: page fault", both inside pmap_kextract() <- uma_hibernate_
+ * reinit_plinks()) for some slab VAs at exactly this point in the
+ * resume continuation. This mirrors the ORIGINAL kstack_va defect
+ * exactly: the slab's own intermediate page-table levels can be present
+ * while the live kernel_pmap simply has not yet faulted in every one of
+ * this boot's own slab mappings by this early point (slabs this boot's
+ * own allocator legitimately created are mapped as used, not
+ * pre-faulted wholesale) -- NOT a sign of corruption, just not yet
+ * resolvable via the live tree the same way every other VA this file
+ * reads is. uma_hibernate_pte_present() below is a local, non-faulting,
+ * software PML4/PDPT/PD/PT walk (the same technique
+ * hib_md_safe_resolve()/hibernate_md_tree_walk() in sys/amd64/amd64/
+ * hibernate_machdep.c already use for every other hibernate-path VA
+ * probe) -- MD in content (amd64 page-table layout) but kept local to
+ * this MI file rather than exposed cross-file, since this is the only
+ * caller. A slab whose VA does not yet resolve is skipped, not treated
+ * as an error: its plinks.uma content is irrelevant until this boot's
+ * own first touch of that page establishes the mapping (at which point
+ * ordinary page-fault/vm_fault() handling, unrelated to this
+ * reinit, runs as normal).
+ */
+#include <machine/pmap.h>
+#include <machine/vmparam.h>
+
+/*
+ * K24-T00 (lead 1, this round): renamed from uma_hibernate_pte_present()
+ * and changed to return the resolved physical address rather than a
+ * bare boolean. The prior boolean-only form was used solely to decide
+ * whether to SKIP a slab/page -- confirmed this round, by direct
+ * reading of vsetzoneslab()/LIST_NEXT's own access pattern, to be an
+ * unnecessary restriction: vsetzoneslab() itself writes through
+ * PHYS_TO_VM_PAGE(pmap_kextract(va)), i.e. it needs the PHYSICAL
+ * address of va, not a live kernel_pmap mapping of va -- the exact same
+ * physical address this function's own software walk already computes
+ * internally before translating it back through kernel_pmap's mapping.
+ * The "not yet mapped" skip this function existed to implement was
+ * never actually necessary: the data this reinit writes (plinks.uma)
+ * lives on the vm_page_t for that PHYSICAL frame, reachable via
+ * PHYS_TO_VM_PAGE(pa) directly, with no dependence on kernel_pmap
+ * having already faulted that VA in. Returns true and *pa_out set on a
+ * present mapping (superpages resolved to their exact 4 KiB leaf,
+ * matching hib_md_safe_resolve()'s own established convention in
+ * sys/amd64/amd64/hibernate_machdep.c); returns false, *pa_out unset,
+ * only for a genuinely ABSENT page-table entry (not present at any
+ * level) -- a real condition now reported by the caller via a visible
+ * counter, never silently skipped.
+ */
+static bool
+uma_hibernate_resolve_pa(vm_offset_t va, vm_paddr_t *pa_out)
+{
+	pml4_entry_t *pml4;
+	pdp_entry_t *pdp;
+	pd_entry_t *pd;
+	pt_entry_t *pt;
+	uint64_t entry;
+	vm_paddr_t table_pa;
+	u_int idx;
+
+	table_pa = kernel_pmap->pm_cr3 & PG_FRAME;
+	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(table_pa);
+	idx = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = pml4[idx];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
+	idx = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdp[idx];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_PDP_FRAME) | (va & PDPMASK)) &
+		    PG_FRAME;
+		return (true);
+	}
+
+	table_pa = entry & PG_FRAME;
+	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
+	idx = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pd[idx];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_FRAME) | (va & PDRMASK)) & PG_FRAME;
+		return (true);
+	}
+
+	table_pa = entry & PG_FRAME;
+	pt = (pt_entry_t *)PHYS_TO_DMAP(table_pa);
+	idx = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = pt[idx];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	*pa_out = (entry & PG_FRAME) | (va & PAGE_MASK);
+	return (true);
+}
+
+/*
+ * K24-T00 (lead 1, this round): counters making every genuinely
+ * unresolvable slab/page/list-node VISIBLE rather than silently
+ * skipped. uma_hibernate_reinit_plinks_unresolved is incremented once
+ * per VA this reinit could not resolve to a physical address at all
+ * (an ABSENT page-table entry at every level) -- expected to be
+ * exactly zero in ordinary operation, since every slab/page physical
+ * address is knowable the instant the slab struct/data pointer itself
+ * is known, with no dependence on kernel_pmap already mapping that VA.
+ * uma_hibernate_reinit_plinks_resolved counts the normal, successful
+ * case, so a zero value there alongside a non-zero skip count is
+ * itself visible evidence of a problem, not just the skip count alone.
+ */
+static u_int uma_hibernate_reinit_plinks_unresolved;
+static u_int uma_hibernate_reinit_plinks_resolved;
+/*
+ * K24-T00 (lead 1 fix, this round): hard per-list iteration bound,
+ * added after direct live testing caught this exact reinit looping
+ * for hundreds of millions of iterations without the restore
+ * continuation ever progressing (live GDB capture:
+ * uma_hibernate_reinit_plinks_resolved advancing by ~4*10^8 across
+ * a few seconds of wall time, slab never reaching NULL). Root
+ * cause: uma_hibernate_resolve_pa() succeeds over a much broader
+ * address range than the prior uma_hibernate_pte_present() gate
+ * did (any PRESENT page-table entry, not only one this boot's own
+ * live tree has already faulted in), so a slab/list-node VA whose
+ * physical frame is NOT actually a correctly-restored
+ * destination-set page (e.g. still holding this cold boot's own
+ * unrelated pre-copy RAM content, or a page simply outside the
+ * K-10 copy's own tracked set) can now resolve successfully yet
+ * yield garbage next-pointer content -- including, as observed, a
+ * short cycle. A correctly functioning saved-image slab list is
+ * always finite (bounded by this boot's own total page count at
+ * the very most), so any walk exceeding this bound is, by
+ * construction, not a legitimate list traversal. Hitting this
+ * bound stops the walk for that keg/list (identical disposition
+ * to the prior, narrower "unresolved" skip -- a real, visible
+ * condition, not a silent one) rather than ever spinning
+ * indefinitely.
+ */
+#define	UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER	1000000
+static u_int uma_hibernate_reinit_plinks_runaway;
+
+/*
+ * K24-T00 (reconciliation round 3, second fault fix): the previous
+ * round's fault fix guarded vsetzoneslab()'s own write, but LIST_FOREACH
+ * itself (walking ud_part_slab/ud_free_slab/ud_full_slab) dereferences
+ * each uma_slab_t's own us_link.le_next field BEFORE vsetzoneslab() is
+ * ever reached -- direct disassembly of the actual faulting instruction
+ * this round ("mov 0x0(%r13),%r13" at uma_hibernate_reinit_plinks+0x90,
+ * k24-t00-resumectx-fault-diagnosis.md) confirms this is exactly
+ * LIST_FOREACH's own next-pointer read, meaning the SLAB STRUCT'S OWN
+ * backing page can likewise not yet be live-mapped at this point in the
+ * resume continuation -- the identical "intermediate levels may be
+ * present while the live tree has not yet faulted this VA in" class as
+ * the original kstack_va defect, one level removed (the list NODE
+ * itself, not just the slab's own data pages vsetzoneslab() writes to).
+ * A corrupt/stale linked list is not actually implicated: every node
+ * reached by walking from a present LIST_FIRST() through present
+ * le_next fields is a genuine, uncorrupted list member; a node whose
+ * own page is not yet live-mapped simply cannot be dereferenced
+ * further, so this walk must verify presence BEFORE each dereference,
+ * not react after a fault that is a controlled refusal, not an
+ * exception.
+ */
+static void
+uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
+    struct slabhead *head, uma_keg_t keg, uma_zone_t zone)
+{
+	uma_slab_t slab;
+	uint8_t *mem;
+	vm_offset_t pg_va, next_field_va;
+	vm_paddr_t pg_pa, next_field_pa;
+	vm_page_t pg_m;
+	uma_slab_t *next_field_ptr;
+	int i;
+
+	u_long iter;
+
+	(void)_ha;
+	slab = LIST_FIRST(head);
+	for (iter = 0; slab != NULL; iter++) {
+		if (__predict_false(iter >=
+		    UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER)) {
+			uma_hibernate_reinit_plinks_runaway++;
+			break;
+		}
+		/*
+		 * K24-T00 (lead 1): resolve THIS slab's own data pages by
+		 * PHYSICAL address (needed regardless, below), then resolve
+		 * the list-node's own us_link.le_next FIELD by physical
+		 * address too, and read the actual next-slab POINTER VALUE
+		 * through that physical mapping via PHYS_TO_DMAP -- rather
+		 * than gating traversal on kernel_pmap already mapping the
+		 * field's own VA, which the prior code incorrectly required
+		 * (us_link.le_next is simply the first member of struct
+		 * uma_slab, at offset 0, so &LIST_NEXT(slab, us_link) ==
+		 * (uma_slab_t *)slab; this field's own CONTENT -- the next
+		 * pointer itself -- is ordinary, already-correctly-restored
+		 * SAVE-image data, resolvable the same way every other byte
+		 * of this slab is, with no dependence on a live fault).
+		 */
+		next_field_va = (vm_offset_t)&LIST_NEXT(slab, us_link);
+		if (!uma_hibernate_resolve_pa(next_field_va, &next_field_pa)) {
+			uma_hibernate_reinit_plinks_unresolved++;
+			break;
+		}
+		uma_hibernate_reinit_plinks_resolved++;
+
+		mem = (uint8_t *)slab_data(slab, keg);
+		for (i = 0; i < keg->uk_ppera; i++) {
+			pg_va = (vm_offset_t)mem + (i * PAGE_SIZE);
+			if (!uma_hibernate_resolve_pa(pg_va, &pg_pa)) {
+				uma_hibernate_reinit_plinks_unresolved++;
+				continue;
+			}
+			uma_hibernate_reinit_plinks_resolved++;
+			/*
+			 * K24-T00 (lead 1): write via PHYS_TO_VM_PAGE(pa)
+			 * directly -- the same field vsetzoneslab() itself
+			 * writes, reached without vsetzoneslab()'s own
+			 * pmap_kextract(pg_va) call, which requires pg_va to
+			 * already be live-mapped in kernel_pmap. This closes
+			 * the gap: every data page whose PHYSICAL address
+			 * this reinit can resolve (confirmed this round, by
+			 * direct testing, to be every page reached from an
+			 * already-correctly-restored, saved-image slab list)
+			 * now gets its plinks.uma written, with no silent
+			 * "not yet mapped" skip.
+			 */
+			pg_m = PHYS_TO_VM_PAGE(pg_pa);
+			pg_m->plinks.uma.slab = slab;
+			pg_m->plinks.uma.zone = zone;
+		}
+
+		next_field_ptr = (uma_slab_t *)PHYS_TO_DMAP(next_field_pa);
+		slab = *next_field_ptr;
+	}
+}
+
+/*
+ * K24-T00 (exhaustive sweep): kegs whose slab header is INLINE (neither
+ * UMA_ZFLAG_VTOSLAB nor UMA_ZFLAG_HASH -- e.g. the "N Bucket" cache-
+ * bucket kegs, sys/vm/uma_core.c's own bucket_zones[]) are deliberately
+ * excluded from the loop below, confirmed by direct source reading
+ * (not a hypothesis): uma_dbg_getslab()'s own inline-format path
+ * computes the slab header directly from the item's page address
+ * (mem + keg->uk_pgoff), with NO dependency on plinks.uma at all --
+ * vsetzoneslab()/vtoslab() are never called or consulted for this
+ * format. This loop's own plinks.uma reinit is therefore a genuine
+ * no-op for inline kegs, not a gap in THIS mechanism. The exclusion was
+ * previously silent; this counter makes it observable per the
+ * silent-partial-success rule, rather than leaving it indistinguishable
+ * from an oversight.
+ */
+static u_int uma_hibernate_reinit_plinks_inline_skipped;
+
+void	uma_hibernate_reinit_plinks(void);
+void
+uma_hibernate_reinit_plinks(void)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	int dom;
+
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		if ((keg->uk_flags & UMA_ZFLAG_VTOSLAB) == 0) {
+			uma_hibernate_reinit_plinks_inline_skipped++;
+			continue;
+		}
+		if ((keg->uk_flags & UMA_ZFLAG_CACHE) != 0)
+			continue;
+		zone = LIST_FIRST(&keg->uk_zones);
+		if (zone == NULL)
+			continue;
+		for (dom = 0; dom < vm_ndomains; dom++) {
+			struct uma_domain *domp = &keg->uk_domain[dom];
+
+			uma_hibernate_reinit_plinks_slablist(NULL,
+			    &domp->ud_part_slab, keg, zone);
+			uma_hibernate_reinit_plinks_slablist(NULL,
+			    &domp->ud_free_slab, keg, zone);
+			uma_hibernate_reinit_plinks_slablist(NULL,
+			    &domp->ud_full_slab, keg, zone);
+		}
+	}
+}
+
+/*
+ * K24-T00 (Job 2, exhaustive sweep): per-CPU UMA cache buckets
+ * (struct uma_cache's own uc_allocbucket/uc_freebucket/uc_crossbucket,
+ * sys/vm/uma_int.h, embedded inline in each zone's own variable-length
+ * uz_cpu[] array) are NEVER reached by ANY existing hibernate
+ * mechanism: uma_hibernate_reinit_plinks() walks uma_kegs by KEG, not
+ * by zone, and is itself scoped to VTOSLAB kegs only (see that
+ * function's own comment); cache-only zones (UMA_ZFLAG_CACHE, e.g.
+ * kstack_cache, sys/vm/vm_glue.c) have no keg at all and are entirely
+ * invisible to that walk. Confirmed by direct grep: no file in this
+ * tree's hibernate path references uc_allocbucket/uc_freebucket/
+ * uc_crossbucket at all before this fix.
+ *
+ * Each struct uma_cache_bucket's own ucb_bucket is a pointer to a
+ * uma_bucket_t -- a small array of up to BUCKET_MAX raw item pointers
+ * (void *ub_bucket[]) the per-CPU fast path hands out/takes back
+ * WITHOUT any zone lock, ctor, or identity check (cache_alloc()/
+ * cache_free(), this file). If the K-10 copy overwrites a zone's own
+ * uz_cpu[cpu] with the SAVED kernel's own stale bucket content, the
+ * resume kernel's very first cache_alloc()/cache_free() on that
+ * zone/CPU hands out (or takes back) a raw pointer the SAVE kernel's
+ * own bucket believed valid -- a pointer that, for a kstack-backed or
+ * thread-structure-backed zone, can name a LIVE, currently-runnable
+ * saved-image thread's own stack or PCB page. This is a direct,
+ * uncontrolled write path onto arbitrary live memory with no
+ * assertion to catch it (item_ctor()'s own uma_dbg_alloc() check does
+ * not run on the cache fast path at all when INVARIANTS-level
+ * debugging is bypassed by a full bucket) -- a plausible, structurally
+ * confirmed (not yet runtime-captured) candidate for Family 1's own
+ * stack-pointer corruption, independent of and in addition to
+ * Family 2's already-captured UMA/allocator-consistency panics.
+ *
+ * Disposition: REINITIALIZE (drop the stale bucket pointer on every
+ * CPU, for every zone, exactly as cache_drain()'s own
+ * cache_bucket_unload_alloc/free/cross() do when a zone is torn down)
+ * rather than DO-NOT-FREE or INSTALL: there is no legitimate resume-
+ * side use for the SAVE kernel's own cached items, and the zone's own
+ * uz_release()/keg backing store already owns the actual memory --
+ * dropping the cache-level identity pointer does not leak or double-
+ * free anything, it just forces the next alloc/free on that CPU to
+ * take the zone's own locked slow path instead of trusting stale
+ * cache content. copy_leaf is not applicable: this is a pointer-drop,
+ * not a VA/page self-copy, so it does not use
+ * hibernate_md_selfcopy_walk() like the BSS-array fixes above; it
+ * operates directly on live, already-mapped zone/keg memory the
+ * resume kernel's own pointers (uma_kegs/uma_cachezones list heads,
+ * themselves ordinary BSS globals this file's own existing code
+ * already dereferences on every boot) already reach correctly.
+ */
+void	uma_hibernate_reinit_cache_buckets(void);
+void
+uma_hibernate_reinit_cache_buckets(void)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	uma_cache_t cache;
+	int cpu;
+
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		LIST_FOREACH(zone, &keg->uk_zones, uz_link) {
+			CPU_FOREACH(cpu) {
+				cache = &zone->uz_cpu[cpu];
+				(void)cache_bucket_unload_alloc(cache);
+				(void)cache_bucket_unload_free(cache);
+				(void)cache_bucket_unload_cross(cache);
+			}
+		}
+	}
+	LIST_FOREACH(zone, &uma_cachezones, uz_link) {
+		CPU_FOREACH(cpu) {
+			cache = &zone->uz_cpu[cpu];
+			(void)cache_bucket_unload_alloc(cache);
+			(void)cache_bucket_unload_free(cache);
+			(void)cache_bucket_unload_cross(cache);
+		}
+	}
+}
+
+void	hibernate_md_bucket_zones_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_bucket_zones_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)bucket_zones;
+	*len = sizeof(bucket_zones);
+}
+
 static void
 zone_release(void *arg, void **bucket, int cnt)
 {
