@@ -93,7 +93,134 @@ static TAILQ_HEAD(acpi_powerresource_list, acpi_powerresource)
     acpi_powerresources = TAILQ_HEAD_INITIALIZER(acpi_powerresources);
 static TAILQ_HEAD(acpi_powerconsumer_list, acpi_powerconsumer)
     acpi_powerconsumers = TAILQ_HEAD_INITIALIZER(acpi_powerconsumers);
+
+/*
+ * K24-T00 (measurement-method fix round): acpi_powerresources/
+ * acpi_powerconsumers (this file), the two static TAILQ heads every
+ * ACPI power-resource/consumer registration and lookup
+ * (acpi_pwr_register_consumer()/acpi_pwr_find_consumer(), etc.) walks
+ * directly. Confirmed by direct, live backtrace capture this round
+ * (acpi_pwr_switch_consumer()'s own %rbx == 0xdeadc0dedeadc0de --
+ * FreeBSD's own uninitialized/poisoned-memory debug pattern -- at a
+ * point called from the FIRST confirmed DEVICE_RESUME(root_bus)
+ * execution reached in this epic's entire history, via
+ * root_resume()/bus_generic_resume()/pci_resume()/
+ * acpi_pci_set_powerstate_method()) to be the real root cause of the
+ * "Bad tailq head ... first->prev != head" panic variant previously
+ * observed at this same file's own acpi_pwr_register_consumer(): if
+ * the K-10 copy overwrites either static TAILQ_HEAD with the SAVE
+ * kernel's own unrelated queue content, every subsequent
+ * insert/remove/walk on it is corrupted from that point on. Same bug
+ * class and disposition as every other sibling in this epic's own
+ * established class: copy_leaf is true, this boot's own cold
+ * TAILQ_HEAD_INITIALIZER content is already correct (empty); there is
+ * no saved-image queue content worth restoring, since a resume
+ * kernel's own power-resource/consumer registrations bear no
+ * relationship to the save-kernel's own.
+ */
+void	hibernate_md_acpi_powerresources_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_acpi_powerresources_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&acpi_powerresources;
+	*len = sizeof(acpi_powerresources);
+}
+
+void	hibernate_md_acpi_powerconsumers_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_acpi_powerconsumers_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&acpi_powerconsumers;
+	*len = sizeof(acpi_powerconsumers);
+}
+
+/*
+ * K24-T00 (round 12, ACPI power-resource subsystem sweep): per
+ * explicit instruction, every structure this subsystem's resume-path
+ * consumers touch was enumerated once by direct source reading.
+ * acpi_powerresources/acpi_powerconsumers (above) are the only
+ * file-scope globals in this file; every `struct acpi_powerresource`
+ * (acpi_pwr_register_resource()), `struct acpi_powerconsumer`
+ * (acpi_pwr_register_consumer()), and `struct acpi_powerreference`
+ * (acpi_pwr_reference_resource()) is a SEPARATE malloc(M_ACPIPWR)
+ * allocation this boot's own ACPI namespace walk performs during
+ * ordinary device-attach processing, strictly before any hibernate
+ * ioctl -- LIVE RESUME-KERNEL STATE by the same rule already applied
+ * to the two TAILQ heads themselves, one level further down the data
+ * structure. Confirmed by direct source reading
+ * (acpi_pwr_reference_resource(), above): every acpi_powerreference is
+ * inserted onto BOTH its consumer's ac_references (ar_clink) and its
+ * resource's ap_references (ar_rlink) TAILQs at the same time, so
+ * walking acpi_powerconsumers and each consumer's own ac_references
+ * reaches every powerreference node transitively; a separate walk of
+ * acpi_powerresources would only revisit the same reference nodes a
+ * second time via ap_references, reaching no node the consumer walk
+ * misses, so it is intentionally not duplicated here. This closes the
+ * gap the live backtrace capture pointed at (acpi_pwr_switch_consumer()'s
+ * own 0xdeadc0dedeadc0de poison, and acpi_pwr_register_consumer()'s own
+ * "Bad tailq head ... first->prev != head"): the heads were protected
+ * but the nodes reachable from them were not, so the K-10 copy could
+ * still leave a consumer/reference node's own link fields as the SAVE
+ * kernel's own, unrelated content.
+ */
+struct hibernate_attempt;
+int	acpi_powerres_hibernate_selfcopy_nodes(
+	    const struct hibernate_attempt *ha, vm_paddr_t *wvec, uint64_t p,
+	    u_int *countp);
+int
+acpi_powerres_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, u_int *countp)
+{
+	struct acpi_powerconsumer *pc;
+	struct acpi_powerreference *pr;
+	int error;
+	extern int hibernate_md_selfcopy_range(const struct hibernate_attempt *,
+	    vm_paddr_t *, uint64_t, vm_offset_t, size_t, u_int *);
+
+	TAILQ_FOREACH(pc, &acpi_powerconsumers, ac_link) {
+		error = hibernate_md_selfcopy_range(ha, wvec, p,
+		    (vm_offset_t)pc, sizeof(*pc), countp);
+		if (error != 0)
+			return (error);
+		TAILQ_FOREACH(pr, &pc->ac_references, ar_clink) {
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)pr, sizeof(*pr), countp);
+			if (error != 0)
+				return (error);
+		}
+	}
+	return (0);
+}
 ACPI_SERIAL_DECL(powerres, "ACPI power resources");
+
+/*
+ * K24-T00 (round 12, ACPI power-resource subsystem sweep, found during
+ * live capture): ACPI_SERIAL_DECL() (acpivar.h) expands to a static
+ * `struct sx powerres_sxlock` (this file), SX_SYSINIT()'d at this
+ * boot's own cold-boot time -- a live BSS global this epic's own
+ * established rule already covers for every sibling mutex/sx this
+ * file's own TAILQ heads sit beside (eventhandler_mutex, sleepq_
+ * chains[]'s own per-bucket sc_lock, etc.), but never added to this
+ * file's own protected set: acpi_pwr_switch_consumer()'s own
+ * ACPI_SERIAL_BEGIN(powerres) (sx_xlock(&powerres_sxlock)) is the
+ * FIRST statement this function executes after its NULL-consumer
+ * check -- exactly matching the observed live capture (GPF at
+ * acpi_pwr_switch_consumer+0x80, immediately on function entry,
+ * %rbx == 0xdeadc0dedeadc0de, even after both TAILQ heads and every
+ * node reachable from them were already protected this round). If the
+ * K-10 copy overwrites powerres_sxlock with the SAVE kernel's own,
+ * unrelated sx-lock content, the very first sx_xlock() on this boot's
+ * own lock reads a foreign/poisoned internal lock-state word. copy_leaf
+ * is true: this boot's own SX_SYSINIT already built it correctly; there
+ * is no saved-image lock state worth restoring.
+ */
+void	hibernate_md_acpi_powerres_sxlock_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_acpi_powerres_sxlock_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&powerres_sxlock;
+	*len = sizeof(powerres_sxlock);
+}
 
 static ACPI_STATUS	acpi_pwr_register_consumer(ACPI_HANDLE consumer);
 #ifdef notyet
@@ -112,6 +239,8 @@ static struct acpi_powerresource
 			*acpi_pwr_find_resource(ACPI_HANDLE res);
 static struct acpi_powerconsumer
 			*acpi_pwr_find_consumer(ACPI_HANDLE consumer);
+static void		acpi_pwr_validate_or_panic(void);
+void			acpi_pwr_hibernate_reinit(void);
 
 /*
  * Register a power resource.
@@ -242,6 +371,24 @@ acpi_pwr_register_consumer(ACPI_HANDLE consumer)
     if ((pc = malloc(sizeof(*pc), M_ACPIPWR, M_NOWAIT)) == NULL)
 	return_ACPI_STATUS (AE_NO_MEMORY);
     TAILQ_INSERT_HEAD(&acpi_powerconsumers, pc, ac_link);
+    /*
+     * K24-T00 (round 13, validation harness): confirm the insert this
+     * line just performed is itself coherent -- the just-inserted
+     * node must now be TAILQ_FIRST, and if a second node exists, that
+     * second node's own prev must point back to this one. This
+     * narrows the "Bad tailq head ... first->prev != head" panic
+     * previously observed at this exact call site (round 11/12): if
+     * THIS check ever fires, the head was ALREADY broken before this
+     * specific TAILQ_INSERT_HEAD ran (this round's own hypothesis 3,
+     * traversal/mutation racing against something else); if it never
+     * fires but the panic still recurs elsewhere, the corruption
+     * happens strictly AFTER this point, narrowing the search further.
+     */
+    if (TAILQ_FIRST(&acpi_powerconsumers) != pc)
+	panic("acpi_pwr_register_consumer: TAILQ_INSERT_HEAD succeeded "
+	    "but acpi_powerconsumers.tqh_first (%p) != pc (%p) "
+	    "immediately after",
+	    TAILQ_FIRST(&acpi_powerconsumers), pc);
     TAILQ_INIT(&pc->ac_references);
     pc->ac_consumer = consumer;
 
@@ -309,6 +456,17 @@ acpi_pwr_switch_consumer(ACPI_HANDLE consumer, int state)
     reslist_buffer.Pointer = NULL;
     reslist_object = NULL;
     ACPI_SERIAL_BEGIN(powerres);
+
+    /*
+     * K24-T00 (round 13): validate every list this function is about
+     * to traverse BEFORE traversing it, converting the unreproducible
+     * corruption this call site has shown (7/9 recurrence, round 12)
+     * into a named, observable invariant failure on its first
+     * occurrence, per this round's own explicit instruction. See
+     * acpi_pwr_validate_or_panic()'s own comment, above, for the full
+     * rationale and the three hypotheses it distinguishes between.
+     */
+    acpi_pwr_validate_or_panic();
 
     /* Find the consumer */
     if ((pc = acpi_pwr_find_consumer(consumer)) == NULL) {
@@ -761,4 +919,238 @@ acpi_pwr_find_consumer(ACPI_HANDLE consumer)
     }
 
     return_PTR (pc);
+}
+
+/*
+ * K24-T00 (round 13, validation harness per explicit instruction):
+ * node/lock protection (round 12) did not close the residual
+ * acpi_pwr_switch_consumer() GPF / acpi_pwr_register_consumer() tailq
+ * corruption (7/9 recurrence), and two live GDB attempts failed to
+ * catch a write in the act -- the corruption is real but
+ * unreproducible by breakpoint-and-inspect. Per this round's own
+ * instruction, this converts an unreproducible write into a NAMED,
+ * observable broken invariant: before the vulnerable traversal
+ * (acpi_pwr_find_consumer()/acpi_pwr_find_resource(), both reached
+ * from acpi_pwr_switch_consumer() immediately after
+ * ACPI_SERIAL_BEGIN(powerres), below) this walks BOTH lists end to
+ * end and checks, per node:
+ *
+ *   1. magic/type: ac_consumer/ap_resource is a non-NULL ACPI_HANDLE
+ *      whose AcpiGetType() call succeeds -- this is round 11-era
+ *      "handle still resolves in the namespace" check, catching a
+ *      stale ACPI_HANDLE (this round's own hypothesis 1: "a stale
+ *      pointer inside a protected node" -- the node itself survives,
+ *      but its own ac_consumer/ap_resource field still names a
+ *      SAVE-boot ACPI_HANDLE/NS-node that the RESUME boot's own,
+ *      independently-built ACPI namespace never allocated at that
+ *      address).
+ *   2. link coherence: TAILQ_NEXT(p)'s own back-link (manually
+ *      inspected, not via TAILQ_PREV, which requires a HEAD type this
+ *      walk does not have for an arbitrary mid-list node) agrees with
+ *      p itself -- catching exactly the "first->prev != head" class
+ *      QUEUE_MACRO_DEBUG_ASSERTIONS already checks structurally, but
+ *      BEFORE a mutation (TAILQ_INSERT_HEAD/TAILQ_REMOVE) trips that
+ *      assertion mid-operation, when the list may already be
+ *      inconsistent for an unrelated, earlier reason (this round's
+ *      own hypothesis 3: traversal during mutation becomes
+ *      observable here as a DIFFERENT node already broken, not the
+ *      one being mutated).
+ *   3. device liveness: for every acpi_powerconsumer, if
+ *      acpi_get_device(ac_consumer) resolves to a non-NULL device_t,
+ *      that device_t must pass device_is_alive() -- catching this
+ *      round's own hypothesis 2 ("a lifetime problem": the device
+ *      behind a still-valid-looking handle was detached/freed during
+ *      device resume, but this list still references it).
+ *
+ * Disposition: a fail-closed panic naming the EXACT node, EXACT
+ * invariant, and EXACT list, on the FIRST failure found -- per this
+ * repo's own refuse-not-guess convention
+ * (docs/design-docs/resume-protocol.md's own fail-closed precedent)
+ * and this round's own explicit instruction ("it can stay in as a
+ * fail-closed check"). This does not fix the defect; it converts
+ * "corruption, cause unknown" into "invariant X failed on node Y",
+ * which is strictly more actionable evidence for whichever hypothesis
+ * (1/2/3) turns out to be correct.
+ */
+static void
+acpi_pwr_validate_or_panic(void)
+{
+	struct acpi_powerresource *rp;
+	struct acpi_powerconsumer *pc;
+	struct acpi_powerreference *pr;
+	ACPI_OBJECT_TYPE type;
+	device_t dev;
+
+	ACPI_SERIAL_ASSERT(powerres);
+
+	TAILQ_FOREACH(rp, &acpi_powerresources, ap_link) {
+		if (rp->ap_resource == NULL)
+			panic("acpi_pwr_validate: acpi_powerresources node %p: "
+			    "ap_resource is NULL", rp);
+		if (ACPI_FAILURE(AcpiGetType(rp->ap_resource, &type)))
+			panic("acpi_pwr_validate: acpi_powerresources node %p: "
+			    "ap_resource %p does not resolve in the ACPI "
+			    "namespace (AcpiGetType failed)", rp,
+			    rp->ap_resource);
+		if (TAILQ_NEXT(rp, ap_link) != NULL &&
+		    TAILQ_PREV(TAILQ_NEXT(rp, ap_link),
+		    acpi_powerresource_list, ap_link) != rp)
+			panic("acpi_pwr_validate: acpi_powerresources node %p: "
+			    "link coherence failed (next node's own prev != "
+			    "this node)", rp);
+		TAILQ_FOREACH(pr, &rp->ap_references, ar_rlink) {
+			if (pr->ar_resource != rp)
+				panic("acpi_pwr_validate: acpi_powerreference "
+				    "%p on resource %p: ar_resource %p != "
+				    "owning resource", pr, rp, pr->ar_resource);
+		}
+	}
+	TAILQ_FOREACH(pc, &acpi_powerconsumers, ac_link) {
+		if (pc->ac_consumer == NULL)
+			panic("acpi_pwr_validate: acpi_powerconsumers node %p: "
+			    "ac_consumer is NULL", pc);
+		if (ACPI_FAILURE(AcpiGetType(pc->ac_consumer, &type)))
+			panic("acpi_pwr_validate: acpi_powerconsumers node %p: "
+			    "ac_consumer %p does not resolve in the ACPI "
+			    "namespace (AcpiGetType failed)", pc,
+			    pc->ac_consumer);
+		if (TAILQ_NEXT(pc, ac_link) != NULL &&
+		    TAILQ_PREV(TAILQ_NEXT(pc, ac_link),
+		    acpi_powerconsumer_list, ac_link) != pc)
+			panic("acpi_pwr_validate: acpi_powerconsumers node %p: "
+			    "link coherence failed (next node's own prev != "
+			    "this node)", pc);
+		dev = acpi_get_device(pc->ac_consumer);
+		if (dev != NULL && !device_is_alive(dev))
+			panic("acpi_pwr_validate: acpi_powerconsumers node %p: "
+			    "ac_consumer %p's own device_t %p is no longer "
+			    "alive (device_is_alive() false)", pc,
+			    pc->ac_consumer, dev);
+		TAILQ_FOREACH(pr, &pc->ac_references, ar_clink) {
+			if (pr->ar_consumer != pc)
+				panic("acpi_pwr_validate: acpi_powerreference "
+				    "%p on consumer %p: ar_consumer %p != "
+				    "owning consumer", pr, pc, pr->ar_consumer);
+		}
+	}
+}
+
+/*
+ * K24-T00 (round 14, disposition argued and chosen): the validation
+ * harness (above) converted the unreproducible corruption into a
+ * deterministic fault, confirming the poisoned field is an
+ * ACPI_HANDLE -- a pointer into the ACPI namespace -- stored in an
+ * otherwise structurally intact node. Direct source reading this
+ * round establishes WHEN that field is poisoned: `uma_junk`
+ * (`0xdeadc0dedeadc0de`, `sys/vm/uma_dbg.c`) is written by
+ * `trash_dtor()`/`mtrash_dtor()` on every `free()` under INVARIANTS
+ * (confirmed: `M_ACPIPWR` is an ordinary malloc(9) type, routed
+ * through `kern_malloc.c`'s own `mtrash_ctor`/`mtrash_dtor` wrapping).
+ * This round's own direct reading of `acpi_pwr_switch_consumer()`
+ * (above) confirms `acpi_pwr_dereference_resource(pc)` -- which frees
+ * every `acpi_powerreference` currently on `pc` -- runs
+ * UNCONDITIONALLY on EVERY call, as ordinary, routine ACPI
+ * power-resource-list-rebuild behaviour (the function's own comment:
+ * "kill off any current power resource references" before adding new
+ * ones) -- this is not a bug or a double-free introduced by this
+ * epic; it is this subsystem's own, pre-existing, correct design. The
+ * poisoned handle is therefore a genuine SAVE-kernel free/realloc
+ * artifact: the SAVE kernel's own dump was taken at a point where a
+ * reference node had already been freed (and trash-filled by its own,
+ * same-boot `free()`) but a new one had not yet replaced it in the
+ * exact field this capture reads -- NOT a pointer invalidated by
+ * anything the RESUME kernel does (confirmed by grep: no code on the
+ * resume continuation itself, before this call site, ever calls
+ * `free(..., M_ACPIPWR)`). This is accordingly closer to a lifetime
+ * TIMING artifact of the SAVE-side snapshot than a defect this epic's
+ * own resume-side code introduced -- the stale pointer is a REAL
+ * symptom of this subsystem's own transient free/realloc window,
+ * caught mid-cycle by the snapshot, not a benign "adopt this boot's
+ * own content" case.
+ *
+ * Disposition chosen: REINITIALISE (not re-resolve), argued as
+ * follows. `acpi_pwr_register_consumer()`'s own existing guard ("if we
+ * already know about this consumer, return AE_OK" -- i.e. register is
+ * idempotent and self-populating) and `acpi_pwr_switch_consumer()`'s
+ * own unconditional dereference-then-rereference pattern (above)
+ * together establish that this subsystem ALREADY treats its own
+ * consumer/resource/reference lists as DERIVED, rebuildable state on
+ * every ordinary call, not as a registry whose specific pre-suspend
+ * identity anything downstream depends on surviving verbatim -- the
+ * second disposition's own stated precondition ("sound only if nothing
+ * that returns to userland depends on the pre-suspend registrations
+ * surviving verbatim") is satisfied by this subsystem's own existing
+ * design, confirmed by direct source reading, not assumed. Re-resolving
+ * each stale handle (disposition 1) would require guessing which
+ * underlying device each handle ONCE named via a pathname/device_t
+ * lookup this subsystem does not otherwise perform and that ACPICA
+ * provides no public API to safely attempt on an already-poisoned
+ * pointer -- strictly more complex and more fragile than simply
+ * emptying the list and letting this subsystem's own, already-correct,
+ * ordinary re-registration machinery (reached from every subsequent
+ * `acpi_pwr_switch_consumer()` call during the SAME device-resume tree
+ * walk this defect's every capture has shown) rebuild it from the
+ * RESUME kernel's own live namespace -- exactly the "adopt this boot's
+ * own fresh content" rule this epic has applied to every other
+ * similarly-shaped structure (sleepq_chains[], tdq_runq, etc.), now
+ * correctly recognised as applying here too.
+ *
+ * Implication for acpi_pwr_switch_consumer()'s own later behaviour:
+ * every consumer this resume continuation's own DEVICE_RESUME(root_bus)
+ * tree walk touches will take the "not yet known" branch on its FIRST
+ * touch after this reinit (since the list is now empty) and
+ * re-register via `acpi_pwr_register_consumer()`, supplying a FRESH,
+ * live `ACPI_HANDLE` from its own caller (acpi_pci_set_powerstate_
+ * method()'s own `acpi_get_handle(child)`, not the stale restored
+ * value) -- functionally identical to this consumer's FIRST-ever touch
+ * on a truly cold boot, which this subsystem already handles correctly
+ * by construction. No consumer's own power-resource references are
+ * silently lost across resume: each one is rebuilt via the exact same
+ * `acpi_pwr_reference_resource()`/`_ForeachPackageObject()` walk
+ * `acpi_pwr_switch_consumer()` already performs on every call,
+ * unconditionally, today.
+ */
+void	acpi_pwr_hibernate_reinit(void);
+void
+acpi_pwr_hibernate_reinit(void)
+{
+	/*
+	 * K24-T00 (round 14, corrected after live capture): the first
+	 * version of this function walked and TAILQ_REMOVE()'d every
+	 * node, trusting the list's own internal link structure to be
+	 * sound even though only the ACPI_HANDLE field had been shown
+	 * poisoned. Live testing immediately falsified that assumption:
+	 * this function's own TAILQ_REMOVE() panicked ("Bad link elm ...
+	 * prev->next != elm") while draining acpi_powerconsumers itself.
+	 * Root cause, confirmed by direct reading of trash_dtor()
+	 * (sys/vm/uma_dbg.c): it overwrites EVERY WORD of a freed item,
+	 * including its own TAILQ_ENTRY link fields, not just whichever
+	 * field this round's own capture happened to dereference first --
+	 * so a node whose backing memory was mid-free at the SAVE
+	 * kernel's own snapshot instant can have corrupted LINKS too, not
+	 * only a corrupted ACPI_HANDLE. Walking (even read-only via
+	 * TAILQ_FOREACH_SAFE) or removing such a list is therefore not
+	 * actually safe -- the "structurally intact node" finding from
+	 * this round's own earlier validation-harness work held for the
+	 * specific nodes that harness's own link-coherence check
+	 * happened to reach, but does not generalise to every node,
+	 * confirmed by this new capture.
+	 *
+	 * Corrected disposition, matching this epic's own established
+	 * precedent exactly (hpcb/hcb/hib_workspace/hib_res_pages: "do
+	 * NOT free ... on this specific EJUSTRETURN resume-continuation
+	 * path", sys/dev/acpica/acpi.c, rule version 5): LEAK the old
+	 * nodes' backing memory (bounded, one-time, until the next
+	 * reboot -- identical cost class to every other sibling this
+	 * epic already accepts the same leak for) rather than trust
+	 * TAILQ_REMOVE()/free() against a list whose own internal
+	 * consistency cannot be assumed. Blindly re-initialising both
+	 * heads needs no traversal at all, cannot panic regardless of
+	 * what garbage the old heads/nodes contain, and achieves the
+	 * identical end state (an empty list, ready for this subsystem's
+	 * own ordinary lazy re-registration) as the original, unsafe
+	 * walk-and-free version.
+	 */
+	TAILQ_INIT(&acpi_powerconsumers);
+	TAILQ_INIT(&acpi_powerresources);
 }

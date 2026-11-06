@@ -67,6 +67,31 @@ struct acpi_pci_devinfo {
 
 ACPI_SERIAL_DECL(pci_powerstate, "ACPI PCI power methods");
 
+/*
+ * K24-T00 (round 13, ACPI subsystem sweep, done properly per explicit
+ * instruction): pci_powerstate_sxlock, the sx this file's own
+ * ACPI_SERIAL_DECL() expands to, is `ACPI_SERIAL_BEGIN(pci_powerstate)`'d
+ * as the FIRST statement in acpi_pci_set_powerstate_method() (this
+ * file) -- the exact function one frame above acpi_pwr_switch_
+ * consumer() in EVERY captured GPF/tailq-corruption backtrace this
+ * epic has recorded for this defect since round 9. Same defect class,
+ * same disposition, as powerres_sxlock (sys/dev/acpica/acpi_powerres.c,
+ * round 12): a live BSS global, SX_SYSINIT()'d at this boot's own cold
+ * boot, never added to this file's own protected set. If the K-10 copy
+ * overwrites it with the SAVE kernel's own, unrelated sx-lock content,
+ * the very first sx_xlock() in this call chain -- reached BEFORE
+ * acpi_pwr_switch_consumer()'s own (now-protected) powerres_sxlock is
+ * ever touched -- reads foreign/poisoned internal lock state. copy_leaf
+ * is true: this boot's own SX_SYSINIT already built it correctly.
+ */
+void	hibernate_md_pci_powerstate_sxlock_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_pci_powerstate_sxlock_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&pci_powerstate_sxlock;
+	*len = sizeof(pci_powerstate_sxlock);
+}
+
 /* Be sure that ACPI and PCI power states are equivalent. */
 CTASSERT(ACPI_STATE_D0 == PCI_POWERSTATE_D0);
 CTASSERT(ACPI_STATE_D1 == PCI_POWERSTATE_D1);

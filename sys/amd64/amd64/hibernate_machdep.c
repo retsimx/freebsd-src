@@ -3419,6 +3419,136 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (round 13, ACPI subsystem sweep, done
+			 * properly per explicit instruction): pci_powerstate_
+			 * sxlock (sys/dev/acpica/acpi_pci.c) is
+			 * ACPI_SERIAL_BEGIN()'d as the FIRST statement of
+			 * acpi_pci_set_powerstate_method() -- the exact
+			 * function one stack frame above
+			 * acpi_pwr_switch_consumer() in every captured
+			 * GPF/tailq-corruption backtrace this epic has ever
+			 * recorded for this defect, reached BEFORE
+			 * powerres_sxlock (below) is ever touched. Never
+			 * previously protected. See
+			 * sys/dev/acpica/acpi_pci.c for the full comment.
+			 */
+			extern void hibernate_md_pci_powerstate_sxlock_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t pps_raw, pps_va, pps_end;
+			size_t pps_len;
+
+			hibernate_md_pci_powerstate_sxlock_va(&pps_raw,
+			    &pps_len);
+			pps_va = trunc_page(pps_raw);
+			pps_end = round_page(pps_raw + pps_len);
+			for (; pps_va < pps_end && error == 0;
+			    pps_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, pps_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (round 12, ACPI power-resource subsystem
+			 * sweep, found this round): powerres_sxlock (the
+			 * ACPI_SERIAL_DECL()-expanded sx this file's own
+			 * acpi_pwr_switch_consumer() locks as its FIRST
+			 * statement) was never added to this file's own
+			 * protected set, confirmed by live capture to be the
+			 * exact site: GPF at acpi_pwr_switch_consumer+0x80 on
+			 * function entry, even after both TAILQ heads and
+			 * every node reachable from them (below) were already
+			 * protected. See sys/dev/acpica/acpi_powerres.c for
+			 * the full comment.
+			 */
+			extern void hibernate_md_acpi_powerres_sxlock_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t sx_raw, sx_va, sx_end;
+			size_t sx_len;
+
+			hibernate_md_acpi_powerres_sxlock_va(&sx_raw, &sx_len);
+			sx_va = trunc_page(sx_raw);
+			sx_end = round_page(sx_raw + sx_len);
+			for (; sx_va < sx_end && error == 0;
+			    sx_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, sx_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (measurement-method fix round):
+			 * acpi_powerresources/acpi_powerconsumers
+			 * (sys/dev/acpica/acpi_powerres.c) -- confirmed by
+			 * direct, live backtrace capture to be reached and
+			 * corrupted during the FIRST confirmed
+			 * DEVICE_RESUME(root_bus) execution reached in this
+			 * epic's entire history (acpi_pwr_switch_consumer()'s
+			 * own %%rbx == 0xdeadc0dedeadc0de). See
+			 * sys/dev/acpica/acpi_powerres.c for the full comment.
+			 */
+			extern void hibernate_md_acpi_powerresources_va(
+			    vm_offset_t *va, size_t *len);
+			extern void hibernate_md_acpi_powerconsumers_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t pr_raw, pr_va, pr_end;
+			size_t pr_len;
+
+			hibernate_md_acpi_powerresources_va(&pr_raw, &pr_len);
+			pr_va = trunc_page(pr_raw);
+			pr_end = round_page(pr_raw + pr_len);
+			for (; pr_va < pr_end && error == 0;
+			    pr_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, pr_va, true,
+				    &selfcopied);
+			if (error == 0) {
+				hibernate_md_acpi_powerconsumers_va(&pr_raw,
+				    &pr_len);
+				pr_va = trunc_page(pr_raw);
+				pr_end = round_page(pr_raw + pr_len);
+				for (; pr_va < pr_end && error == 0;
+				    pr_va += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha, wvec,
+					    p, kernel_pmap->pm_cr3, pr_va, true,
+					    &selfcopied);
+			}
+			/*
+			 * K24-T00 (round 12, ACPI power-resource subsystem
+			 * sweep): per this round's own instruction ("check
+			 * whether the ENTRIES need the do-not-free/protect
+			 * disposition rather than the heads"), the two static
+			 * TAILQ HEADS above are correctly protected (live BSS
+			 * globals, ordinary rule), but every struct
+			 * acpi_powerresource/acpi_powerconsumer/
+			 * acpi_powerreference node reachable from them is a
+			 * SEPARATE malloc(M_ACPIPWR) allocation this boot's
+			 * own ACPI namespace walk (acpi_pwr_register_resource/
+			 * _consumer(), acpi_pwr_reference_resource(), this
+			 * file) performs during ordinary device-attach
+			 * processing, before any hibernate ioctl -- LIVE
+			 * RESUME-KERNEL STATE by the same rule as the
+			 * eventhandler nodes above, never the saved image's.
+			 * Confirmed by direct source reading: every
+			 * acpi_powerreference is reachable from its OWN
+			 * consumer's ac_references TAILQ (ar_clink), so
+			 * walking consumers alone reaches every reference
+			 * node transitively; walking resources separately
+			 * would revisit the same reference nodes a second
+			 * time, not reach any node the consumer walk misses.
+			 */
+			if (error == 0) {
+				extern int
+				acpi_powerres_hibernate_selfcopy_nodes(
+				    const struct hibernate_attempt *ha,
+				    vm_paddr_t *wvec, uint64_t p,
+				    u_int *countp);
+				error = acpi_powerres_hibernate_selfcopy_nodes(
+				    ha, wvec, p, &selfcopied);
+			}
+		}
+		if (error == 0) {
+			/*
 			 * The save-side hcb allocation (sys/kern/kern_dump.c) is a
 			 * large, dynamically-sized kmem_malloc()-backed allocation
 			 * whose own page-table path was never added to this

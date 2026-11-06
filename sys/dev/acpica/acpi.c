@@ -5193,6 +5193,24 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * device-resume callee performs.
 		 */
 		uma_hibernate_reinit_cache_buckets();
+		/*
+		 * K24-T00 (round 14, disposition chosen and argued): the
+		 * ACPI power-resource/consumer/reference lists
+		 * (sys/dev/acpica/acpi_powerres.c) are reinitialised (list
+		 * drained, not reconciled) BEFORE any device-resume callee
+		 * can touch them -- same ordering rule as every reinit
+		 * above and below this line. See
+		 * acpi_pwr_hibernate_reinit()'s own comment,
+		 * sys/dev/acpica/acpi_powerres.c, for the full disposition
+		 * argument (reinitialise vs. re-resolve) and for WHEN the
+		 * stale ACPI_HANDLE field this replaces is actually
+		 * poisoned (a SAVE-kernel free/realloc timing artifact of
+		 * this subsystem's own routine operation, confirmed by
+		 * direct reading of uma_dbg.c's own trash_dtor(), not a
+		 * defect this epic's own resume-side code introduced).
+		 */
+		extern void acpi_pwr_hibernate_reinit(void);
+		acpi_pwr_hibernate_reinit();
 		 * accessors, matching this file's own existing convention
 		 * (e.g. "extern struct susppcb **susppcbs" in
 		 * sys/amd64/amd64/hibernate_machdep.c, declared the same
