@@ -362,6 +362,40 @@ callout_callwheel_init(void *dummy)
 SYSINIT(callwheel_init, SI_SUB_CPU, SI_ORDER_ANY, callout_callwheel_init, NULL);
 
 /*
+ * K24-T00 (round 42): expose a given CPU's own cc_callwheel array
+ * (its address and byte size) for hibernate_machdep_prepare()'s self-
+ * copy protection, matching the tc_hibernate_selfcopy_range()
+ * precedent (sys/kern/kern_tc.c) this file has no public header to
+ * declare a prototype in otherwise. cc_callwheel is a SEPARATE,
+ * per-CPU malloc_domainset() allocation (callout_cpu_init() below),
+ * outside the DPCPU-resident struct callout_cpu itself (which only
+ * holds the pointer) -- the same bug shape already fixed for the
+ * idle-thread kstacks (round 29): a per-CPU, dynamically-allocated
+ * structure whose backing physical pages can independently fall
+ * inside the K-10 destination set. Returns with both output
+ * parameters set to 0 if cpu's own callout_cpu has not yet been
+ * initialized (cc_callwheel == NULL); the caller must treat that as
+ * "nothing to protect for this cpu", not an error.
+ */
+void	callout_cpu_hibernate_selfcopy_range(int cpu, uintptr_t *va_out,
+	    size_t *len_out);
+void
+callout_cpu_hibernate_selfcopy_range(int cpu, uintptr_t *va_out,
+    size_t *len_out)
+{
+	struct callout_cpu *cc;
+
+	cc = CC_CPU(cpu);
+	if (cc->cc_callwheel == NULL) {
+		*va_out = 0;
+		*len_out = 0;
+		return;
+	}
+	*va_out = (uintptr_t)cc->cc_callwheel;
+	*len_out = sizeof(struct callout_list) * callwheelsize;
+}
+
+/*
  * cc_callwheel[]'s own buckets register currently-armed callouts;
  * every struct callout embedded in a thread or softc OTHER than the
  * two continuing threads (the resumed BSP thread, the AP's own fresh

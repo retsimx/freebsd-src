@@ -2810,6 +2810,78 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00 (round 43, comment corrected by the repair
+			 * session that found this contradiction): this comment
+			 * previously argued for copy_leaf=false ("Corrected
+			 * disposition, matching vm_page_array's own precedent
+			 * exactly"), but the CODE below has always passed
+			 * copy_leaf=true -- round 43's own verdict reverted to
+			 * true after its own direct testing found BOTH values
+			 * reproduce failures (true: the original "Bad link
+			 * elm"/"not owned" variants; false: the SAME eventual
+			 * failures PLUS a new cross-CPU hang in configtimer()),
+			 * and explicitly restored true "as the safest known-
+			 * good configuration ... with no evidence it is worse
+			 * than any alternative tried." That revert was never
+			 * reflected back into this comment, leaving code and
+			 * comment contradicting each other; this corrects that
+			 * omission.
+			 *
+			 * copy_leaf=true is correct, for a reason round 43 did
+			 * not yet have: round 44's own
+			 * sleepq_hibernate_reinit_chains()/
+			 * turnstile_hibernate_reinit_chains()/
+			 * callout_cpu_hibernate_reinit_chains() (sys/kern/
+			 * subr_sleepqueue.c, subr_turnstile.c, kern_timeout.c;
+			 * called from sys/dev/acpica/acpi.c, strictly before
+			 * any sleep/lock-contention/callout operation this
+			 * continuation performs) now unconditionally
+			 * REINITIALIZES every CPU's own cc_callwheel bucket
+			 * LIST_HEADs and cc_lock before anything can observe
+			 * them, superseding this array's own copy_leaf debate
+			 * entirely: whichever content the self-copy walk below
+			 * admits for this leaf is overwritten before any code
+			 * reads it, so copy_leaf's value cannot affect final
+			 * correctness either way. Of the two, true remains the
+			 * better choice even for the narrow window before that
+			 * reinit runs: a fresh-boot, all-empty bucket (true)
+			 * can never reference a now-dead saved-image thread's
+			 * identity, whereas a saved-image bucket (false) could
+			 * -- the exact defect class round 44 root-caused.
+			 * Round 42's own cc_lock/cc_cpu DPCPU fix (the loop
+			 * immediately above) remains correct and unchanged:
+			 * that per-CPU hardware/lock state IS boot-instance-
+			 * specific and must stay copy_leaf=true; only this
+			 * array's own CONTENT disposition was ever in question,
+			 * and it is now moot in practice thanks to round 44's
+			 * reinit, with true remaining the defensible choice
+			 * regardless.
+			 */
+			u_int cw_cpu;
+
+			CPU_FOREACH(cw_cpu) {
+				uintptr_t cw_va;
+				size_t cw_len;
+				vm_offset_t cw_pg, cw_end;
+
+				callout_cpu_hibernate_selfcopy_range(cw_cpu,
+				    &cw_va, &cw_len);
+				if (cw_va == 0)
+					continue;
+				cw_pg = trunc_page((vm_offset_t)cw_va);
+				cw_end = round_page((vm_offset_t)cw_va +
+				    cw_len);
+				for (; cw_pg < cw_end && error == 0;
+				    cw_pg += PAGE_SIZE)
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    cw_pg, true, &selfcopied);
+				if (error != 0)
+					break;
+			}
+		}
+		if (error == 0) {
+			/*
 			 * dpcpu_off[]/cpuid_to_pcpu[]: the two BSS-global lookup
 			 * tables the per-CPU DPCPU protection above does not
 			 * cover, found by live register capture of a genuine,
