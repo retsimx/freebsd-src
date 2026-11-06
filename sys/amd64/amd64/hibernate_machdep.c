@@ -2965,6 +2965,52 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (measurement-method fix round): kmemzones[]
+			 * (sys/kern/kern_malloc.c) -- the table EVERY malloc(9)
+			 * call anywhere resolves through to find its backing
+			 * UMA zone. Confirmed by direct source reading to be
+			 * the real, single root cause of the four previously-
+			 * separate-looking symptom variants at
+			 * acpi_pwr_register_consumer()'s own malloc() call.
+			 * See sys/kern/kern_malloc.c for the full comment.
+			 */
+			extern void hibernate_md_kmemzones_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t kz_raw, kz_va, kz_end;
+			size_t kz_len;
+
+			hibernate_md_kmemzones_va(&kz_raw, &kz_len);
+			kz_va = trunc_page(kz_raw);
+			kz_end = round_page(kz_raw + kz_len);
+			for (; kz_va < kz_end && error == 0;
+			    kz_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, kz_va, true,
+				    &selfcopied);
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00 (measurement-method fix round): kmemsize[]
+			 * (sys/kern/kern_malloc.c), the size-to-index table
+			 * malloc() consults before kmemzones[] on every call.
+			 * Same disposition and reasoning as kmemzones[] above.
+			 */
+			extern void hibernate_md_kmemsize_va(
+			    vm_offset_t *va, size_t *len);
+			vm_offset_t ks_raw, ks_va, ks_end;
+			size_t ks_len;
+
+			hibernate_md_kmemsize_va(&ks_raw, &ks_len);
+			ks_va = trunc_page(ks_raw);
+			ks_end = round_page(ks_raw + ks_len);
+			for (; ks_va < ks_end && error == 0;
+			    ks_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha, wvec, p,
+				    kernel_pmap->pm_cr3, ks_va, true,
+				    &selfcopied);
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "

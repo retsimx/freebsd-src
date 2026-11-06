@@ -208,6 +208,48 @@ SYSCTL_PROC(_vm, OID_AUTO, kmem_map_size,
     CTLFLAG_RD | CTLTYPE_ULONG | CTLFLAG_MPSAFE, NULL, 0,
     sysctl_kmem_map_size, "LU", "Current kmem allocation size");
 
+/*
+ * K24-T00 (measurement-method fix round): kmemzones[]/kmemsize[]
+ * (this file), the two tables EVERY malloc(9) call anywhere in the
+ * kernel resolves through on its hot path (malloc(): indx =
+ * kmemsize[size >> KMEM_ZSHIFT]; zone =
+ * kmemzones[indx].kz_zone[mtp_get_subzone(mtp)]) to find its backing
+ * UMA zone -- confirmed by direct source reading, not inferred.
+ * Neither table was ever self-copy protected in this epic. This is
+ * the single root cause this round traced ALL FOUR previously-
+ * separate-looking symptom variants at acpi_pwr_register_consumer()'s
+ * own malloc(sizeof(*pc), M_ACPIPWR, M_NOWAIT) call to
+ * (uma-wrong-zone, "page ... has object", "refcount ... wraparound",
+ * tailq corruption): if the K-10 copy overwrites kmemzones[]/
+ * kmemsize[] with the SAVE kernel's own stale uma_zone_t pointers /
+ * size-class indices, EVERY malloc() of a matching size anywhere in
+ * the resume kernel -- not just this one call site -- resolves to a
+ * foreign zone from a different boot instance, producing whichever
+ * specific UMA/VM consistency check happens to fire first depending
+ * on that foreign zone's own particular stale content. Same bug
+ * class and disposition as every other sibling in this epic
+ * (vm_page_array/vm_dom/vm_phys_free_queues/vm_reserv_array/
+ * vm_phys_segs/bucket_zones, etc.): copy_leaf is true, this boot's
+ * own cold malloc_init()/kmeminit() already built every zone pointer
+ * and size-class index correctly; there is no saved-image content
+ * worth restoring.
+ */
+void	hibernate_md_kmemzones_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_kmemzones_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)kmemzones;
+	*len = sizeof(kmemzones);
+}
+
+void	hibernate_md_kmemsize_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_kmemsize_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)kmemsize;
+	*len = sizeof(kmemsize);
+}
+
 static int sysctl_kmem_map_free(SYSCTL_HANDLER_ARGS);
 SYSCTL_PROC(_vm, OID_AUTO, kmem_map_free,
     CTLFLAG_RD | CTLTYPE_ULONG | CTLFLAG_MPSAFE, NULL, 0,
