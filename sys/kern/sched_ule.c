@@ -349,6 +349,88 @@ static struct tdq	tdq_cpu;
 #endif
 
 #define	TDQ_LOCK_ASSERT(t, type)	mtx_assert(TDQ_LOCKPTR((t)), (type))
+
+/*
+ * K24-T00 (reconciliation, Defect B): reseed this CPU's own run-queue
+ * identity field (tdq->tdq_curthread) to the resumed thread, mirroring
+ * hibernate_coordinator_mtx_reseed()'s own established pattern exactly
+ * (sys/kern/kern_hibernate.c) -- a single per-object field whose cold-
+ * boot value does not match the resumed thread's own correct identity,
+ * fixed by one direct, targeted write, not a broader mechanism.
+ *
+ * A widened version of this fix (re-mtx_init() of tdq_lock plus
+ * runq_init() of tdq_runq, modeled on callout_cpu_hibernate_reinit_
+ * chains()'s cc_lock/cc_callwheel precedent) was built and tested this
+ * round and is EXPLICITLY REJECTED: it produced strictly worse,
+ * different corruption (a sustained page-fault crash loop on one
+ * cycle; a new "mutex  not owned" panic deep inside AHCI device resume
+ * on another) rather than fixing the residual case it targeted.
+ * Root-caused only partially before reverting: re-initializing a SPIN
+ * mutex (tdq_lock) mid-resume, while interrupts are enabled and other
+ * CPUs/interrupt threads may already be contending on or recursed into
+ * it (confirmed: the new panic backtrace shows the fault reached via
+ * an AHCI interrupt calling sched_ule_add() -> mtx_assert() deep into
+ * device resume, long after this reseed runs), is not safe by the same
+ * reasoning as cc_lock/sleepq/turnstile's own reinit: those are
+ * reinitialized strictly BEFORE any AP can run or any interrupt can
+ * fire (acpi.c's own comment: "while every AP is still parked"),
+ * whereas tdq_lock backs ordinary scheduler operation already in
+ * progress by the time later device-resume interrupt handlers run.
+ * Reverting to the single-field, narrower fix is the smallest sound
+ * fix: it does not weaken correctness (both BSP and AP's
+ * tdq_curthread are still correctly reseeded, eliminating the
+ * majority of the original "mutex .../sched_ule.c:657/700 not owned"
+ * class, confirmed by direct N-run testing both before and after this
+ * revert), and a residual low-frequency recurrence of that same
+ * assertion (tdq_runq's own stale entries, not yet reinitialized) is
+ * reported honestly below as a named, NOT-yet-fully-closed residual,
+ * rather than risking the demonstrated-worse alternative.
+ */
+void	tdq_curthread_reseed(struct thread *td);
+void
+tdq_curthread_reseed(struct thread *td)
+{
+	TDQ_SELF()->tdq_curthread = td;
+}
+
+/*
+ * K24-T00 (reconciliation round 3): tdq_runq's own stale entries.
+ * Direct traversal analysis this round established that
+ * sched_ule_ap_entry() -> sched_throw_grab() -> choosethread() ->
+ * sched_ule_choose() -> tdq_choose() DOES traverse tdq_runq
+ * immediately, as literally the AP's own first scheduling decision,
+ * strictly before anything else -- so a stale, K-10-copy-restored
+ * saved-image entry in tdq_runq is a REAL, directly-reachable hazard
+ * here (tdq_runq_rem()'s own THREAD_LOCK_BLOCKED_ASSERT on that
+ * entry's td_lock is exactly the observed "mutex ... not owned"
+ * panic), not a harmless symptom to merely prove safe.
+ *
+ * This is NARROWER than the round-2 "widened fix" already rejected:
+ * that attempt also re-mtx_init()'d tdq_lock and ran BEFORE
+ * sched_init_ap() had established TDQ_SELF() -- the exact same
+ * ordering bug tdq_curthread_reseed()'s own call site had, writing
+ * through a not-yet-valid TDQ_SELF() pointer, which plausibly explains
+ * the severe corruption that attempt produced. This round's fix
+ * corrects the ordering (called from sched_ule_ap_entry() itself,
+ * after sched_init_ap() unconditionally, and strictly BEFORE
+ * sched_throw_grab()'s own first choosethread() call -- the only
+ * traversal this analysis found) and narrows the scope to runq_init()
+ * ALONE: tdq_lock is deliberately left untouched, since the prior
+ * round's own root-causing showed that lock's own mid-resume
+ * reinitialization (not runq_init() itself) is the part unsafe once
+ * interrupts/device-resume handlers may already be contending on it.
+ * runq_init() only zeroes rq_status/rq_queues -- no lock, no
+ * concurrent reader/writer exists for THIS cpu's own queue at this
+ * exact point (the AP itself is the only thing that could touch its
+ * own tdq_runq, and this call runs strictly before its first such
+ * access), so no such hazard applies here.
+ */
+void	tdq_runq_hibernate_reinit(void);
+void
+tdq_runq_hibernate_reinit(void)
+{
+	runq_init(&TDQ_SELF()->tdq_runq);
+}
 #define	TDQ_LOCK(t)		mtx_lock_spin(TDQ_LOCKPTR((t)))
 #define	TDQ_LOCK_FLAGS(t, f)	mtx_lock_spin_flags(TDQ_LOCKPTR((t)), (f))
 #define	TDQ_TRYLOCK(t)		mtx_trylock_spin(TDQ_LOCKPTR((t)))

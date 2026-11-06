@@ -527,6 +527,9 @@ hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb, bool *refuse_la57,
  *
  * Never returns.
  */
+void	tdq_curthread_reseed(struct thread *td);
+void	tdq_runq_hibernate_reinit(void);
+
 void
 hibernate_resume_ap_entry(u_int cpu)
 {
@@ -663,6 +666,49 @@ hibernate_resume_ap_entry(u_int cpu)
 	 * before sched_ap_entry(), reproduces the missing cold-boot step.
 	 */
 	sched_init_ap();
+	/*
+	 * K24-T00 (reconciliation, Defect B -- corrected ordering): the
+	 * BSP-side fix (sys/dev/acpica/acpi.c's EJUSTRETURN branch,
+	 * tdq_curthread_reseed(saved_td) immediately after
+	 * PCPU_SET(curthread, saved_td)) has an exact AP-side twin here:
+	 * tdq->tdq_curthread (sys/kern/sched_ule.c, DPCPU-backed,
+	 * preserved copy_leaf=true per round 41's own disposition) is a
+	 * SEPARATE field from pc_curthread, and every subsequent
+	 * sched_switch()/mi_switch() on THIS cpu asserts
+	 * td == tdq->tdq_curthread before choosing a new thread.
+	 *
+	 * This call was ORIGINALLY placed immediately after
+	 * pc->pc_curthread = pc->pc_idlethread above (several hundred
+	 * lines earlier in this same function) and is MOVED here after
+	 * direct testing found the residual "mutex sleepq chain not
+	 * owned"/"mutex callout not owned" panic (cpuid=1) still
+	 * recurring: TDQ_SELF() (PCPU_GET(sched)) is only guaranteed
+	 * valid AFTER sched_init_ap()'s own PCPU_SET(sched,
+	 * DPCPU_PTR(tdq)) call immediately above -- calling
+	 * tdq_curthread_reseed() any earlier risks reading/deriving
+	 * TDQ_SELF() from a PCPU(sched) value this exact resume cycle has
+	 * not yet established, the identical "must run after, not before,
+	 * sched_init_ap()" ordering constraint sched_ule_ap_entry()'s own
+	 * existing comment ("This should have been setup in
+	 * sched_init_ap()") already documents for td_lock itself.
+	 */
+	tdq_curthread_reseed(pc->pc_idlethread);
+	/*
+	 * K24-T00 (reconciliation round 3): tdq_runq's own stale,
+	 * saved-image entries -- traversal analysis this round proved
+	 * sched_ap_entry() (immediately below) reaches
+	 * sched_throw_grab() -> choosethread() -> tdq_choose(), which
+	 * traverses THIS cpu's own tdq_runq as its very first action,
+	 * strictly before anything else. Called here, after
+	 * sched_init_ap() (so TDQ_SELF() is already valid -- the same
+	 * ordering fix tdq_curthread_reseed()'s own call site needed)
+	 * and strictly before that first traversal. See
+	 * sys/kern/sched_ule.c's own tdq_runq_hibernate_reinit() for
+	 * the full root-cause/scope account (runq_init() only -- NOT
+	 * tdq_lock, which remains the demonstrated-unsafe part from the
+	 * already-rejected wider attempt).
+	 */
+	tdq_runq_hibernate_reinit();
 	sched_ap_entry();
 	panic("hibernate: sched_ap_entry returned to %s", __func__);
 }

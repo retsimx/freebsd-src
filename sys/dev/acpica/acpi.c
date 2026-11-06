@@ -5053,6 +5053,45 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		PCPU_SET(curthread, saved_td);
 		PCPU_SET(curpcb, saved_td->td_pcb);
 		/*
+		 * K24-T00 (reconciliation, Defect B): tdq->tdq_curthread
+		 * (sys/kern/sched_ule.c's own DPCPU-backed run-queue
+		 * identity field) is a SEPARATE field from PCPU(curthread)
+		 * just restored above -- resumectx() writes neither, and
+		 * the round-41 DPCPU copy_leaf=true disposition preserves
+		 * tdq_curthread as this resume kernel's OWN cold-boot
+		 * value, not the resumed thread's. Reseed it to the same
+		 * saved_td right here, before any sched_switch()/
+		 * mi_switch() on this CPU can assert
+		 * td == tdq->tdq_curthread against the stale value. See
+		 * sys/kern/sched_ule.c's own tdq_curthread_reseed() for the
+		 * full root-cause account.
+		 */
+		extern void tdq_curthread_reseed(struct thread *td);
+		tdq_curthread_reseed(saved_td);
+		/*
+		 * K24-T00 (reconciliation round 4): the BSP's own tdq_runq
+		 * ALSO needs reinitializing -- round 3's own analysis
+		 * correctly found the AP's own direct-entry traversal
+		 * (sched_throw_grab() -> choosethread()) but missed that
+		 * sched_ule_clock()'s own periodic statclock callback (an
+		 * ORDINARY TIMER INTERRUPT, not an entry-path call) can
+		 * reach tdq_move()/tdq_idled() -> sched_rem() ->
+		 * sched_ule_rem() on the BSP's own queue once interrupts are
+		 * re-enabled later in this same continuation
+		 * (acpi_s4_resume_interrupts()'s own intr_restore(), the
+		 * last call before DEVICE_RESUME) -- confirmed directly:
+		 * "Assertion td->td_lock == TDQ_LOCKPTR(tdq) failed at
+		 * .../sched_ule.c:3132" inside tdq_move() <-
+		 * sched_ule_clock() <- statclock(), cpuid=0. This call runs
+		 * strictly before intr_restore() (several calls below, this
+		 * same function's own continuation), so no interrupt can
+		 * reach tdq_move() before it completes -- the same safety
+		 * argument already established for the AP's own call site in
+		 * hibernate_machdep.c.
+		 */
+		extern void tdq_runq_hibernate_reinit(void);
+		tdq_runq_hibernate_reinit();
+		/*
 		 * hib_workspace's own six M_TEMP allocations
 		 * (hww_io_buffer/hww_destination_intervals/hww_free_scratch/
 		 * hww_runs/hww_xsave/hww_prefix) are the identical defect
