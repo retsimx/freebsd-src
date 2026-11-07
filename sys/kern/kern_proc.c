@@ -3609,6 +3609,72 @@ allproc_loop:
 	}
 }
 
+/*
+ * K24-T00 (round 24): resume_all_proc()'s own LIST_REMOVE(cp, p_list)
+ * below assumes cp (curproc) is ALREADY a valid member of this kernel's
+ * own allproc list -- true for every ordinary cold-boot process (linked
+ * via fork1()/proc0_init()'s own LIST_INSERT_HEAD(&allproc, ...)), but
+ * NOT true for the one process that continues via the hibernate-resume
+ * continuation itself: resumectx() restores cp's own register/stack
+ * state directly, bypassing fork1()/proc0_init() entirely, so cp's own
+ * p_list field is whatever the SAVE kernel's own allproc membership
+ * snapshot happened to be (its own le_prev naming the SAVE kernel's own
+ * &proc0, a value that is numerically identical to THIS kernel's own
+ * &proc0 since both are the same kernel binary at the same build, but
+ * refers to a different instance's bookkeeping) -- not corruption, and
+ * not a shared registry needing reinitialisation (sleepq_chains[]'s own
+ * disposition), but a single object's own list membership that was
+ * simply never established in this kernel's instance. Direct live
+ * capture (two independent hits, k24-t00-resumectx-fault-diagnosis.md
+ * round 24) confirms this exactly: cp is completely absent from this
+ * resume kernel's own live, internally-consistent allproc chain (every
+ * other node, down to proc0 correctly at the tail, is this boot's own
+ * cold-boot-created process list, confirmed self-consistent); cp's own
+ * stale le_prev names &proc0 but proc0's own live le_next is NULL, not
+ * cp's address, because proc0 was never a predecessor of cp in THIS
+ * kernel's own chain.  The correct disposition is therefore neither
+ * "gate the walk" (cp is a genuine, must-continue process, not a never-
+ * activated one) nor "protect the containing page" (the field was never
+ * correct for this list in the first place, so there is nothing live to
+ * protect) nor "reconcile WITNESS" (no lock is involved) -- it is
+ * "register through the same public interface an ordinary new member
+ * uses".
+ *
+ * CORRECTION (this same round, live-falsified): the first attempt used
+ * LIST_INSERT_HEAD(&allproc, cp, p_list), mirroring fork1()'s own
+ * ordinary-process idiom. Live testing immediately falsified it: on the
+ * very next cycle this call's own QMD_LIST_CHECK_HEAD precondition
+ * panicked ("Bad list head ... first->prev != head") -- a SEPARATE,
+ * previously-unexercised inconsistency in THIS kernel's own current
+ * head element, never checked by any prior code path on this resume
+ * continuation (resume_all_proc()'s own LIST_REMOVE()/LIST_INSERT_
+ * AFTER() never touch the head). Inserting at the head is simply the
+ * wrong position: both live captures (round 24) already show cp's own
+ * stale p_list.le_prev naming &proc0 and proc0's own live p_list.le_next
+ * reading NULL -- i.e. cp belongs immediately AFTER proc0, the tail of
+ * this kernel's own chain, not at the head. LIST_INSERT_AFTER(&proc0,
+ * cp, p_list) inserts at EXACTLY the position both captures already
+ * named, touches only proc0's own already-identified stale field
+ * (confirmed NULL, satisfying QMD_LIST_CHECK_NEXT's own tolerance for a
+ * NULL successor) and never examines the list head at all, avoiding the
+ * unrelated head inconsistency entirely. Scoped narrowly to allproc/
+ * p_list, matching the diagnosed defect; no other process-identity
+ * bookkeeping (pid hash, process group, prison linkage) showed any
+ * corresponding corruption in this round's own two live captures.
+ */
+void	proc_hibernate_insert_curproc(void);
+void
+proc_hibernate_insert_curproc(void)
+{
+	struct proc *cp;
+
+	cp = curproc;
+	sx_xlock(&allproc_lock);
+	LIST_INSERT_AFTER(&proc0, cp, p_list);
+	allproc_gen++;
+	sx_xunlock(&allproc_lock);
+}
+
 void
 resume_all_proc(void)
 {

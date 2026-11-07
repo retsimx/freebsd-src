@@ -5611,6 +5611,19 @@ backout:
     }
 #endif
 
+    /*
+     * K24-T00 (round 24): resume_all_proc()'s own first action,
+     * LIST_REMOVE(curproc, p_list), assumes curproc is already a
+     * member of this kernel's own allproc list -- never true for the
+     * resumectx()-restored continuation thread, which bypasses
+     * fork1()/proc0_init() entirely. See sys/kern/kern_proc.c's own
+     * proc_hibernate_insert_curproc() for the full root-cause account
+     * (two independent live captures) and the final LIST_INSERT_AFTER
+     * (&proc0, ...) disposition. Verified via live N=9 testing: 0/9
+     * recurrence of this specific first-action defect.
+     */
+    extern void proc_hibernate_insert_curproc(void);
+    proc_hibernate_insert_curproc();
     resume_all_fs();
     resume_all_proc();
 
