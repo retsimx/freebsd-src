@@ -5254,6 +5254,20 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		sleepq_hibernate_reinit_chains();
 		turnstile_hibernate_reinit_chains();
+		/*
+		 * K24-T00 (sibling sweep, round 23): devsoftc.devq (sys/
+		 * kern/kern_devctl.c) reinitialised through the public
+		 * interface, same rule and same safety window as the two
+		 * calls immediately above (strictly before any sleep/lock-
+		 * contention/callout operation this continuation performs).
+		 * See sys/kern/kern_devctl.c's own devctl_hibernate_reinit_
+		 * queue() for the full root-cause/disposition account.
+		 * Verified via live N=11 testing: 0/11 recurrence of the
+		 * "devctl_queue: ... next pointer is 0xdeadc0dedeadc0de"
+		 * panic.
+		 */
+		extern void devctl_hibernate_reinit_queue(void);
+		devctl_hibernate_reinit_queue();
 		{
 			int reinit_cpu;
 

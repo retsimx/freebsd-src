@@ -98,6 +98,66 @@ static void devctl_detach_handler(void *arg __unused, device_t dev,
     enum evhdev_detach state);
 static void devctl_nomatch_handler(void *arg __unused, device_t dev);
 
+/*
+ * K24-T00 (sibling sweep, defect 4 of 5 -- devctl_queue corruption,
+ * CORRECTED disposition): the first attempt at this fix self-copy
+ * protected devsoftc's own fields (treating it as "live content this
+ * boot already built correctly") -- live N-run evidence shows this
+ * does NOT close the defect: devsoftc.devq is not necessarily EMPTY
+ * at the point this boot's own hibernate ioctl fires (ordinary boot-
+ * time device-attach events, ACPI power-resource consumer
+ * registration, etc. can legitimately queue a dei node before the
+ * resume cycle ever runs), so devsoftc's own head fields can be
+ * perfectly correct while still pointing at a separately-allocated
+ * "struct dev_event_info" node (uma_zalloc(devsoftc.zone, ...), this
+ * file) whose OWN backing memory is not covered by protecting the
+ * head alone -- the identical lesson this epic already learned for
+ * acpi_powerresources/acpi_powerconsumers (self-copying the static
+ * TAILQ heads was insufficient; the reachable nodes needed their own
+ * disposition). Confirmed by direct live evidence: panic:
+ * kern_devctl.c: devctl_queue: ... next pointer is
+ * 0xdeadc0dedeadc0de, not NULL, STILL recurring identically with the
+ * head self-copy-protected.
+ *
+ * Correct disposition, per this epic's own established idiom for
+ * exactly this shape (sleepq_hibernate_reinit_chains()/
+ * turnstile_hibernate_reinit_chains()/callout_cpu_hibernate_reinit_
+ * chains(), sys/kern/subr_sleepqueue.c et al.): REINITIALISE devq
+ * through the same STAILQ_INIT() devctl_init() itself uses, rather
+ * than protect or walk-and-fix its content. A resume kernel's own set
+ * of pending devctl notifications is necessarily different from the
+ * save kernel's own (ordinary boot-time device-attach/-detach events
+ * are not part of what hibernate resume is meant to replay), so
+ * there is no queued-node content worth preserving across the
+ * resume -- discarding it (not freeing the now-foreign node memory,
+ * the same bounded one-time-leak disposition this epic's own
+ * hib_workspace fix already established) is strictly simpler and
+ * safer than walking devq to free each node through an allocator
+ * whose own zone-identity metadata (devsoftc.zone) is itself exactly
+ * the kind of allocator-consulted pointer this epic's own rule
+ * already treats with suspicion post-K-10-copy.
+ *
+ * devsoftc.mtx/cv/sel are NOT touched here: devctl_queue()/
+ * devctl_notify() acquire devsoftc.mtx via mtx_lock(), the same
+ * ordinary DEF mutex class whose correctness after a resume has
+ * already been established (hibernate_coordinator_mtx's own
+ * reinit precedent, sys/kern/kern_hibernate.c) -- but devsoftc.mtx
+ * is not held across the resume continuation at all (confirmed:
+ * every devctl_queue()/devctl_notify() call is a self-contained
+ * lock/unlock, no nesting across the suspend boundary), so unlike
+ * hibernate_coordinator_mtx it needs no reseed through mtx_destroy()/
+ * mtx_init(): its own cold-boot MTX_SYSINIT value is simply never
+ * disturbed by anything this resume path does before this call runs.
+ */
+void	devctl_hibernate_reinit_queue(void);
+void
+devctl_hibernate_reinit_queue(void)
+{
+
+	STAILQ_INIT(&devsoftc.devq);
+	devsoftc.queued = 0;
+}
+
 static d_open_t		devopen;
 static d_close_t	devclose;
 static d_read_t		devread;
