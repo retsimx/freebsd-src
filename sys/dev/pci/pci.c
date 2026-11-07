@@ -5328,9 +5328,61 @@ pci_resume_child(device_t dev, device_t child)
 	 * Allow interrupts only after fully resuming the driver and hardware.
 	 */
 	if (pci_do_power_suspend) {
-		/* See pci_suspend_child for details. */
+		/*
+		 * K24-T00 (round 21, fix): See pci_suspend_child for
+		 * details on rle. Direct, repeated live measurement
+		 * (N=12, 4/4 ie_lock_gpf hits + 5/5 other-panic hits
+		 * at this same halted instant) proved the specific
+		 * resource_i node nexus_resume_intr() -> rman_get_
+		 * irq_cookie() dereferences here reads r_flags == 0
+		 * (neither RF_ALLOCATED nor RF_ACTIVE) and r_dev/r_rm
+		 * == 0xdeadc0dedeadc0de (the kernel's own UMA free-
+		 * poison pattern), and is absent from the live IRQ
+		 * rman's own rm_list/r_sharehead ("show allrman"),
+		 * confirmed against an independently-activated control
+		 * resource in the SAME capture. r_flags is defined in
+		 * struct resource_i (sys/kern/subr_rman.c) and is set
+		 * to RF_ACTIVE only by rman_activate_resource()
+		 * (sys/kern/subr_rman.c), the same call nexus_setup_
+		 * intr() (sys/x86/x86/nexus.c) makes before it ever
+		 * calls rman_set_irq_cookie() -- the only writer of
+		 * r_irq_cookie. This resource was therefore never
+		 * activated through this kernel's own bus_setup_intr()
+		 * path; its r_irq_cookie does not name an intr_handler
+		 * at all, it is uninitialized/freed memory this resume
+		 * walk should never have dereferenced. Fix: resume only
+		 * what this kernel actually activated.
+		 */
 		rle = resource_list_find(&dinfo->resources, SYS_RES_IRQ, 0);
-		if (rle != NULL && rle->res != NULL)
+		/*
+		 * K24-T00 (sibling sweep, round 23): direct live evidence
+		 * (N=14 batch, runs r22_02/r22_05/r22_06/r22_09, identical
+		 * GPF every time) shows this round-21 fix's own
+		 * rman_get_flags(rle->res) call can itself fault: rax
+		 * reads 0xdeadc0dedeadc0de -- this epic's own established
+		 * UMA free-poison signature -- meaning rle->res->__r_i
+		 * (struct resource's sole field, sys/sys/rman.h) is itself
+		 * uninitialized/freed memory, one call-frame earlier than
+		 * the already-fixed r_irq_cookie defect this same function
+		 * closed in round 21. Same root cause, same rule, applied
+		 * one level higher: rle->res is non-NULL (a live devinfo-
+		 * owned resource_list_entry this boot's own PCI probe
+		 * built), but the resource_i it references was never
+		 * actually populated by this kernel's own rman path, so
+		 * rman_get_flags() cannot be called on it at all --
+		 * checking RF_ACTIVE AFTER the crash point is too late; the
+		 * validity test must happen BEFORE the first dereference.
+		 * Per the same rule round 21 established ("the
+		 * 0xdeadc0dedeadc0de signature is now a reliable tell"),
+		 * gate on the resource wrapper's own __r_i pointer not
+		 * being this exact poison value, rather than reconciling or
+		 * protecting it: this is a never-activated/never-reached
+		 * resource by the identical reasoning already proven for
+		 * r_irq_cookie, just observed one field earlier.
+		 */
+		if (rle != NULL && rle->res != NULL &&
+		    rle->res->__r_i != (struct resource_i *)0xdeadc0dedeadc0deUL &&
+		    (rman_get_flags(rle->res) & RF_ACTIVE) != 0)
 			(void)bus_resume_intr(child, rle->res);
 	}
 
