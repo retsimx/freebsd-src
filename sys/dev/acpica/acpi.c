@@ -5612,15 +5612,35 @@ backout:
 #endif
 
     /*
-     * K24-T00 (round 24): resume_all_proc()'s own first action,
-     * LIST_REMOVE(curproc, p_list), assumes curproc is already a
-     * member of this kernel's own allproc list -- never true for the
-     * resumectx()-restored continuation thread, which bypasses
-     * fork1()/proc0_init() entirely. See sys/kern/kern_proc.c's own
-     * proc_hibernate_insert_curproc() for the full root-cause account
-     * (two independent live captures) and the final LIST_INSERT_AFTER
-     * (&proc0, ...) disposition. Verified via live N=9 testing: 0/9
-     * recurrence of this specific first-action defect.
+     * K24-T00 (round 24, corrected placement): resume_all_proc()'s own
+     * first action, LIST_REMOVE(curproc, p_list), assumes curproc is
+     * ALREADY a member of THIS kernel's own allproc list -- never true
+     * for the resumectx()-restored continuation thread, which bypasses
+     * fork1()/proc0_init() entirely (see sys/kern/kern_proc.c's own
+     * comment on proc_hibernate_insert_curproc() for the full root-
+     * cause/disposition account and the two independent live captures
+     * that confirmed it). Placed HERE, immediately before the call it
+     * exists to make safe, rather than up in the EJUSTRETURN branch
+     * alongside the sleepq/turnstile/devctl reinit calls: those three
+     * run strictly inside the hibernate_coordinator_mtx critical
+     * section (hibernate_coordinator_mtx_reseed()/..._release(), above)
+     * and never take allproc_lock; placing THIS call there instead
+     * made allproc_lock the FIRST lock ever acquired while
+     * hibernate_coordinator_mtx is held, a brand-new WITNESS lock-order
+     * pair whose order-recording path called into the kernel linker's
+     * own symbol lookup and paniced ("kernel linker not locked",
+     * confirmed live, two independent hits, this round) -- a self-
+     * inflicted regression, not a property of the fix itself. By this
+     * point hibernate_coordinator_mtx was already released several
+     * lines above (backout:'s own hibernate_coordinator_release(),
+     * reached via goto backout long before this code runs), so no such
+     * lock-order pair is created here.
+     */
+    /*
+     * K24-T00: proc_hibernate_insert_curproc() is conditional (only
+     * inserts if cp is not already correctly linked) -- safe to call
+     * unconditionally here regardless of whether cp is image content
+     * (the proven common case) or genuinely absent.
      */
     extern void proc_hibernate_insert_curproc(void);
     proc_hibernate_insert_curproc();

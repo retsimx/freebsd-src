@@ -3670,7 +3670,25 @@ proc_hibernate_insert_curproc(void)
 
 	cp = curproc;
 	sx_xlock(&allproc_lock);
-	LIST_INSERT_AFTER(&proc0, cp, p_list);
+	/*
+	 * K24-T00 (round 33): guard against double-insertion. Round 31's
+	 * own live capture proved cp is already image content, genuinely
+	 * linked into the restored allproc chain (immediately after proc0)
+	 * by the K-10 copy itself -- this function's own original,
+	 * unconditional LIST_INSERT_AFTER(&proc0, cp, p_list) does not
+	 * check for that case, and re-linking an ALREADY-linked node this
+	 * way makes cp->p_list.le_next point at cp itself (confirmed live,
+	 * round 32's own b_12 capture: the walk from allproc.lh_first
+	 * terminates immediately after proc0, discarding every process
+	 * that followed cp in the original chain). The correct, minimal
+	 * disposition is therefore conditional: only insert cp if it is
+	 * NOT already correctly linked (its own p_list.le_prev does not
+	 * yet point back at it -- the same invariant QMD_LIST_CHECK_PREV
+	 * tests). If already linked, this is a silent no-op; the image's
+	 * own chain is left exactly as restored.
+	 */
+	if (cp->p_list.le_prev == NULL || *cp->p_list.le_prev != cp)
+		LIST_INSERT_AFTER(&proc0, cp, p_list);
 	allproc_gen++;
 	sx_xunlock(&allproc_lock);
 }
