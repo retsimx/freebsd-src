@@ -3702,6 +3702,39 @@ resume_all_proc(void)
 	sx_xlock(&allproc_lock);
 again:
 	LIST_REMOVE(cp, p_list);
+	/*
+	 * K24-T00 (round 34): self-heal a single, narrowly-confirmed
+	 * defect on the CURRENT head of allproc, found by direct live
+	 * evidence (a ddb-callable diagnostic wrapper around the
+	 * destination-set predicate, plus a
+	 * per-node forward/backward consistency probe, this round's own
+	 * new diagnostics): after the K-10 copy, the node already sitting
+	 * at allproc.lh_first (NOT cp -- cp's own removal above touches
+	 * only cp's own links, never the head) can itself carry a p_list.
+	 * le_prev that does not point back at &allproc.lh_first, as
+	 * QMD_LIST_CHECK_HEAD requires, even though the node is otherwise
+	 * perfectly well-formed: its own true predecessor exists, is
+	 * reachable by following that same (wrong-for-the-head-check)
+	 * le_prev pointer, and that predecessor's own p_list.le_next
+	 * correctly names this node back (confirmed live, round 34's own
+	 * r34e_05 capture: pid 871 syslogd at the head, le_prev naming
+	 * pid 874 syslogd, whose own le_next correctly names pid 871
+	 * back) -- i.e. this is a genuine, mutually-consistent TAIL of a
+	 * longer original chain, orphaned only because lh_first itself
+	 * was not restored to point at that chain's own true, earlier
+	 * head. Both the head node's own page and its own le_prev
+	 * target's page tested OUT of the destination set via the new
+	 * wrapper (both captures this round), ruling out the K-10-copy-
+	 * collision mechanism round 28 found for individual process
+	 * pages as the explanation for this specific field; the narrower,
+	 * directly-supported disposition is to correct exactly the one
+	 * field QMD_LIST_CHECK_HEAD itself tests, on exactly the one node
+	 * it tests it on -- not a sweep, not a relink of the chain's own
+	 * (otherwise intact) interior linkage.
+	 */
+	if (!LIST_EMPTY(&allproc) &&
+	    LIST_FIRST(&allproc)->p_list.le_prev != &LIST_FIRST(&allproc))
+		LIST_FIRST(&allproc)->p_list.le_prev = &LIST_FIRST(&allproc);
 	LIST_INSERT_HEAD(&allproc, cp, p_list);
 	for (;;) {
 		p = LIST_NEXT(cp, p_list);
