@@ -5194,6 +5194,77 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			 * "not yet mapped" skip.
 			 */
 			pg_m = PHYS_TO_VM_PAGE(pg_pa);
+			/*
+			 * K24-T00 (T01 round): plinks is a UNION
+			 * (sys/vm/vm_page.h) -- plinks.uma.{slab,zone} (just
+			 * below) and plinks.q (the free-list/page-queue
+			 * TAILQ_ENTRY vm_freelist_add()/vm_freelist_rem()
+			 * use, sys/vm/vm_phys.c) occupy the IDENTICAL bytes
+			 * of this same struct vm_page. This keg walk proves
+			 * pg_m is genuinely keg-owned (reached from a
+			 * present, saved-image-correct LIST_FIRST() through
+			 * present le_next fields, the same proof this
+			 * function's own header comment already establishes
+			 * for slab/list-node traversal) -- but the resume
+			 * kernel's own COLD BOOT separately, independently
+			 * populated this exact page's own free-list
+			 * membership (round 59's own vm_page_array
+			 * self-copy preserves THIS boot's cold-start
+			 * m->order/m->pool/plinks.q content, not the saved
+			 * image's) whenever this physical page happened to
+			 * be free at THIS boot's own vm_page_startup() time.
+			 * A page cannot legitimately be both at once: writing
+			 * plinks.uma here, UNCONDITIONALLY, silently
+			 * overwrites this boot's own live plinks.q
+			 * TAILQ_ENTRY (next/prev pointers into
+			 * vm_phys_free_queues[domain][flind][pool][order].pl)
+			 * with keg-identity bytes that are not a valid
+			 * TAILQ_ENTRY at all -- the exact, already-reproduced
+			 * "vm_freelist_rem: Bad link elm ... next->prev !=
+			 * elm" panic (fpc_6/r36t_12, this epic's own prior
+			 * round), reached the next time ANY allocation walks
+			 * that same free list and dereferences the now-
+			 * corrupted plinks.q of this page or either of its
+			 * TAILQ neighbors.
+			 *
+			 * Disposition: if pg_m is CURRENTLY free per this
+			 * boot's own cold-start free-list state
+			 * (m->order != VM_NFREEORDER, the same test
+			 * vm_phys_unfree_page() itself already uses),
+			 * unlink it from that free list FIRST, via
+			 * vm_phys_unfree_page() -- the existing, already-
+			 * locked-and-correct single-page removal primitive
+			 * (sys/vm/vm_phys.c), under the owning domain's own
+			 * vm_domain_free_lock() (safe to acquire as a real
+			 * mutex here: acpi_s4_resume_discard_snapshot(),
+			 * acpi.c's own EJUSTRETURN branch, already zeroed
+			 * td_critnest/td_md.md_spinlock_count before this
+			 * function's own call site, the same precondition
+			 * hibernate_coordinator_mtx_reseed()'s own real
+			 * mtx_lock() already relies on) -- BEFORE writing
+			 * plinks.uma, so the union's own content is
+			 * overwritten only after its PRIOR, live meaning
+			 * (free-list membership) has been correctly retired,
+			 * never while still live. This is the saved image's
+			 * own keg ownership claim overriding this boot's own
+			 * stale free-list membership for this one specific
+			 * page -- the identical "adopt the saved image's own
+			 * claim over this boot's cold-start default" rule
+			 * already governing plinks.uma itself; it is not a
+			 * new policy, only extended to the union's other
+			 * arm. A page NOT currently free
+			 * (m->order == VM_NFREEORDER already) has no live
+			 * plinks.q content to disturb; writing plinks.uma
+			 * for it is exactly today's existing, already-correct
+			 * behaviour, unchanged.
+			 */
+			if (pg_m->order != VM_NFREEORDER) {
+				int pg_domain = vm_phys_domain(pg_pa);
+
+				vm_domain_free_lock(VM_DOMAIN(pg_domain));
+				(void)vm_phys_unfree_page(pg_pa);
+				vm_domain_free_unlock(VM_DOMAIN(pg_domain));
+			}
 			pg_m->plinks.uma.slab = slab;
 			pg_m->plinks.uma.zone = zone;
 		}
