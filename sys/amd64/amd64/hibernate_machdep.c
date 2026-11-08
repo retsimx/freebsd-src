@@ -1716,6 +1716,218 @@ hibernate_md_selfcopy_page(const struct hibernate_attempt *ha,
 }
 
 /*
+ * K24-T00 (reconciliation): round 63 and round 64 both measured the LIVE
+ * kernel_pmap at hibernate_machdep_prepare() time and both found the walk
+ * (hibernate_md_tree_walk()/hib_md_safe_resolve()) returns false for
+ * kstack_va -- reported loosely as "no page-table entry at all". A precise,
+ * per-level capture (k24-t00-resumectx-fault-diagnosis.md, reconciliation
+ * round) proves this is imprecise: the live tree's PML4, PDPT, and PD
+ * entries for kstack_va's slot are ALL present and valid, and the PD
+ * entry's frame (the PT page itself) is a genuine member of this image's
+ * destination set. Only the single terminal PTE slot inside that PT page
+ * is absent (raw value 0x0) -- exactly what hibernate_md_tree_walk()
+ * reports back as an overall "not present" result, since it does not
+ * distinguish "no entry at any level" from "every level down to PD
+ * present, only the terminal leaf missing". Round 64's own separate
+ * finding -- that the STAGED image's PT-page slot (the same PT page,
+ * addressed via its destination-set index) holds a valid, present,
+ * writable leaf PTE -- is the fix pointer: the needed leaf value already
+ * exists in the staged image, reachable by walking the LIVE tree down to
+ * the PT-page level (which works, unlike walking the SAVED tree from its
+ * own PML4 root via hibernate_md_staged_tree_walk() above, whose entry
+ * for this VA does not correspond to a real destination-set frame on any
+ * captured cycle) and reading the STAGED content for that exact PT page's
+ * slot.
+ *
+ * Returns false, failing closed, if any live level above the terminal PTE
+ * is not present/valid, if that level is a superpage (never true for a
+ * kstack VA in current builds, but refused rather than assumed), or if
+ * the live PT page is not itself a member of the destination set (either
+ * would mean this reconciliation's own precondition -- intermediate
+ * levels present -- does not hold this cycle, and no assumption is made
+ * about a different failure shape instead).
+ */
+static bool
+hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
+    const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
+    struct hibernate_md_walk *walk)
+{
+	pml4_entry_t *pml4;
+	pdp_entry_t *pdp;
+	pd_entry_t *pd;
+	const uint64_t *staged_pt;
+	vm_paddr_t pt_page_pa;
+	uint64_t entry, sidx, staged_pte;
+	u_int index;
+
+	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(kernel_pmap->pm_cr3 & PG_FRAME);
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = pml4[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	pdp = (pdp_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdp[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	pd = (pd_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pd[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	pt_page_pa = entry & PG_FRAME;
+	if (hibernate_md_dst_page_index(ha, pt_page_pa, &sidx) != 0 ||
+	    sidx >= vector_count)
+		return (false);
+
+	staged_pt = (const uint64_t *)PHYS_TO_DMAP(vector[sidx]);
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	staged_pte = staged_pt[index];
+	if ((staged_pte & X86_PG_V) == 0)
+		return (false);
+
+	walk->hmw_pa = staged_pte & PG_FRAME;
+	walk->hmw_flags = staged_pte & (X86_PG_V | X86_PG_RW | X86_PG_U |
+	    X86_PG_NX);
+	return (true);
+}
+
+/*
+ * K24-T00 (round 64): install one exact 4 KiB mapping, VA va -> leaf_pa,
+ * into the LIVE kernel_pmap -- Design 041's option 1, "installed in the
+ * live kernel_pmap ... before resumectx() runs". Missing intermediate
+ * tables are allocated via pmap_page_alloc_below_4g(), the identical
+ * machinery hibernate_md_identity_ensure() already uses; no parallel
+ * mapping scheme is invented. Each freshly allocated table page is
+ * checked disjoint from the image's own destination set (a genuinely
+ * free page was never claimed by any in-use kernel structure, so it
+ * cannot legitimately appear there; this makes that assumption an
+ * explicit, fail-closed check rather than an implicit one). A
+ * pre-existing leaf entry is refused rather than overwritten -- Step 1's
+ * capture already proved none should exist for this class of VA. After
+ * writing the leaf, the full PTE chain is read back via
+ * hibernate_md_walk_matches() and the insertion is undone (EINVAL
+ * returned) if it does not resolve to exactly the intended frame and
+ * permissions: "proven present with the required permissions", not
+ * assumed.
+ */
+static int
+hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
+    vm_paddr_t leaf_pa, uint64_t saved_flags)
+{
+	pml4_entry_t *pml4e;
+	pdp_entry_t *pdpe;
+	pd_entry_t *pde;
+	pt_entry_t *pte;
+	vm_page_t m_pdp, m_pd, m_pt;
+	vm_paddr_t table_pa;
+	uint64_t entry, leaf_flags;
+	u_int pml4_idx, pdpt_idx, pd_idx, pt_idx;
+
+	if ((va & PAGE_MASK) != 0 || (leaf_pa & PAGE_MASK) != 0)
+		return (EINVAL);
+
+	pml4_idx = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	pml4e = kernel_pmap->pm_pmltop;
+	entry = pml4e[pml4_idx];
+	if ((entry & X86_PG_V) == 0) {
+		m_pdp = pmap_page_alloc_below_4g(true);
+		if (m_pdp == NULL)
+			return (ENOMEM);
+		table_pa = VM_PAGE_TO_PHYS(m_pdp);
+		if (hib_pa_in_dst_md(ha, table_pa))
+			return (EINVAL);
+		pml4e[pml4_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
+		    X86_PG_M;
+		entry = pml4e[pml4_idx];
+	}
+	if ((entry & PG_PS) != 0)
+		return (EINVAL);
+	pdpe = (pdp_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
+
+	pdpt_idx = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdpe[pdpt_idx];
+	if ((entry & X86_PG_V) == 0) {
+		m_pd = pmap_page_alloc_below_4g(true);
+		if (m_pd == NULL)
+			return (ENOMEM);
+		table_pa = VM_PAGE_TO_PHYS(m_pd);
+		if (hib_pa_in_dst_md(ha, table_pa))
+			return (EINVAL);
+		pdpe[pdpt_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
+		    X86_PG_M;
+		entry = pdpe[pdpt_idx];
+	}
+	if ((entry & PG_PS) != 0)
+		return (EINVAL);
+	pde = (pd_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
+
+	pd_idx = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pde[pd_idx];
+	if ((entry & X86_PG_V) == 0) {
+		m_pt = pmap_page_alloc_below_4g(true);
+		if (m_pt == NULL)
+			return (ENOMEM);
+		table_pa = VM_PAGE_TO_PHYS(m_pt);
+		if (hib_pa_in_dst_md(ha, table_pa))
+			return (EINVAL);
+		pde[pd_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
+		    X86_PG_M;
+		entry = pde[pd_idx];
+	}
+	if ((entry & PG_PS) != 0)
+		return (EINVAL);
+	pte = (pt_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
+
+	pt_idx = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = pte[pt_idx];
+	leaf_flags = X86_PG_V | X86_PG_A | X86_PG_M |
+	    (saved_flags & (X86_PG_RW | X86_PG_U | X86_PG_NX));
+	if ((entry & X86_PG_V) != 0) {
+		/*
+		 * K24-T00 (reconciliation): a pre-existing leaf here is not
+		 * automatically a conflict. The live PT page can already,
+		 * via ordinary deterministic early-boot allocation order,
+		 * hold exactly the frame+permissions the image needs at this
+		 * slot (observed directly: diag_install_err=EINVAL alongside
+		 * a live terminal PTE already bit-identical to the staged
+		 * value, k24-t00-resumectx-fault-diagnosis.md reconciliation
+		 * round) -- refusing unconditionally here is refusing a
+		 * no-op. Accept only an EXACT match (same frame, same
+		 * V|RW|U bits) as success with no write; any other
+		 * pre-existing leaf is still refused, unchanged from before.
+		 */
+		if ((entry & PG_FRAME) == leaf_pa &&
+		    (entry & (X86_PG_V | X86_PG_RW | X86_PG_U)) ==
+		    (leaf_flags & (X86_PG_V | X86_PG_RW | X86_PG_U)))
+			return (0);
+		return (EINVAL);
+	}
+
+	pte[pt_idx] = leaf_pa | leaf_flags;
+
+	if ((read_rflags() & PSL_I) != 0)
+		pmap_invalidate_all(kernel_pmap);
+	else
+		invltlb_glob();
+
+	if (!hibernate_md_walk_matches(kernel_pmap->pm_cr3, va, leaf_pa,
+	    leaf_flags & (X86_PG_V | X86_PG_RW | X86_PG_U))) {
+		pte[pt_idx] = entry;
+		if ((read_rflags() & PSL_I) != 0)
+			pmap_invalidate_all(kernel_pmap);
+		else
+			invltlb_glob();
+		return (EINVAL);
+	}
+
+	return (0);
+}
+
+/*
  * K23-T13: walk va under root_pa and self-copy every page-table page
  * traversed.  Returns the number of pages made self-referential in *countp.
  *
@@ -2271,6 +2483,23 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	bool refuse_la57, refuse_mtrr;
 	uint8_t *header_buf, *handoff_buf, *trampoline_buf;
 	int error;
+	/*
+	 * kstack_va, computed inside the resumectx-stack install block
+	 * below, is needed again later in this same function (the FPU
+	 * save-area install) but that block's own "register_t
+	 * kstack_va;" is scoped to its own braces. Mirrored here at
+	 * function scope, assigned inside that block, read at the later
+	 * site.
+	 */
+	register_t k24t00_kstack_va = 0;
+	/*
+	 * staged_pcb->pcb_save is read inside the kstack_va block below,
+	 * whose own braces close before this value is needed again (the
+	 * FPU save-area page-table-path protection, below) -- mirrored
+	 * at function scope exactly like k24t00_kstack_va immediately
+	 * above, for the identical reason.
+	 */
+	struct savefpu *k24t00_staged_fpu_save = NULL;
 
 	/* 1. Preconditions. */
 	if (ha == NULL)
@@ -2695,32 +2924,261 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * onto the SUSPENDED thread's own saved kernel stack
 			 * (pcb_rsp) and writes the saved return address onto
 			 * it, immediately before the final jmp/ret back into
-			 * .Lhibernate_resumed.  That stack is a page this file
-			 * never adds to the protected VA set: like saved_pcb_va
-			 * and pc_gdt, its own page-table path can fall inside
-			 * the K-10 destination set and collapse.  Captured and
-			 * confirmed this session: a double fault with
-			 * rip inside resumectx() at exactly this
-			 * "movq %rax,(%rsp)" instruction, gsbase pointing at
-			 * the (already-fixed) GDT KVA rather than this CPU's
-			 * own pcpu, and a separate run's WITNESS panic
-			 * (td_critnest nonzero at the real, live curthread,
-			 * confirmed non-zero only AFTER my own diagnostic read
-			 * it as zero moments earlier) both trace back to the
-			 * same root cause: the suspended thread's own stack
-			 * page's page-table path was never proven disjoint.
-			 * Its *content* must come from the saved image (it
-			 * holds the actual suspended register/stack-frame
-			 * state resumectx() restores), so copy_leaf is false
-			 * here, exactly like saved_pcb_va/pc_gdt above.
+			 * .Lhibernate_resumed.  Its content must come from the
+			 * saved image, so copy_leaf is false here, exactly like
+			 * saved_pcb_va/pc_gdt above.
+			 *
+			 * K24-T00: reading susppcbs[0]->sp_pcb.pcb_rsp directly
+			 * on THIS (resume) boot reads this boot's own
+			 * never-written PCB allocation (acpi_wakeup.c's
+			 * acpi_install_wakeup_handler(), M_WAITOK, not M_ZERO):
+			 * savectx() only ever runs on the SAVE boot
+			 * (dumpsys_hibernate_savectx()) or an ordinary ACPI S3
+			 * suspend, never here. Live capture confirmed this read
+			 * is boot-dependent garbage (a non-canonical address)
+			 * the self-copy walk silently no-ops on, protecting
+			 * nothing, while the real suspended stack's own
+			 * page-table path is left unprotected and can collide
+			 * with the K-10 destination set on a boot-dependent
+			 * basis -- the double fault this fix chases.
+			 *
+			 * The real value must come from the SAVED image.
+			 * susppcbs[0]->sp_pcb's own physical page is itself one
+			 * of the image's PT_LOAD destination pages (the same
+			 * page saved_pcb_va's copy_leaf=false walk above already
+			 * relies on being restored from the image), so its
+			 * SAVED content is already staged in the K-9 source
+			 * vector (wvec[]), addressable via
+			 * hibernate_md_dst_page_index() + PHYS_TO_DMAP() before
+			 * the K-10 destructive copy ever runs.  Read pcb_rsp from
+			 * there instead.
+			 *
+			 * Further, round 63/64's own direct per-level capture
+			 * proved the live kernel_pmap genuinely has no
+			 * page-table entry at all for this class of VA at this
+			 * point: there is nothing for an ordinary self-copy
+			 * walk to protect. The mapping is instead derived from
+			 * the SAVED kernel's own page tables (via
+			 * hibernate_md_staged_leaf_for_live_slot(), which walks
+			 * the LIVE tree down to the PT-page level -- proven
+			 * present -- and reads the STAGED content for that
+			 * page's own terminal slot) and installed into the live
+			 * tree before resumectx() runs (via
+			 * hibernate_md_kva_install()), not a self-copy walk and
+			 * not vtoslab().
+			 *
+			 * Installing only the single page containing pcb_rsp is
+			 * insufficient: a correlated capture proved the double
+			 * fault's own faulting rsp is bit-identical to this
+			 * cycle's own kstack_va -- a page-aligned boundary --
+			 * meaning execution pushes the stack pointer down, past
+			 * the first page, into the immediately lower,
+			 * never-installed page of the same KSTACK_PAGES-page
+			 * kernel stack, the instant any callee inside
+			 * resumectx()'s return path needs more than one page of
+			 * stack. Install every remaining lower page of the
+			 * stack's KSTACK_PAGES range (kernel stacks grow down;
+			 * KSTACK_GUARD_PAGES below kstack_va is deliberately
+			 * left unmapped, matching the saved kernel's own
+			 * intent), best-effort: reaching a VA the live
+			 * tree/staged image cannot resolve is the expected,
+			 * benign end of the stack's mapped range and stops the
+			 * extension quietly, without invalidating the base
+			 * page's already-proven-good install. Only a genuine
+			 * install error on a page that DID resolve is treated
+			 * as fatal.
 			 */
 			register_t kstack_va;
+			vm_paddr_t pcb_pa, pcb_dst_page;
+			vm_offset_t pcb_page_off;
+			uint64_t pcb_idx;
+			const struct pcb *staged_pcb;
 
-			kstack_va = susppcbs[0]->sp_pcb.pcb_rsp;
+			if (susppcbs == NULL || susppcbs[0] == NULL)
+				return (EINVAL);
+			pcb_pa = vtophys(&susppcbs[0]->sp_pcb);
+			pcb_dst_page = trunc_page(pcb_pa);
+			pcb_page_off = (vm_offset_t)(pcb_pa & PAGE_MASK);
+
+			/*
+			 * Fail closed, not silently: ENOENT here means the
+			 * saved PCB's own physical page was not part of the
+			 * image at all, which should never happen given
+			 * saved_pcb_va's own existing reliance on this same PA
+			 * (see hibernate_md_patch_saved_domain() above) -- refuse
+			 * rather than trust an unindexed read.
+			 */
+			error = hibernate_md_dst_page_index(ha, pcb_dst_page,
+			    &pcb_idx);
+			if (error != 0)
+				return (error);
+			if (pcb_idx >= p)
+				return (EINVAL);
+			/*
+			 * struct pcb must not straddle its containing page: the
+			 * staged read below only maps one page via
+			 * PHYS_TO_DMAP(wvec[pcb_idx]).
+			 */
+			if (pcb_page_off + sizeof(*staged_pcb) > PAGE_SIZE)
+				return (EINVAL);
+			staged_pcb = (const struct pcb *)((const uint8_t *)
+			    PHYS_TO_DMAP(wvec[pcb_idx]) + pcb_page_off);
+			kstack_va = staged_pcb->pcb_rsp;
 			kstack_va &= ~(register_t)PAGE_MASK;
-			error = hibernate_md_selfcopy_walk(ha, wvec, p,
-			    kernel_pmap->pm_cr3, (vm_offset_t)kstack_va, false,
-			    &selfcopied);
+
+			/*
+			 * A kstack VA must lie in the kernel half of the
+			 * address space; fail closed (EINVAL; a pre-RESTORE
+			 * refusal, so the stage machine cold-boots) rather
+			 * than guess.
+			 */
+			if ((vm_offset_t)kstack_va < VM_MIN_KERNEL_ADDRESS ||
+			    (vm_offset_t)kstack_va >= VM_MAX_KERNEL_ADDRESS)
+				return (EINVAL);
+
+			k24t00_kstack_va = kstack_va;
+			k24t00_staged_fpu_save = staged_pcb->pcb_save;
+
+			{
+				struct hibernate_md_walk saved_walk;
+				bool walk_ok;
+				int install_err;
+				vm_offset_t kstack_page_va;
+				u_int kstack_npages;
+
+				walk_ok = hibernate_md_staged_leaf_for_live_slot(ha,
+				    wvec, p, (vm_offset_t)kstack_va, &saved_walk);
+				install_err = 0;
+				if (walk_ok &&
+				    (saved_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) ==
+				    (X86_PG_V | X86_PG_RW))
+					install_err = hibernate_md_kva_install(ha,
+					    (vm_offset_t)kstack_va, saved_walk.hmw_pa,
+					    saved_walk.hmw_flags);
+
+				if (walk_ok && install_err == 0) {
+					for (kstack_npages = 1;
+					    kstack_npages < KSTACK_PAGES;
+					    kstack_npages++) {
+						struct hibernate_md_walk
+						    extra_walk;
+						bool extra_ok;
+
+						kstack_page_va =
+						    (vm_offset_t)kstack_va -
+						    (vm_offset_t)kstack_npages *
+						    PAGE_SIZE;
+						extra_ok =
+						    hibernate_md_staged_leaf_for_live_slot(
+						    ha, wvec, p,
+						    kstack_page_va,
+						    &extra_walk);
+						if (!extra_ok ||
+						    (extra_walk.hmw_flags &
+						    (X86_PG_V | X86_PG_RW)) !=
+						    (X86_PG_V | X86_PG_RW))
+							break;
+						install_err =
+						    hibernate_md_kva_install(
+						    ha, kstack_page_va,
+						    extra_walk.hmw_pa,
+						    extra_walk.hmw_flags);
+						if (install_err != 0)
+							break;
+					}
+				}
+
+				if (!walk_ok)
+					return (EINVAL);
+				if ((saved_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) !=
+				    (X86_PG_V | X86_PG_RW))
+					return (EINVAL);
+				error = install_err;
+			}
+		}
+		if (error == 0) {
+			/*
+			 * K24-T00: the SAME defect class and SAME page-table-
+			 * path mechanism just applied to kstack_va above -- not
+			 * a content/self-copy question, a page-table-path
+			 * question. k24t00_staged_fpu_save (captured above,
+			 * from staged_pcb->pcb_save, the SAME staged-PCB page
+			 * already mapped for kstack_va) names
+			 * td_md.md_usr_fpu_save, a SEPARATE UMA allocation
+			 * (sys/amd64/amd64/fpu.c's own fpu_save_area_alloc(),
+			 * fpu_save_area_zone) that can have NO page-table entry
+			 * at all in the resume kernel's own kernel_pmap at this
+			 * point -- there would be nothing for an ordinary
+			 * self-copy walk to protect, exactly as kstack_va's own
+			 * case already established. This is the correctly-
+			 * identified mechanism for a GPF/page-fault class a
+			 * prior, falsified fpcurthread-reseed hypothesis did
+			 * not close: fpu_activate_sw() ->
+			 * restore_fpu_curthread() -> fpurestore(pcb->pcb_save)
+			 * dereferences exactly this VA for whichever thread the
+			 * resume continuation later switches into, and a
+			 * missing live mapping there produces the identical
+			 * #GP/#PF signature already captured. Resolve and
+			 * install this one page using the identical, already-
+			 * proven mechanism, not a self-copy walk and not
+			 * vtoslab() (already falsified on this exact resume-
+			 * continuation path for an unrelated but structurally
+			 * identical reason: it depends on allocator-internal
+			 * state not yet reconciled at this point). The buffer
+			 * is a single page: cpu_max_ext_state_size (sys/x86/
+			 * x86/identcpu.c) is, on every x86_64 XSAVE-capable CPU
+			 * up to and including AVX-512, bounded well under
+			 * PAGE_SIZE; one install call per thread's own buffer
+			 * therefore suffices.
+			 *
+			 * This protects exactly ONE page, belonging to the ONE
+			 * thread (saved_td) whose own continuation this exact
+			 * resume cycle actually resumes and switches back into
+			 * -- not every thread in the system, which an earlier,
+			 * reverted blanket sweep already proved tears the copy.
+			 */
+			if (k24t00_staged_fpu_save != NULL) {
+				struct hibernate_md_walk fpu_walk;
+				bool fpu_walk_ok;
+				vm_offset_t fpu_va;
+
+				fpu_va = trunc_page(
+				    (vm_offset_t)k24t00_staged_fpu_save);
+				/*
+				 * Reject a non-canonical/out-of-kernel-range
+				 * VA closed-form, matching kstack_va's own
+				 * precedent exactly -- fail closed (EINVAL;
+				 * pre-RESTORE refusal) rather than let a
+				 * garbage pointer reach
+				 * hibernate_md_kva_install() at all.
+				 */
+				if (fpu_va < VM_MIN_KERNEL_ADDRESS ||
+				    fpu_va >= VM_MAX_KERNEL_ADDRESS)
+					return (EINVAL);
+				/*
+				 * cpu_max_ext_state_size must not straddle a
+				 * page boundary from this base VA, matching
+				 * the single-install-call disposition
+				 * justified above; if it ever did (a future
+				 * CPU generation with a larger XSAVE area than
+				 * this check anticipates), fail closed rather
+				 * than silently install only a partial
+				 * mapping.
+				 */
+				if (((vm_offset_t)k24t00_staged_fpu_save &
+				    PAGE_MASK) + cpu_max_ext_state_size >
+				    PAGE_SIZE)
+					return (EINVAL);
+				fpu_walk_ok = hibernate_md_staged_leaf_for_live_slot(
+				    ha, wvec, p, fpu_va, &fpu_walk);
+				if (!fpu_walk_ok)
+					return (EINVAL);
+				if ((fpu_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) !=
+				    (X86_PG_V | X86_PG_RW))
+					return (EINVAL);
+				error = hibernate_md_kva_install(ha, fpu_va,
+				    fpu_walk.hmw_pa, fpu_walk.hmw_flags);
+			}
 		}
 		if (error == 0) {
 			/*
