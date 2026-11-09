@@ -5258,7 +5258,58 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			 * for it is exactly today's existing, already-correct
 			 * behaviour, unchanged.
 			 */
-			if (pg_m->order != VM_NFREEORDER) {
+			/*
+			 * K24-T00 (T08 round): validity gate, discovered and
+			 * added this round after a direct, instrumented
+			 * crash capture. pg_m->order != VM_NFREEORDER alone
+			 * is NOT sufficient proof this page is a genuine
+			 * free-list member: pg_pa is the physical address
+			 * this reinit's OWN software page-table walk
+			 * (uma_hibernate_resolve_pa()) resolved for the
+			 * slab's data page -- confirmed correct per that
+			 * function's own complete body (a real PTE walk, not
+			 * a sentinel/fabricated value) -- but nothing
+			 * upstream of this point ever validated that pg_pa
+			 * actually falls within a REGISTERED vm_phys_seg at
+			 * all. Captured directly this round: pg_pa resolved
+			 * to physical address 0 (not covered by any of this
+			 * boot's own 13 vm_phys_segs[] entries -- confirmed,
+			 * vm_phys_paddr_to_seg(0) returns NULL), yet
+			 * PHYS_TO_VM_PAGE(0) still returns SOME vm_page_t
+			 * (vm_page_array's own backing memory for that index,
+			 * zero-filled and never initialized by any real
+			 * vm_phys_add_seg() call) whose order field reads 0
+			 * purely because it was never written at all -- not
+			 * because the page is genuinely free. Calling
+			 * vm_phys_unfree_page(0) on this non-existent page
+			 * dereferences seg->domain through a NULL seg
+			 * pointer (seg = vm_phys_paddr_to_seg(pa) returns
+			 * NULL; vm_domain_free_assert_locked(VM_DOMAIN(
+			 * seg->domain)) is the first thing that function
+			 * does), producing the observed #GP fault --
+			 * confirmed directly via disassembly (fault RIP
+			 * matches the resolved vm_phys_segs[] struct's own
+			 * first_page field read) and this round's own live
+			 * diagnostic capture (seg=0x0, seg_domain=-1,
+			 * vm_phys_nsegs=13, pg_pa=0).
+			 *
+			 * This is the identical "never-activated/never-a-
+			 * genuine-member" defect class this epic already
+			 * closed for the ie_lock/IRQ-resource family
+			 * (pci_resume_child()'s own RF_ACTIVE gate): a
+			 * structure that LOOKS like it satisfies a loose
+			 * precondition (pcb_flags-style/order-style zero
+			 * value) without ever having been a genuine member
+			 * of the system this round's own code assumes. The
+			 * fix is the same shape: gate on membership in a
+			 * REAL vm_phys_seg (this boot's own, authoritative
+			 * memory-map registration) before trusting the
+			 * page's own order field at all -- not relaxing or
+			 * removing the order check, adding the missing
+			 * precondition it should have had from the start.
+			 */
+			if (pg_m->order != VM_NFREEORDER &&
+			    vm_phys_paddr_to_seg(pg_pa) != NULL) {
 				int pg_domain = vm_phys_domain(pg_pa);
 
 				vm_domain_free_lock(VM_DOMAIN(pg_domain));

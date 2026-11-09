@@ -5197,10 +5197,6 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    saved_td_sleeplocks);
 		hibernate_coordinator_mtx_reseed(saved_td);
 		/*
-		 * This file has no public header for any of these three
-		extern void uma_hibernate_reinit_plinks(void);
-		extern void uma_hibernate_reinit_cache_buckets(void);
-		/*
 		 * K24-T00 (reconciliation, Defect A): rebuild UMA's own
 		 * plinks.uma reverse-lookup index (vm_page_t's own
 		 * slab/zone-identity fields, stale/zero after round 59's
@@ -5214,6 +5210,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * uma_hibernate_reinit_plinks() for the full root-cause
 		 * account and disposition.
 		 */
+		extern void uma_hibernate_reinit_plinks(void);
 		uma_hibernate_reinit_plinks();
 		/*
 		 * K24-T00 (Job 2, exhaustive sweep): per-CPU cache-bucket
@@ -5224,6 +5221,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * malloc()/free() this continuation or any later
 		 * device-resume callee performs.
 		 */
+		extern void uma_hibernate_reinit_cache_buckets(void);
 		uma_hibernate_reinit_cache_buckets();
 		/*
 		 * K24-T00 (round 14, disposition chosen and argued): the
@@ -5243,6 +5241,8 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 */
 		extern void acpi_pwr_hibernate_reinit(void);
 		acpi_pwr_hibernate_reinit();
+		/*
+		 * This file has no public header for any of these three
 		 * accessors, matching this file's own existing convention
 		 * (e.g. "extern struct susppcb **susppcbs" in
 		 * sys/amd64/amd64/hibernate_machdep.c, declared the same
