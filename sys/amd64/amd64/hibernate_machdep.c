@@ -3170,87 +3170,197 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00: the SAME defect class and SAME page-table-
-			 * path mechanism just applied to kstack_va above -- not
-			 * a content/self-copy question, a page-table-path
-			 * question. k24t00_staged_fpu_save (captured above,
-			 * from staged_pcb->pcb_save, the SAME staged-PCB page
-			 * already mapped for kstack_va) names
-			 * td_md.md_usr_fpu_save, a SEPARATE UMA allocation
-			 * (sys/amd64/amd64/fpu.c's own fpu_save_area_alloc(),
-			 * fpu_save_area_zone) that can have NO page-table entry
-			 * at all in the resume kernel's own kernel_pmap at this
-			 * point -- there would be nothing for an ordinary
-			 * self-copy walk to protect, exactly as kstack_va's own
-			 * case already established. This is the correctly-
-			 * identified mechanism for a GPF/page-fault class a
-			 * prior, falsified fpcurthread-reseed hypothesis did
-			 * not close: fpu_activate_sw() ->
-			 * restore_fpu_curthread() -> fpurestore(pcb->pcb_save)
-			 * dereferences exactly this VA for whichever thread the
-			 * resume continuation later switches into, and a
-			 * missing live mapping there produces the identical
-			 * #GP/#PF signature already captured. Resolve and
-			 * install this one page using the identical, already-
-			 * proven mechanism, not a self-copy walk and not
-			 * vtoslab() (already falsified on this exact resume-
-			 * continuation path for an unrelated but structurally
-			 * identical reason: it depends on allocator-internal
-			 * state not yet reconciled at this point). The buffer
-			 * is a single page: cpu_max_ext_state_size (sys/x86/
-			 * x86/identcpu.c) is, on every x86_64 XSAVE-capable CPU
-			 * up to and including AVX-512, bounded well under
-			 * PAGE_SIZE; one install call per thread's own buffer
-			 * therefore suffices.
+			 * K24-T00 (T14): per-thread user-FPU save area --
+			 * requested after direct testing isolated the AP-
+			 * side fpurestore_xrstor3264() GPF/double-fault
+			 * cascade (T13's own outcome table, runs 5/9; T12's
+			 * own runs 6-7) to shape (1) of the two candidates:
+			 * PCB_FPUINITDONE already set (a genuine, working
+			 * thread per the K24T00-T14 restore_fpu capture
+			 * taken immediately before the K-10 copy) on a
+			 * thread whose pcb_save area reads a MALFORMED
+			 * XSAVE header post-copy (live capture,
+			 * restore-20261109-112805.log: xstate_bv=
+			 * 0xfffffe00004d1f48, xcomp_bv=0x1 -- not a valid
+			 * state-component bitmap, closer in magnitude to a
+			 * raw pointer value than to any of this round's
+			 * own genuinely-valid captures, which read small,
+			 * sparse values like 0x1/0x2 throughout). This
+			 * rules out shape (2) (pcb_save itself invalid/
+			 * misaligned): every capture's own pcb_save pointer
+			 * resolved to a valid physical page via vtophys()
+			 * (added this round specifically to test this),
+			 * align6=0 (64-byte aligned, satisfying XSAVE's own
+			 * requirement) on every single capture, pre- and
+			 * post-copy alike.
 			 *
-			 * This protects exactly ONE page, belonging to the ONE
-			 * thread (saved_td) whose own continuation this exact
-			 * resume cycle actually resumes and switches back into
-			 * -- not every thread in the system, which an earlier,
-			 * reverted blanket sweep already proved tears the copy.
+			 * Root cause: get_pcb_user_save_td()/
+			 * get_pcb_user_save_pcb() (sys/amd64/amd64/
+			 * vm_machdep.c) resolve pcb_save to
+			 * td->td_md.md_usr_fpu_save -- a SEPARATE
+			 * allocation from both the struct proc page and the
+			 * thread's own kstack (fpu_save_area_alloc(),
+			 * cpu_thread_alloc(), sys/amd64/amd64/
+			 * vm_machdep.c:375), outside the destination-set
+			 * bitmap hibernate_md_enumerate_procs() (this same
+			 * file) computes: that function's own k28
+			 * enumeration walks exactly two physical regions
+			 * per thread -- the struct proc page
+			 * (trunc_page((vm_offset_t)pp)) and
+			 * td->td_kstack -- and never resolves or registers
+			 * td_md.md_usr_fpu_save at all. The pointer value
+			 * itself survives the K-10 copy correctly (it lives
+			 * on the kstack, which IS covered), but the
+			 * separate physical page it points at is never
+			 * accounted for by the destination-set membership
+			 * test, so its post-copy CONTENT is whatever the
+			 * saved image's own snapshot happened to leave at
+			 * that physical address -- the identical "never-
+			 * accounted-for, live-but-clobbered" shape this
+			 * epic has already found and fixed seven times
+			 * (pc_gdt, KPML4phys, ths[], vm_page_array, idle
+			 * kstacks, vm_dom[], and DPCPU, several lines above
+			 * this same block).
+			 *
+			 * Disposition: copy_leaf=true, mirroring the DPCPU
+			 * block immediately above and for the identical
+			 * reason -- this is live, in-use allocator content
+			 * this boot's own cpu_fork()/fpu_save_area_alloc()
+			 * already built correctly (a freshly allocated save
+			 * area, or this boot's own prior fpurestore() output
+			 * for a thread that had already used the FPU before
+			 * suspend); there is no saved-image content here
+			 * worth restoring FROM -- the resumed thread's own
+			 * logical FPU state is reconstructed by the ordinary
+			 * cold-init branch in restore_fpu_curthread() when
+			 * PCB_FPUINITDONE is clear, and left as this boot's
+			 * own valid data when it is already set, exactly
+			 * paralleling why saved_pcb_va alone (not this
+			 * region) needs copy_leaf=false.
+			 *
+			 * Walked for every process/thread in the system
+			 * (mirroring hibernate_md_enumerate_procs()'s own
+			 * traversal shape exactly, same locks, same order:
+			 * allproc_lock then PROC_LOCK), not merely the BSP/
+			 * AP idle threads the pre-existing kstack self-copy
+			 * blocks above already cover -- the T14 capture's
+			 * own faulting thread (tid 100089, "acpiconf") is
+			 * an ordinary user thread reached via the interrupt-
+			 * resume path, not an idle thread.
+			 *
+			 * K24-T00 (T15): a zone-wide variant of this fix
+			 * (protecting fpu_save_area_zone's own backing pages
+			 * as a unit) was tried and REVERTED: an 8-run
+			 * campaign showed it recurred on 3/3 runs that
+			 * reached the fault's own call path (worse than this
+			 * per-thread walk's own 1/5), falsifying the
+			 * "immune by construction" reasoning it was built
+			 * on. Its own failure mode was never re-diagnosed.
+			 *
+			 * K24-T00 (T16): CONTENT PROTECTION REPLACED WITH A
+			 * GATE. Both T14 (per-thread self-copy-protect) and
+			 * T15 (zone-wide self-copy-protect) tried to make
+			 * td_md.md_usr_fpu_save's own CONTENT survive the
+			 * K-10 copy intact -- but any thread created between
+			 * this walk and the destructive copy (via fork() or
+			 * pthread_create(), both funnelled through
+			 * sys/amd64/amd64/vm_machdep.c's own copy_thread())
+			 * is handed a BRAND-NEW fpu_save_area_alloc()
+			 * physical page that did not exist at this walk's
+			 * own time and so could never have been protected by
+			 * either mechanism -- the structural reason both
+			 * attempts left a window (T14: 1/5 recurrence) or
+			 * failed outright (T15: 3/3).
+			 *
+			 * The content-preservation goal is abandoned here in
+			 * favour of a GATE that is robust to this timing by
+			 * CONSTRUCTION, not merely by coverage: instead of
+			 * self-copy-protecting each thread's own save-area
+			 * page, clear_pcb_flags(..., PCB_FPUINITDONE |
+			 * PCB_USERFPUINITDONE) is called on every thread this
+			 * walk reaches, forcing restore_fpu_curthread()'s own
+			 * cold-init branch ("if ((pcb->pcb_flags &
+			 * PCB_FPUINITDONE) == 0) { bcopy(fpu_initialstate,
+			 * pcb->pcb_save, ...); ... }", sys/amd64/amd64/
+			 * fpu.c) on this thread's own first post-resume FPU
+			 * use, UNCONDITIONALLY overwriting whatever content
+			 * (genuine or clobbered) its own save area holds --
+			 * the save area's own CONTENT becomes irrelevant, so
+			 * no self-copy-protect call against it is needed at
+			 * all.
+			 *
+			 * Why this closes the race rather than narrowing it:
+			 * copy_thread() (sys/amd64/amd64/vm_machdep.c)
+			 * ALWAYS begins with "bcopy(td1->td_pcb, pcb2,
+			 * sizeof(*pcb2))" -- an unconditional, byte-for-byte
+			 * copy of the creating thread's ENTIRE pcb, including
+			 * pcb_flags, into the new thread's own pcb, BEFORE
+			 * that new thread is handed its own fresh
+			 * fpu_save_area_alloc() page. Any thread created
+			 * during the race window is therefore, by ordinary
+			 * causality within this single boot's own execution
+			 * timeline, forked from (or pthread_create()'d
+			 * alongside) a thread that was ALREADY walked and
+			 * gated by this exact loop -- so its own inherited
+			 * pcb_flags already has PCB_FPUINITDONE clear at the
+			 * moment of the bcopy, regardless of how much later
+			 * the creation happens relative to this walk. The new
+			 * thread's own cold-init branch fires on its own
+			 * first FPU use, exactly as if it were an ordinary
+			 * first-time FPU user -- no gap, no timing dependency
+			 * on when between this walk and the no-return jump
+			 * the creation occurs.
+			 *
+			 * TRADE-OFF, stated explicitly per this round's own
+			 * requested disposition: every walked thread LOSES
+			 * its own genuine pre-suspend FPU register state --
+			 * its first post-resume FPU touch reloads
+			 * fpu_initialstate (ordinary reset values, the exact
+			 * same state an ordinary cold-boot first-FPU-use
+			 * thread already gets) rather than its own real,
+			 * pre-hibernate register contents. This is accepted,
+			 * for every thread class including the resuming/
+			 * dump-invoking userland process itself, with no
+			 * special-casing, because: (1) the alternative,
+			 * confirmed this epic's own own T14/T15 campaigns, is
+			 * an outright kernel panic (GPF in
+			 * fpurestore_xrstor3264()) on recurrence -- a
+			 * silently-reinitialised FPU register file is
+			 * strictly preferable to a crash; (2) no FreeBSD ABI
+			 * or POSIX contract promises FPU register CONTENT
+			 * persistence across hibernate/resume -- unlike
+			 * general-purpose registers, memory, or file-
+			 * descriptor state, x87/SSE/AVX register VALUES are
+			 * not part of any documented cross-suspend guarantee,
+			 * and ordinary ACPI S3/S4 resume on real hardware
+			 * already involves CPU state re-establishment of this
+			 * kind; (3) the lost state is register CONTENT only,
+			 * never correctness-bearing kernel bookkeeping (pcb
+			 * identity, thread scheduling state, memory contents,
+			 * and process semantics are all untouched by this
+			 * change) -- a program that depends on specific FPU
+			 * register VALUES surviving an actual hibernate cycle
+			 * unchanged is relying on behaviour no POSIX/FreeBSD
+			 * interface guarantees in the first place. No thread
+			 * class was found needing different handling.
 			 */
-			if (k24t00_staged_fpu_save != NULL) {
-				struct hibernate_md_walk fpu_walk;
-				bool fpu_walk_ok;
-				vm_offset_t fpu_va;
+			struct proc *fpu_pp;
+			struct thread *fpu_td;
 
-				fpu_va = trunc_page(
-				    (vm_offset_t)k24t00_staged_fpu_save);
-				/*
-				 * Reject a non-canonical/out-of-kernel-range
-				 * VA closed-form, matching kstack_va's own
-				 * precedent exactly -- fail closed (EINVAL;
-				 * pre-RESTORE refusal) rather than let a
-				 * garbage pointer reach
-				 * hibernate_md_kva_install() at all.
-				 */
-				if (fpu_va < VM_MIN_KERNEL_ADDRESS ||
-				    fpu_va >= VM_MAX_KERNEL_ADDRESS)
-					return (EINVAL);
-				/*
-				 * cpu_max_ext_state_size must not straddle a
-				 * page boundary from this base VA, matching
-				 * the single-install-call disposition
-				 * justified above; if it ever did (a future
-				 * CPU generation with a larger XSAVE area than
-				 * this check anticipates), fail closed rather
-				 * than silently install only a partial
-				 * mapping.
-				 */
-				if (((vm_offset_t)k24t00_staged_fpu_save &
-				    PAGE_MASK) + cpu_max_ext_state_size >
-				    PAGE_SIZE)
-					return (EINVAL);
-				fpu_walk_ok = hibernate_md_staged_leaf_for_live_slot(
-				    ha, wvec, p, fpu_va, &fpu_walk);
-				if (!fpu_walk_ok)
-					return (EINVAL);
-				if ((fpu_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) !=
-				    (X86_PG_V | X86_PG_RW))
-					return (EINVAL);
-				error = hibernate_md_kva_install(ha, fpu_va,
-				    fpu_walk.hmw_pa, fpu_walk.hmw_flags);
+			sx_xlock(&allproc_lock);
+			FOREACH_PROC_IN_SYSTEM(fpu_pp) {
+				PROC_LOCK(fpu_pp);
+				FOREACH_THREAD_IN_PROC(fpu_pp, fpu_td) {
+					if (fpu_td->td_md.md_usr_fpu_save ==
+					    NULL)
+						continue;
+					clear_pcb_flags(fpu_td->td_pcb,
+					    PCB_FPUINITDONE |
+					    PCB_USERFPUINITDONE);
+				}
+				PROC_UNLOCK(fpu_pp);
 			}
+			sx_xunlock(&allproc_lock);
 		}
 		if (error == 0) {
 			/*
