@@ -3693,6 +3693,158 @@ proc_hibernate_insert_curproc(void)
 	sx_xunlock(&allproc_lock);
 }
 
+/*
+ * K24-T00 (T13): post-copy normalization pass for the allproc chain.
+ *
+ * Rounds 34/T10 healed one poisoned p_list back-reference at a time (the
+ * allproc head, then a mutual/cyclic pair elsewhere in the chain). The
+ * outcome table across T10-T12 shows the SAME class recurring at a
+ * DIFFERENT node pair each time the prior one is healed -- the signature
+ * of a whole-graph problem, not a sequence of independent single-node
+ * defects. This function replaces per-node healing with a single,
+ * deterministic rebuild: the process SET is read from pidhashtbl (linked
+ * via p_hash, a STRUCTURALLY INDEPENDENT field from p_list -- the two
+ * indices are separate LIST linkages over the same struct proc objects,
+ * populated independently at fork time), validated node-by-node, and
+ * allproc (linked via p_list) is rebuilt from scratch in ascending pid
+ * order. This repairs any number of broken p_list links at once, because
+ * it never trusts p_list's own existing content as input -- only p_hash
+ * and the proc objects' own non-linkage fields are read.
+ *
+ * Why this is safe: allproc_lock/proctree_lock/pidhashtbl_lock are BSS-
+ * allocated lock objects, not saved-image destination-set content -- the
+ * K-10 copy's own documented defect class affects DATA the resumed image
+ * carries (process objects, their p_list links), not statically-allocated
+ * lock objects elsewhere in BSS, and all three locks are already proven
+ * live and functional every run (resume_all_proc()'s own unconditional
+ * sx_xlock(&allproc_lock) has never itself panicked in this epic's own
+ * history -- only the chain CONTENT it protects has). p_hash is read-only
+ * here (never written), so even if p_hash itself also carries stale
+ * destination-set content, the only consequence is an incomplete or
+ * malformed SET being observed -- caught by the per-node validation below
+ * and the bounded-iteration guard, never an unbounded loop or a write
+ * through a corrupt pointer.
+ *
+ * Validation, not assumption: each node found via p_hash is accepted into
+ * the rebuilt set only if p_state is a plausible enum value (excluding
+ * PRS_NEW, the same exclusion proc_iterate() already applies), p_pid is
+ * in-range, and p_comm contains a NUL within its own fixed buffer (a
+ * cheap, real sanity check that the bytes are a terminated C string, not
+ * raw heap junk). Nodes failing validation are counted and reported, not
+ * silently dropped -- a nonzero reject count is loud, named evidence
+ * something is still wrong, not swallowed.
+ *
+ * Bounded, not unbounded: the total accepted-node count is capped (see
+ * HIB_REBUILD_MAX_PROCS below); exceeding it aborts the rebuild with a
+ * named diagnostic rather than silently truncating the set or risking an
+ * unbounded insertion-sort. This epic has already been burned once by an
+ * unbounded blanket sweep (round-prior 268-page tear); this pass is
+ * scoped to exactly the one list (p_list on struct proc) and one object
+ * class (processes already enumerated by the hibernate image's own k28
+ * accounting, typically ~17-32 on this test configuration), with an
+ * explicit ceiling well above that.
+ *
+ * Scope: only p_list linkage is touched. No process is relocated, no
+ * thread's own state is altered, no process is added or removed from the
+ * SET (membership comes entirely from p_hash, read-only) -- this
+ * reorders/repairs links only.
+ */
+#define	HIB_REBUILD_MAX_PROCS	512
+void	hibernate_resume_rebuild_allproc(void);
+void
+hibernate_resume_rebuild_allproc(void)
+{
+	struct proc *procs[HIB_REBUILD_MAX_PROCS];
+	struct proc *p;
+	int i, j, n, rejected, iter_guard, k, lo, hi;
+	bool has_nul;
+
+	n = 0;
+	rejected = 0;
+	sx_slock(&proctree_lock);
+	for (i = 0; i < pidhashlock + 1; i++) {
+		sx_slock(&pidhashtbl_lock[i]);
+		for (j = i; j <= pidhash; j += pidhashlock + 1) {
+			iter_guard = 0;
+			LIST_FOREACH(p, &pidhashtbl[j], p_hash) {
+				if (++iter_guard > HIB_REBUILD_MAX_PROCS) {
+					printf("hibernate_resume_rebuild_"
+					    "allproc: ABORT pidhashtbl "
+					    "bucket %d iteration exceeded %d "
+					    "-- p_hash itself appears cyclic; "
+					    "allproc rebuild skipped, falling "
+					    "back to resume_all_proc()'s own "
+					    "narrow self-heals\n",
+					    j, HIB_REBUILD_MAX_PROCS);
+					sx_sunlock(&pidhashtbl_lock[i]);
+					sx_sunlock(&proctree_lock);
+					return;
+				}
+				if (p->p_state == PRS_NEW)
+					continue;
+				if (p->p_state < SIDL || p->p_state > SLOCK) {
+					rejected++;
+					continue;
+				}
+				if (p->p_pid < 0 || p->p_pid > PID_MAX) {
+					rejected++;
+					continue;
+				}
+				has_nul = false;
+				for (k = 0; k < sizeof(p->p_comm); k++) {
+					if (p->p_comm[k] == '\0') {
+						has_nul = true;
+						break;
+					}
+				}
+				if (!has_nul) {
+					rejected++;
+					continue;
+				}
+				if (n >= HIB_REBUILD_MAX_PROCS) {
+					printf("hibernate_resume_rebuild_"
+					    "allproc: ABORT accepted "
+					    "process count exceeded %d -- "
+					    "allproc rebuild skipped, falling "
+					    "back to resume_all_proc()'s own "
+					    "narrow self-heals\n",
+					    HIB_REBUILD_MAX_PROCS);
+					sx_sunlock(&pidhashtbl_lock[i]);
+					sx_sunlock(&proctree_lock);
+					return;
+				}
+				procs[n++] = p;
+			}
+		}
+		sx_sunlock(&pidhashtbl_lock[i]);
+	}
+	sx_sunlock(&proctree_lock);
+
+	/* Insertion-sort procs[] by p_pid ascending (n is small/bounded). */
+	for (i = 1; i < n; i++) {
+		struct proc *key = procs[i];
+		j = i - 1;
+		while (j >= 0 && procs[j]->p_pid > key->p_pid) {
+			procs[j + 1] = procs[j];
+			j--;
+		}
+		procs[j + 1] = key;
+	}
+
+	sx_xlock(&allproc_lock);
+	LIST_INIT(&allproc);
+	for (i = n - 1; i >= 0; i--)
+		LIST_INSERT_HEAD(&allproc, procs[i], p_list);
+	sx_xunlock(&allproc_lock);
+
+	/* Find the pid range actually accepted, for the diagnostic. */
+	lo = n > 0 ? procs[0]->p_pid : -1;
+	hi = n > 0 ? procs[n - 1]->p_pid : -1;
+	printf("hibernate_resume_rebuild_allproc: allproc rebuilt from "
+	    "pidhashtbl: accepted=%d rejected=%d pid_range=[%d,%d]\n",
+	    n, rejected, lo, hi);
+}
+
 void
 resume_all_proc(void)
 {

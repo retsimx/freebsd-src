@@ -5645,6 +5645,24 @@ backout:
     extern void proc_hibernate_insert_curproc(void);
     proc_hibernate_insert_curproc();
     resume_all_fs();
+    /*
+     * K24-T00 (T13): run the allproc normalization pass BEFORE
+     * resume_all_proc()'s own per-node self-heals. T10-T12's own
+     * outcome table shows the SAME p_list corruption class recurring
+     * at a DIFFERENT node pair each round after the prior one was
+     * healed -- the signature of a whole-graph problem, not a
+     * sequence of independent single-node defects. This rebuilds the
+     * ENTIRE allproc chain in one deterministic pass (sourced from
+     * pidhashtbl/p_hash, a structurally independent linkage -- see
+     * hibernate_resume_rebuild_allproc()'s own full account in
+     * sys/kern/kern_proc.c), so resume_all_proc() then runs against an
+     * already-consistent chain; its own narrow self-heals (round 34,
+     * T10) remain in place as a fallback for the rare case the
+     * rebuild itself aborts (a named, loud bail-out, not a silent
+     * no-op -- see the function's own abort paths).
+     */
+    extern void hibernate_resume_rebuild_allproc(void);
+    hibernate_resume_rebuild_allproc();
     resume_all_proc();
 
     if (stype == POWER_STYPE_OS_HIBERNATE)
