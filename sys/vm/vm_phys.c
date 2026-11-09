@@ -2258,6 +2258,127 @@ hibernate_md_vm_phys_free_queues_va(vm_offset_t *va, size_t *len)
 }
 
 /*
+ * K24-T00 (T23): close the vm_page_array/vm_phys_free_queues disagreement
+ * `vm_page_alloc_check()`'s own "page ... has object" panic reaches
+ * (reproduced three times this epic, every capture naming
+ * kernel_object_store as the claiming object, via vm_page_alloc_noobj_
+ * domain() -> vm_phys_alloc_pages() -> vm_phys_alloc_freelist_pages()
+ * extracting a page from a free-list TAILQ that m->object/m->ref_count
+ * (both already correctly self-copy-protected, round 59) say is NOT
+ * free at all).
+ *
+ * Two-sided overlap, pinned directly from a live capture (K24T00-T20/
+ * T22): the SAME page simultaneously satisfies (a) kernel_object's own
+ * ownership claim -- m->object == &kernel_object_store, m->ref_count ==
+ * VPRC_OBJREF|1 (genuinely wired), m->busy_lock exclusive-busy, not
+ * VPB_FREED/VPB_UNBUSIED -- and (b) the free-list path's own membership
+ * claim -- this page was reachable via vm_phys_free_queues[dom][flind]
+ * [pool][oind].pl, the exact TAILQ vm_phys_alloc_freelist_pages() walks,
+ * since that is the only way vm_phys_alloc_pages() could have returned
+ * it to vm_page_alloc_noobj_domain() in the first place.
+ *
+ * Root cause (established by direct inspection of hibernate_md_selfcopy_
+ * walk(), this file's own PML4/PDPT/PD/PT traversal, in hibernate_
+ * machdep.c): an invalid (not-yet-present, X86_PG_V == 0) intermediate
+ * page-table entry anywhere along the walk makes the function return 0
+ * (success), not an error -- so a 4 KiB page that happens to NOT be
+ * live-mapped in kernel_pmap at hibernate_machdep_prepare() time (this
+ * boot's own early-resume point, strictly BEFORE the destructive K-10
+ * copy) is silently treated as "nothing to protect here" rather than
+ * "this page's own content is unprotected." vm_page_array spans many
+ * megabytes; a single 4 KiB slot inside it landing on such a gap is
+ * exactly the kind of narrow, intermittent miss this epic's own
+ * established "page-table-path" defect class (first proven for
+ * kstack_va/pcb_save) already names -- but unlike those single, known
+ * VAs, vm_page_array's own self-copy walk has no way to know IN ADVANCE
+ * which of its many pages might hit this gap, so it cannot refuse
+ * closed at prepare() time without also refusing every ordinary,
+ * correctly-mapped hibernate attempt.
+ *
+ * Disposition: reconcile the invariant on this file's own authoritative
+ * side instead -- after the K-10 copy, immediately after this file's
+ * other post-copy reinits (uma_hibernate_reinit_plinks()/
+ * uma_hibernate_reinit_cache_buckets(), already called from acpi.c's
+ * EJUSTRETURN branch before any device-resume code can run), walk every
+ * free-list entry this boot's own vm_phys_free_queues names and assert
+ * exactly one interpretation per page: if m->object != NULL (the
+ * object-ownership claim, already proven live and correct by vm_page_
+ * array's own self-copy), that page is NOT free -- unlink it from the
+ * free list it is wrongly still linked into (mirroring vm_phys_
+ * unfree_page()'s own TAILQ_REMOVE/lcnt-- disposition exactly, under
+ * the same vm_domain_free_lock()), matching the established "object/
+ * page bookkeeping disagreement -> the object's own claim wins" rule
+ * this epic already applies to vm_dom[]/vm_phys_free_queues themselves.
+ * A page that is genuinely free (m->object == NULL) is left completely
+ * untouched -- this pass only ever removes entries, never adds any, so
+ * it cannot manufacture a new disagreement of its own.
+ *
+ * Fails closed: any entry that is BOTH on a free list AND lacks a valid
+ * m->object/ref_count pairing consistent with vm_page_alloc_check()'s
+ * own preconditions (m->ref_count == 0 for a genuinely free page) is
+ * left in place and panics via the ordinary vm_page_alloc_check() path
+ * exactly as before -- this pass only removes the specific, provable
+ * violation (object-owned pages reachable as free), not every
+ * possible future free-list defect.
+ */
+static u_int vm_phys_hibernate_reconcile_scanned;
+static u_int vm_phys_hibernate_reconcile_removed;
+
+void	vm_phys_hibernate_reconcile_object_owned(void);
+void
+vm_phys_hibernate_reconcile_object_owned(void)
+{
+	struct vm_freelist *fl;
+	vm_page_t m, mnext;
+	int dom, flind, pind, oind;
+
+	vm_phys_hibernate_reconcile_scanned = 0;
+	vm_phys_hibernate_reconcile_removed = 0;
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		for (flind = 0; flind < vm_nfreelists; flind++) {
+			for (pind = 0; pind < VM_NFREEPOOL; pind++) {
+				fl = vm_phys_free_queues[dom][flind][pind];
+				for (oind = 0; oind < VM_NFREEORDER; oind++) {
+					m = TAILQ_FIRST(&fl[oind].pl);
+					while (m != NULL) {
+						mnext = TAILQ_NEXT(m,
+						    plinks.q);
+						vm_phys_hibernate_reconcile_scanned++;
+						if (m->object != NULL) {
+							vm_domain_free_lock(
+							    VM_DOMAIN(dom));
+							TAILQ_REMOVE(
+							    &fl[oind].pl, m,
+							    plinks.q);
+							fl[oind].lcnt--;
+							m->order =
+							    VM_NFREEORDER;
+							vm_domain_free_unlock(
+							    VM_DOMAIN(dom));
+							vm_phys_hibernate_reconcile_removed++;
+							printf(
+							    "vm_phys_hibernate_"
+							    "reconcile: removed "
+							    "object-owned page "
+							    "m=%p obj=%p from "
+							    "free list dom=%d "
+							    "flind=%d pind=%d "
+							    "oind=%d\n",
+							    m, m->object, dom,
+							    flind, pind, oind);
+						}
+						m = mnext;
+					}
+				}
+			}
+		}
+	}
+	printf("vm_phys_hibernate_reconcile: scanned=%u "
+	    "removed=%u\n", vm_phys_hibernate_reconcile_scanned,
+	    vm_phys_hibernate_reconcile_removed);
+}
+
+/*
  * K24-T00: vm_phys_segs[], the per-segment physical-memory descriptor
  * array -- sibling to vm_phys_free_queues and vm_reserv_array (both
  * already self-copy protected in hibernate_machdep_prepare()), and

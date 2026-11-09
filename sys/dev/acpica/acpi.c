@@ -5224,6 +5224,17 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void uma_hibernate_reinit_cache_buckets(void);
 		uma_hibernate_reinit_cache_buckets();
 		/*
+		 * K24-T00 (T23): close the vm_page_array/vm_phys_free_queues
+		 * two-sided overlap -- see sys/vm/vm_phys.c's own
+		 * vm_phys_hibernate_reconcile_object_owned() for the full
+		 * root-cause account and disposition. Called immediately
+		 * after the two UMA reinits above, same reasoning: before
+		 * any malloc()/free() or device-resume callee that could
+		 * extract a still-wrongly-linked page from a free list.
+		 */
+		extern void vm_phys_hibernate_reconcile_object_owned(void);
+		vm_phys_hibernate_reconcile_object_owned();
+		/*
 		 * K24-T00 (round 14, disposition chosen and argued): the
 		 * ACPI power-resource/consumer/reference lists
 		 * (sys/dev/acpica/acpi_powerres.c) are reinitialised (list
