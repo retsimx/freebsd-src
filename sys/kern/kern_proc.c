@@ -3956,6 +3956,38 @@ again:
 	}
 	sx_xunlock(&allproc_lock);
 
+	/*
+	 * K24-T00 (T13): lock-family normalization, sapblk
+	 * (stop_all_proc_blocker). Live capture this round
+	 * (restore-20261109-090639.log): sx_xlocked=0, owner=0,
+	 * raw_lock=0x1 -- decoded against SX_LOCK_UNLOCKED
+	 * (SX_SHARERS_LOCK(0), the shared-bit-set/zero-sharers pattern
+	 * sx_init_flags() itself writes), this is the GENUINE unlocked
+	 * value, not a stale owner pointer. This is the "not genuinely
+	 * held" case from the held-vs-stale taxonomy (same bucket as the
+	 * scheduler locks fixed narrowly in T12): the dump-side kernel's
+	 * own stop_all_proc()/stop_all_proc_block() (sys/dev/acpica/
+	 * acpi.c's own call before the snapshot) locked this exact sx
+	 * object on the SAVE side, and the resumed continuation's own
+	 * control flow (this exact tail call) logically expects to
+	 * release that same acquisition -- but the resume kernel's own
+	 * cold-boot SX_SYSINIT already initialised this address fresh
+	 * (unlocked) before the K-10 copy ran, and this particular
+	 * address evidently was NOT overwritten by the saved image's own
+	 * locked content (unlike the coordinator mutex, which IS
+	 * destination-set content and reaches this code genuinely
+	 * locked). Per the public-interface rule already established for
+	 * the coordinator mutex (hibernate_coordinator_mtx_reseed(),
+	 * sys/kern/kern_hibernate.c) and the AP/BSP idle-thread reseed
+	 * (T12): reinitialise through sx_init_flags()+a REAL sx_xlock()
+	 * acquisition (not a raw field poke), so WITNESS, lockstat, and
+	 * sx_lock itself all observe a consistent transition, then let
+	 * the existing stop_all_proc_unblock() call immediately below
+	 * perform a genuine, correctly-paired release.
+	 */
+	sx_destroy(&stop_all_proc_blocker);
+	sx_init_flags(&stop_all_proc_blocker, "sapblk", 0);
+	sx_xlock(&stop_all_proc_blocker);
 	stop_all_proc_unblock();
 }
 
