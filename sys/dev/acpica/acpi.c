@@ -5145,25 +5145,57 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * acquire() takes a plain, non-recursive, uncontended
 		 * mtx_lock()).
 		 */
-		hibernate_coordinator_mtx_reseed(saved_td);
 		/*
-		 * acpi_s4_resume_discard_snapshot() must run here, before
-		 * hibernate_barrier_unwind(), not inside acpi_s4_resume_bsp()
-		 * afterward: the restored image is a snapshot of curthread
-		 * taken mid-dump-worker, so curthread->td_critnest and
-		 * td_md.md_spinlock_count still carry that worker's deep
-		 * nesting counts the instant resumectx() returns here.
-		 * hibernate_barrier_unwind()'s own Stage 7
-		 * (vm_phys_hibernate_release()) acquires a blockable sleep
-		 * mutex; doing so while those stale nesting counts are still
-		 * in effect is exactly what WITNESS's "acquiring blockable
-		 * sleep lock with spinlock or critical section held" panic
-		 * reports (observed: vm_phys.c's "vm page free queue" mutex).
-		 * Discarding the snapshot first, before any lock acquisition
-		 * on this path, satisfies that invariant.
+		 * K24-T00 (T09 round): ORDER FIX. acpi_s4_resume_discard_
+		 * snapshot() unconditionally sets curthread->td_locks = 0
+		 * and curthread->td_sleeplocks = NULL (establishing a clean
+		 * WITNESS baseline, then re-adding exactly Giant's own
+		 * entry via WITNESS_LOCK()+TD_LOCKS_INC()) -- confirmed by
+		 * direct reading of that function's own body this round.
+		 * The PRIOR ordering called hibernate_coordinator_mtx_
+		 * reseed(saved_td) (which performs a REAL mtx_lock(),
+		 * itself calling WITNESS_LOCK()+TD_LOCKS_INC() for the
+		 * coordinator mutex specifically) BEFORE this discard call
+		 * -- so the discard's own unconditional td_locks=0/
+		 * td_sleeplocks=NULL immediately erased the coordinator
+		 * mutex's own just-created WITNESS entry, while only
+		 * Giant's own entry survived (added by the discard function
+		 * itself, after the erasure). This explains the "lock
+		 * (sleep mutex) hibernate coordinator not locked" panic at
+		 * hibernate_coordinator_release() directly and precisely:
+		 * witness_unlock() (sys/kern/subr_witness.c) walks curthread
+		 * ->td_sleeplocks searching for an li_lock match and panics
+		 * if none is found -- by the time hibernate_coordinator_
+		 * release() runs, the coordinator mutex's own entry had
+		 * already been wiped several hundred lines of reinit calls
+		 * earlier, by this exact ordering bug, not by anything
+		 * downstream. The raw mtx_lock field itself (confirmed
+		 * correct by hibernate_coordinator_mtx_reseed()'s own
+		 * mtx_init(MTX_NEW)+mtx_lock() call) was never the problem
+		 * -- this is squarely "genuinely held, WITNESS bookkeeping
+		 * desynchronised" (the FIRST of the two established rules),
+		 * not "stale, needs reinitialising" (the mutex itself is
+		 * freshly initialised and genuinely locked by this exact
+		 * call).
+		 *
+		 * Fix: reorder so acpi_s4_resume_discard_snapshot() (which
+		 * must still run before any blockable sleep-lock
+		 * acquisition, per its own original, still-valid comment
+		 * below) runs FIRST, establishing the clean td_locks=0/
+		 * Giant-only baseline, and hibernate_coordinator_mtx_
+		 * reseed() runs SECOND, so its own WITNESS_LOCK()+
+		 * TD_LOCKS_INC() for the coordinator mutex is the LAST
+		 * write to td_sleeplocks before hibernate_barrier_unwind()
+		 * eventually calls hibernate_coordinator_release(), and
+		 * therefore survives intact. No functional change to either
+		 * function's own internals -- this is purely a call-order
+		 * fix, matching the "genuinely held -> reconcile WITNESS
+		 * bookkeeping" rule exactly as already established for
+		 * Giant immediately below.
 		 */
 		acpi_s4_resume_discard_snapshot(saved_td_locks, saved_td_pinned,
 		    saved_td_sleeplocks);
+		hibernate_coordinator_mtx_reseed(saved_td);
 		/*
 		 * This file has no public header for any of these three
 		extern void uma_hibernate_reinit_plinks(void);
