@@ -3892,6 +3892,48 @@ again:
 		p = LIST_NEXT(cp, p_list);
 		if (p == NULL)
 			break;
+		/*
+		 * K24-T00 (T10 round): self-heal a single, narrowly-
+		 * confirmed defect on 'p' (the node immediately following
+		 * 'cp'), the exact sibling case to this same function's
+		 * own round-34 fix for allproc's own head, several lines
+		 * above. Direct evidence this round (K24T00-T10's own
+		 * diagnostic, confirmed firing and removed again here):
+		 * 'p' itself can carry a p_list.le_next that still names
+		 * 'cp' -- a genuine, saved-image mutual/cyclic link between
+		 * these two specific adjacent nodes -- which LIST_REMOVE(cp,
+		 * ...) immediately above (TRASHIT(*_Oldnext)/TRASHIT(
+		 * *_Oldprev), sys/sys/queue.h) poisons to (void *)-1 the
+		 * instant it runs, several lines before LIST_INSERT_AFTER(p,
+		 * cp, p_list)'s own QMD_LIST_CHECK_NEXT(p, field) assertion
+		 * dereferences exactly that now-trashed pointer
+		 * (LIST_NEXT(p, field)->le_prev), producing a GPF at a
+		 * wrapped effective address (0xffffffffffffffff + 8 = 0x7,
+		 * confirmed directly via disassembly against the fault's
+		 * own reported "fault virtual address = 0x7"). This is
+		 * ordinary SAVED-IMAGE chain content (not resume-kernel
+		 * state), the identical disposition class the round-34 fix
+		 * already established for allproc's own head: correct
+		 * exactly the one field QMD_LIST_CHECK_NEXT itself tests,
+		 * on exactly the one node it tests it on, BEFORE the
+		 * destructive LIST_REMOVE/LIST_INSERT_AFTER pair runs --
+		 * not a sweep, not a relink of the chain's own otherwise-
+		 * intact interior linkage. If 'p' still names 'cp' as its
+		 * own next, that back-reference is already stale the
+		 * moment 'cp' is about to be unlinked and relinked
+		 * elsewhere in the chain; retargeting it to NULL here
+		 * (the value a correctly-terminated single-successor
+		 * chain segment would show) is sound precisely because
+		 * LIST_INSERT_AFTER(p, cp, p_list), immediately below,
+		 * unconditionally overwrites LIST_NEXT(p, field) with 'cp'
+		 * itself one statement later anyway -- this fix only
+		 * prevents the intervening QMD_LIST_CHECK_NEXT(p, field)
+		 * assertion from dereferencing 'cp' with its own two link
+		 * fields already trashed by the LIST_REMOVE immediately
+		 * above.
+		 */
+		if (LIST_NEXT(p, p_list) == cp)
+			LIST_NEXT(p, p_list) = NULL;
 		LIST_REMOVE(cp, p_list);
 		LIST_INSERT_AFTER(p, cp, p_list);
 		PROC_LOCK(p);
