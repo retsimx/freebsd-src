@@ -3037,7 +3037,79 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				return (EINVAL);
 
 			k24t00_kstack_va = kstack_va;
-			k24t00_staged_fpu_save = staged_pcb->pcb_save;
+			/*
+			 * K24-T00 (T06 round): do NOT source k24t00_staged_
+			 * fpu_save from staged_pcb->pcb_save. staged_pcb here
+			 * is susppcbs[0]->sp_pcb (see hibernate_md_patch_
+			 * saved_domain() above) -- a per-CPU scratch struct
+			 * pcb populated SOLELY by savectx() (sys/amd64/amd64/
+			 * cpu_switch.S), which writes exactly: pcb_rip, pcb_
+			 * rbx/rsp/rbp/r12-r15, pcb_cr0-cr4, pcb_dr0-dr7, pcb_
+			 * fsbase/gsbase/kgsbase, the MSR block (EFER/STAR/
+			 * LSTAR/CSTAR/SFMASK/FRED_*), and pcb_idt/gdt/ldt/tr.
+			 * pcb_save is never among them (confirmed by reading
+			 * savectx()'s own complete body) -- it is thread-
+			 * identity bookkeeping (struct thread's own td_pcb-
+			 * relative field, populated at thread creation by
+			 * cpu_fork()/cpu_thread_alloc() -> get_pcb_user_save_
+			 * pcb(), sys/amd64/amd64/vm_machdep.c), meaningless
+			 * for a standalone struct pcb that was never part of
+			 * a struct thread. susppcbs[i]->sp_pcb is malloc()'d
+			 * with M_WAITOK only, not M_ZERO (sys/amd64/acpica/
+			 * acpi_wakeup.c's acpi_alloc_wakeup_handler()), so its
+			 * own pcb_save field retains whatever the backing heap
+			 * slab last held -- confirmed directly this round: the
+			 * observed poison value 0xdeadc0dedeadc0de is UMA's own
+			 * documented free-memory junk-fill constant (sys/vm/
+			 * uma_dbg.c's own "uma_junk"), meaning this specific
+			 * slab had previously been freed and junked before this
+			 * allocation reused it. This is not a wrong offset (the
+			 * field read is byte-correct for struct pcb) and not a
+			 * legitimate "thread never touched the FPU" case (that
+			 * case is pcb_flags & PCB_FPUINITDONE == 0 on a GENUINE
+			 * thread pcb, which this scratch struct can never carry
+			 * meaningfully either way) -- it is reading a field from
+			 * a struct that was never a valid carrier of that
+			 * field's semantics at all.
+			 *
+			 * The correct, narrow fix is to leave k24t00_staged_
+			 * fpu_save at its NULL initializer (declared above) so
+			 * the FPU page-table-path protection block below is
+			 * skipped entirely -- it is a pure, additive protection
+			 * for a live mapping, not a content requirement (unlike
+			 * saved_pcb_va's copy_leaf=false case); skipping it
+			 * changes nothing about WHICH bytes resumectx() or a
+			 * later context switch read, only whether this file
+			 * proactively pre-maps one VA. The safe fallback already
+			 * exists and needs no new code: restore_fpu_curthread()
+			 * (sys/amd64/amd64/fpu.c) dereferences the REAL resumed
+			 * thread's own td->td_pcb->pcb_save (never susppcbs[0]'s),
+			 * and its own cold-init branch -- "if ((pcb->pcb_flags &
+			 * PCB_FPUINITDONE) == 0) { bcopy(fpu_initialstate,
+			 * pcb->pcb_save, ...); fpurestore(pcb->pcb_save); ...
+			 * set_pcb_flags(..., PCB_FPUINITDONE | ...); }" -- runs
+			 * unconditionally whenever that flag is clear, which is
+			 * exactly the state every thread's own copied/restored
+			 * pcb_flags field already carries unless the saved image
+			 * itself set PCB_FPUINITDONE (an ordinary image-content
+			 * question, already covered by the K-10 destination-set
+			 * copy with no dependency on this block). No separate
+			 * guarantee is needed: this is the SAME fallback every
+			 * ordinary first-fpu-use thread already takes on an
+			 * ordinary cold boot, not a new or weakened path.
+			 *
+			 * This does NOT relax the fpu_va canonical-range guard
+			 * below -- that guard stays exactly as the prior round
+			 * wrote it, unreachable now because its own precondition
+			 * (k24t00_staged_fpu_save != NULL) is never met from this
+			 * invalid source.  If a future round finds a genuine
+			 * staged source for the ACTUAL resumed thread's own
+			 * pcb_save (e.g. by resolving saved_td via the allproc
+			 * walk hibernate_md_enumerate_procs() already proves
+			 * works, then reading ITS td_pcb->pcb_save from the K-9
+			 * staged vector), the guard is what will correctly catch
+			 * a genuinely bad value from that real source.
+			 */
 
 			{
 				struct hibernate_md_walk saved_walk;
