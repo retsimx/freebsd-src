@@ -4162,23 +4162,91 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (measurement-method fix round): kmemsize[]
-			 * (sys/kern/kern_malloc.c), the size-to-index table
-			 * malloc() consults before kmemzones[] on every call.
-			 * Same disposition and reasoning as kmemzones[] above.
+			 * K24-T00 (T21): kernel_object (sys/vm/vm_object.c's
+			 * own kernel_object_store, extern'd as
+			 * &kernel_object_store via sys/vm/vm_object.h's
+			 * kernel_object macro) -- the single, statically-
+			 * allocated vm_object_t every kmem-backed kernel
+			 * allocation in this boot (UMA multi-page/
+			 * kmem_malloc-class slabs via keg_alloc_slab() ->
+			 * kmem_malloc(), and any other kmem_back()-style
+			 * caller) is inserted into. Confirmed this round by
+			 * a direct, instrumented capture (K24T00-T20,
+			 * vm_page_alloc_check()'s own "page ... has object"
+			 * panic, sys/vm/vm_page.c): obj=0xffffffff81eb31d8
+			 * resolves via this binary's own symbol table to
+			 * kernel_object_store exactly, with
+			 * page_ref=0x80000001 (VPRC_OBJREF | one wiring),
+			 * busy_lock=0x3650002 (genuinely exclusive-busy, not
+			 * VPB_UNBUSIED/VPB_FREED), dirty=0, queue=PQ_NONE --
+			 * every field consistent with a REAL, currently
+			 * in-use, resume-kernel-own allocation, not
+			 * stale/garbage content.
+			 *
+			 * Root cause: this is the same "ordinary BSS global,
+			 * live allocator state this boot's own startup
+			 * already built correctly" class already fixed for
+			 * vm_dom[]/vm_phys_free_queues/vm_reserv_array/
+			 * bucket_zones[] above in this same file -- but
+			 * kernel_object_store itself (the struct vm_object
+			 * header: its own rtree root/size/ref_count/
+			 * generation fields, distinct from the PAGES that
+			 * point AT it, which vm_page_array's own self-copy,
+			 * round 59, already protects) was never added to
+			 * this file's protected-VA set, confirmed by an
+			 * exhaustive grep this round finding zero prior
+			 * references. Left unprotected, the K-10 destructive
+			 * copy overwrites kernel_object_store's own memory
+			 * with the SAVED kernel's unrelated snapshot of that
+			 * same object (a different, earlier point in that
+			 * OTHER boot's own kmem history) while every
+			 * vm_page_t that already points AT
+			 * &kernel_object_store (a fixed address, unaffected
+			 * pointer-wise) keeps its own resume-kernel-correct
+			 * per-page state -- an object/page bookkeeping
+			 * disagreement of exactly the same "disagreement
+			 * between siblings" shape this epic already names
+			 * for every other defect in this class.
+			 *
+			 * Disposition: REINITIALIZE (copy_leaf=true, preserve
+			 * THIS boot's own already-correct content), the
+			 * identical rule as vm_dom[]/vm_phys_free_queues/
+			 * vm_reserv_array/bucket_zones[] above -- not "do not
+			 * free" (that rule is for single SAVE-time
+			 * allocations whose own identity is
+			 * unreconstructable; kernel_object_store is shared,
+			 * system-wide bookkeeping every future kmem
+			 * allocation this boot performs legitimately depends
+			 * on being correct, exactly the reasoning already
+			 * established for every sibling in this class).
+			 * Scope is bounded to sizeof(struct vm_object) (a
+			 * small, fixed-size header, not the object's own
+			 * unbounded rtree node allocations, which this round
+			 * deliberately does NOT attempt to walk -- avoiding
+			 * the round-30 blanket-sweep trap this epic's own
+			 * established rules warn against). The object is
+			 * file-static in scope here (sys/vm/vm_object.h only
+			 * exposes it via the kernel_object macro, which this
+			 * file does not currently pull in), so its VA/size
+			 * come from a narrow accessor in sys/vm/vm_object.c
+			 * (hibernate_md_kernel_object_va()), matching this
+			 * file's own existing convention for such cross-file
+			 * hibernate accessors
+			 * (hibernate_md_vm_phys_free_queues_va(),
+			 * hibernate_md_vm_reserv_array_va(), etc., above).
 			 */
-			extern void hibernate_md_kmemsize_va(
+			extern void hibernate_md_kernel_object_va(
 			    vm_offset_t *va, size_t *len);
-			vm_offset_t ks_raw, ks_va, ks_end;
-			size_t ks_len;
+			vm_offset_t ko_raw, ko_pg, ko_end;
+			size_t ko_len;
 
-			hibernate_md_kmemsize_va(&ks_raw, &ks_len);
-			ks_va = trunc_page(ks_raw);
-			ks_end = round_page(ks_raw + ks_len);
-			for (; ks_va < ks_end && error == 0;
-			    ks_va += PAGE_SIZE)
+			hibernate_md_kernel_object_va(&ko_raw, &ko_len);
+			ko_pg = trunc_page(ko_raw);
+			ko_end = round_page(ko_raw + ko_len);
+			for (; ko_pg < ko_end && error == 0;
+			    ko_pg += PAGE_SIZE)
 				error = hibernate_md_selfcopy_walk(ha, wvec, p,
-				    kernel_pmap->pm_cr3, ks_va, true,
+				    kernel_pmap->pm_cr3, ko_pg, true,
 				    &selfcopied);
 		}
 		if (error != 0)

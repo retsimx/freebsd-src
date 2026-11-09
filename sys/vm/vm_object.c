@@ -145,6 +145,22 @@ struct mtx vm_object_list_mtx;	/* lock for object list and count */
 
 struct vm_object kernel_object_store;
 
+/*
+ * K24-T00 (T21): expose kernel_object_store's own VA/size to
+ * sys/amd64/amd64/hibernate_machdep.c, which cannot itself reference
+ * kernel_object/struct vm_object directly (this file does not pull in
+ * sys/vm/vm_object.h). Mirrors this epic's own existing convention for
+ * such cross-file hibernate accessors (e.g.
+ * hibernate_md_vm_phys_free_queues_va(), sys/vm/vm_phys.c).
+ */
+void	hibernate_md_kernel_object_va(vm_offset_t *va, size_t *len);
+void
+hibernate_md_kernel_object_va(vm_offset_t *va, size_t *len)
+{
+	*va = (vm_offset_t)&kernel_object_store;
+	*len = sizeof(kernel_object_store);
+}
+
 static SYSCTL_NODE(_vm_stats, OID_AUTO, object, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "VM object stats");
 
