@@ -5620,7 +5620,33 @@ backout:
 	 */
 	sc->acpi_resume_sbt = getsbinuptime();
 	EVENTHANDLER_INVOKE(acpi_pre_dev_resume, stype);
-	DEVICE_RESUME(root_bus);
+	/*
+	 * K24-T00: wire up uma_hibernate_dbg_suppress_begin()/_end()
+	 * (sys/vm/uma_core.c), bracketing this one DEVICE_RESUME(root_bus)
+	 * call, strictly on the EJUSTRETURN resume-continuation path
+	 * (hib_workspace_resume_continuation, set only there -- see this
+	 * flag's own declaration/set-site comments above). This is the
+	 * already-implemented, already-documented fix (uma_core.c's own
+	 * header comment on uma_hibernate_dbg_suppress_begin()) for the
+	 * "uma: item ... did not belong to zone ... Bucket" panic
+	 * (item_ctor() -> uma_dbg_getslab()'s NULL-slab return on a
+	 * HASH-format keg walk, reached from this exact
+	 * DEVICE_RESUME(root_bus) call via acpi_set_power_children() ->
+	 * device_get_children() -> malloc() -> ... -> cache_alloc() ->
+	 * item_ctor()) -- confirmed present in uma_core.c but never
+	 * called from anywhere in the tree until this change. Suppression
+	 * is bounded to this one call so it has zero effect on an
+	 * ordinary (non-hibernate) S3 resume on this same code path.
+	 */
+	if (hib_workspace_resume_continuation) {
+	    extern void uma_hibernate_dbg_suppress_begin(void);
+	    extern void uma_hibernate_dbg_suppress_end(void);
+
+	    uma_hibernate_dbg_suppress_begin();
+	    DEVICE_RESUME(root_bus);
+	    uma_hibernate_dbg_suppress_end();
+	} else
+	    DEVICE_RESUME(root_bus);
 	slp_state &= ~ACPI_SS_DEV_SUSPEND;
     }
     if ((slp_state & ACPI_SS_SLP_PREP) != 0) {

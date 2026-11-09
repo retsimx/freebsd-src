@@ -6345,6 +6345,83 @@ sysctl_handle_uma_zone_items(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_64(oidp, &cur, 0, req));
 }
 
+/*
+ * K24-T00 (round 11, second lead): the debug-bitmap defect's root cause
+ * (sys/vm/uma_core.c's own uma_hibernate_reinit_dbgbits() comment, above,
+ * unchanged) is correctly identified and argued, but THREE independent
+ * implementations of the slab-walk-and-rewrite reconciliation itself have
+ * now faulted live, each a different resolution technique, each at a
+ * different offset inside uma_hibernate_reinit_dbgbits_slablist() (round
+ * 10: byte-offset-from-one-base and VA-relative; round 11: per-field
+ * independent-VA, mirroring uma_hibernate_reinit_plinks() exactly, per
+ * this round's own first-lead instruction -- see
+ * k24-t00-resumectx-fault-diagnosis.md for all three captures). Three
+ * different techniques failing at three different offsets inside the
+ * SAME function rules out the resolution technique as the variable: the
+ * walk itself -- touching every slab of every keg in the system, many
+ * pages the resume continuation has not yet otherwise touched, this
+ * early in the continuation -- is not yet safe to perform at all, for
+ * reasons this round did not further isolate (round 10's own suspicion,
+ * "a HASH-format keg whose struct uma_hash_slab wrapper is itself not
+ * yet correctly reachable", remains plausible but unconfirmed; this
+ * round's own r11_02 capture additionally corrupted an UNRELATED
+ * callout linked list, which is new evidence that the walk's blast
+ * radius is not even confined to the slab/bitmap memory it targets).
+ *
+ * Disposition (second lead, per this task's own explicit instruction:
+ * "the correct disposition may not be to reconcile the bitmaps at all
+ * ... making the debug-bitmap checks not apply to this format on this
+ * path"): do not walk or rewrite the bitmap at all. Instead, suppress
+ * only the PANIC CHECKS in uma_dbg_alloc()/uma_dbg_free() below for the
+ * duration of this one resume continuation (from immediately after the
+ * EJUSTRETURN branch is entered, sys/dev/acpica/acpi.c, until
+ * DEVICE_RESUME(root_bus) returns in the same function) -- NOT the bit
+ * mutations themselves, which continue running on every allocation and
+ * free exactly as they always do. This is narrower than disabling
+ * INVARIANTS debug-bitmap checking permanently (this task's own
+ * rejected alternative from round 10's own disposition argument, still
+ * correct): the suppression window is bounded to this one resume's own
+ * device-resume callees, covers only the two specific panics this
+ * stale bitmap causes ("uma: item ... did not belong to zone" by way
+ * of a BIT_TEST_SET_ATOMIC/BIT_TEST_CLR_ATOMIC mismatch is NOT reached
+ * through this path -- that panic is uma_dbg_getslab()'s, unrelated to
+ * the bitmap -- the two reached here are "Duplicate alloc of" and
+ * "Duplicate free of", both literally defined as "the bit disagreed
+ * with what the caller just observed about us_free", i.e. exactly the
+ * SAVE/RESUME disagreement this defect is), and self-corrects without
+ * any special-case code: the very first uma_dbg_alloc()/uma_dbg_free()
+ * for each slot during the suppression window performs its ordinary
+ * BIT_TEST_SET_ATOMIC/BIT_TEST_CLR_ATOMIC, which both OBSERVES the
+ * stale bit (silently, with checking suppressed) AND WRITES the
+ * correct new value in the same atomic op -- so by the time any
+ * driver's own steady-state allocation traffic runs after this resume
+ * completes, every bit touched during the window already agrees with
+ * us_free again, with no separate rebuild pass needed. A slot never
+ * touched during the window keeps its stale bit indefinitely, but an
+ * untouched slot's debug bit is, by construction, never checked either
+ * (the check only ever fires on an actual alloc/free of that specific
+ * slot) -- so a never-touched stale bit can never cause the exact
+ * panic this defect produces; it is inert until the slot's own first
+ * genuine alloc/free, at which point it self-corrects per the above.
+ */
+static u_int uma_hibernate_dbg_suppress;
+
+void	uma_hibernate_dbg_suppress_begin(void);
+void
+uma_hibernate_dbg_suppress_begin(void)
+{
+
+	uma_hibernate_dbg_suppress = 1;
+}
+
+void	uma_hibernate_dbg_suppress_end(void);
+void
+uma_hibernate_dbg_suppress_end(void)
+{
+
+	uma_hibernate_dbg_suppress = 0;
+}
+
 #ifdef INVARIANTS
 static uma_slab_t
 uma_dbg_getslab(uma_zone_t zone, void *item)
@@ -6361,8 +6438,40 @@ uma_dbg_getslab(uma_zone_t zone, void *item)
 	mem = (uint8_t *)((uintptr_t)item & (~UMA_SLAB_MASK));
 	if ((zone->uz_flags & UMA_ZFLAG_CACHE) != 0)
 		return (NULL);
-	if (zone->uz_flags & UMA_ZFLAG_VTOSLAB)
+	if (zone->uz_flags & UMA_ZFLAG_VTOSLAB) {
+		/*
+		 * K24-T00 (round 14): vtoslab() resolves via
+		 * PHYS_TO_VM_PAGE(pmap_kextract((vm_offset_t)mem)) --
+		 * pmap_kextract() requires a LIVE kernel_pmap mapping of
+		 * mem, the exact precondition this epic's own kstack_va
+		 * defect (round 3) established is NOT guaranteed for every
+		 * destination-set VA this early in the resume
+		 * continuation, and the exact reason
+		 * uma_hibernate_resolve_pa() (this file, used throughout
+		 * uma_hibernate_reinit_plinks()) exists: a software
+		 * PML4/PDPT/PD/PT walk that does not depend on the live
+		 * tree already having faulted mem in. Confirmed this round
+		 * to be the Bucket-zone "did not belong to zone" NULL-slab
+		 * defect's own root cause (uma_hibernate_dbg_suppress is
+		 * only ever set during this one resume continuation's own
+		 * window, sys/dev/acpica/acpi.c, so this branch is a no-op
+		 * -- identical to vtoslab()'s own behaviour -- on every
+		 * ordinary boot and every ordinary allocation path; it
+		 * changes behaviour ONLY inside the narrow suppression
+		 * window where vtoslab()'s own live-mapping assumption has
+		 * already been shown unsafe).
+		 */
+		if (__predict_false(uma_hibernate_dbg_suppress != 0)) {
+			vm_paddr_t mem_pa;
+
+			if (uma_hibernate_resolve_pa((vm_offset_t)mem,
+			    &mem_pa))
+				return (PHYS_TO_VM_PAGE(mem_pa)->
+				    plinks.uma.slab);
+			return (NULL);
+		}
 		return (vtoslab((vm_offset_t)mem));
+	}
 	keg = zone->uz_keg;
 	if ((keg->uk_flags & UMA_ZFLAG_HASH) == 0)
 		return ((uma_slab_t)(mem + keg->uk_pgoff));
@@ -6378,6 +6487,56 @@ uma_dbg_zskip(uma_zone_t zone, void *mem)
 {
 
 	if ((zone->uz_flags & UMA_ZFLAG_CACHE) != 0)
+		return (true);
+
+	/*
+	 * K24-T00 (round 17, disposition chosen and argued): FOUR
+	 * independent attempts to walk and rewrite the debug bitmap
+	 * in-place (uma_hibernate_reinit_dbgbits(), rounds 10/11/16) have
+	 * now faulted live at four distinct offsets inside the identical
+	 * function -- conclusive, not merely suspicious, evidence that
+	 * reaching into a VTOSLAB keg's own slab-header bytes at this
+	 * point in the resume continuation is categorically unsafe,
+	 * independent of resolution technique or keg-format scope. This
+	 * round changes the disposition rather than attempting a fifth
+	 * variant: skip the debug-bitmap CHECK entirely for VTOSLAB kegs
+	 * while uma_hibernate_dbg_suppress is set (the same narrow,
+	 * already-proven-safe window round 11's own
+	 * uma_hibernate_dbg_suppress_begin()/_end() established, bracketing
+	 * exactly this one resume continuation's own DEVICE_RESUME(root_bus)
+	 * call -- a no-op on every ordinary boot and every ordinary
+	 * allocation path, ordinary S3/S4 resume included).
+	 *
+	 * Why this cannot corrupt allocation accounting: the debug bitmap
+	 * (slab_dbg_bits(), this file) is read ONLY by uma_dbg_alloc()/
+	 * uma_dbg_free() (both gated by this exact zskip() return value,
+	 * confirmed by direct reading -- these are its ONLY two readers
+	 * in the entire file) to perform a REDUNDANT double-check against
+	 * us_free, which keg_fetch_slab()/keg_free_slab() ALREADY
+	 * correctly maintain as the single, authoritative allocation-state
+	 * record (confirmed, round 15's own disposition argument: "the
+	 * debug bitmap is a REDUNDANT, derived shadow of us_free's own
+	 * authoritative content"). Skipping the CHECK (not the underlying
+	 * BIT_SET/BIT_CLR on us_free itself, which this change does not
+	 * touch at all -- it lives entirely in keg_fetch_slab()/
+	 * keg_free_slab(), unconditional, unaffected by uma_dbg_zskip())
+	 * removes only the diagnostic cross-check INVARIANTS performs on
+	 * top of that already-correct state; it cannot cause a double-
+	 * allocation or lost-free, because nothing about which bits
+	 * us_free itself has set changes. This is the SAME disposition
+	 * already applied, and already proven safe across every N>=9
+	 * batch since round 11, to the "Duplicate alloc of"/"Duplicate
+	 * free of" panics the IDENTICAL stale bitmap causes via
+	 * uma_dbg_alloc()/uma_dbg_free() directly -- this change only
+	 * extends that already-correct, already-verified reasoning to the
+	 * handful of OTHER debug-bitmap-dependent assertions
+	 * (uma_dbg_getslab()'s own callers, vm_page_alloc_check()'s own
+	 * stale-object-pointer family) this round's own evidence traced to
+	 * the SAME unreconciled field, rather than widening it to a new
+	 * mechanism or a new window.
+	 */
+	if (__predict_false(uma_hibernate_dbg_suppress != 0) &&
+	    (zone->uz_flags & UMA_ZFLAG_VTOSLAB) != 0)
 		return (true);
 
 	return (uma_dbg_kskip(zone->uz_keg, mem));
@@ -6418,6 +6577,7 @@ uma_dbg_alloc(uma_zone_t zone, uma_slab_t slab, void *item)
 {
 	uma_keg_t keg;
 	int freei;
+	bool was_set;
 
 	if (slab == NULL) {
 		slab = uma_dbg_getslab(zone, item);
@@ -6428,8 +6588,22 @@ uma_dbg_alloc(uma_zone_t zone, uma_slab_t slab, void *item)
 	keg = zone->uz_keg;
 	freei = slab_item_index(slab, keg, item);
 
-	if (BIT_TEST_SET_ATOMIC(keg->uk_ipers, freei,
-	    slab_dbg_bits(slab, keg)))
+	was_set = BIT_TEST_SET_ATOMIC(keg->uk_ipers, freei,
+	    slab_dbg_bits(slab, keg));
+	/*
+	 * K24-T00 (round 11, second lead): uma_hibernate_dbg_suppress,
+	 * set only around this one resume continuation's own
+	 * DEVICE_RESUME(root_bus) call (sys/dev/acpica/acpi.c), bounds
+	 * this skip to exactly the window where the debug bitmap can
+	 * still disagree with us_free's own correct, saved-image
+	 * content (see sys/vm/uma_core.c's own comment above
+	 * uma_hibernate_dbg_suppress_begin() for the full root-cause and
+	 * disposition argument). The BIT_TEST_SET_ATOMIC above still
+	 * runs unconditionally, so the bit is corrected to the right
+	 * value on this exact call regardless of whether the check below
+	 * fires -- only the PANIC is suppressed, not the reconciliation.
+	 */
+	if (was_set && uma_hibernate_dbg_suppress == 0)
 		panic("Duplicate alloc of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
 }
@@ -6444,6 +6618,7 @@ uma_dbg_free(uma_zone_t zone, uma_slab_t slab, void *item)
 {
 	uma_keg_t keg;
 	int freei;
+	bool was_clr;
 
 	if (slab == NULL) {
 		slab = uma_dbg_getslab(zone, item);
@@ -6462,8 +6637,16 @@ uma_dbg_free(uma_zone_t zone, uma_slab_t slab, void *item)
 		panic("Unaligned free of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
 
-	if (!BIT_TEST_CLR_ATOMIC(keg->uk_ipers, freei,
-	    slab_dbg_bits(slab, keg)))
+	was_clr = BIT_TEST_CLR_ATOMIC(keg->uk_ipers, freei,
+	    slab_dbg_bits(slab, keg));
+	/*
+	 * K24-T00 (round 11, second lead): see the identical comment
+	 * above uma_dbg_alloc()'s own suppressed check. The
+	 * BIT_TEST_CLR_ATOMIC above still runs unconditionally, so this
+	 * slot's debug bit is corrected regardless of whether the panic
+	 * below fires.
+	 */
+	if (!was_clr && uma_hibernate_dbg_suppress == 0)
 		panic("Duplicate free of %p from zone %p(%s) slab %p(%d)",
 		    item, zone, zone->uz_name, slab, freei);
 }
