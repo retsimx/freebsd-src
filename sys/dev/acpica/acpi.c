@@ -5053,6 +5053,15 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		PCPU_SET(curthread, saved_td);
 		PCPU_SET(curpcb, saved_td->td_pcb);
 		/*
+		 * The pre-copy and post-rebuild FPU gates cannot reach the
+		 * thread restored directly by resumectx().  Gate it before
+		 * DEVICE_RESUME() can cause its first post-resume FPU use.
+		 */
+		if (saved_td->td_md.md_usr_fpu_save != NULL) {
+			clear_pcb_flags(saved_td->td_pcb,
+			    PCB_FPUINITDONE | PCB_USERFPUINITDONE);
+		}
+		/*
 		 * K24-T00 (reconciliation, Defect B): tdq->tdq_curthread
 		 * (sys/kern/sched_ule.c's own DPCPU-backed run-queue
 		 * identity field) is a SEPARATE field from PCPU(curthread)
