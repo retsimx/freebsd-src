@@ -2460,6 +2460,15 @@ hibernate_md_dtr_valid(uint16_t limit, uint64_t base)
 	return (end >= base);
 }
 
+static int
+hib_selfcopy_pt(const struct hibernate_attempt *ha, vm_paddr_t *wvec,
+    uint64_t p, vm_offset_t va, u_int *count)
+{
+
+	return (hibernate_md_selfcopy_walk(ha, wvec, p,
+	    kernel_pmap->pm_cr3, va, false, count));
+}
+
 static bool
 hib_staged_leaf(const struct hibernate_attempt *ha,
     const vm_paddr_t *wvec, uint64_t p, vm_offset_t va,
@@ -3360,7 +3369,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			struct hib_staged_thread *threads;
-			u_int i, nthreads;
+			u_int i, nthreads, selfcopied;
 
 			threads = malloc(sizeof(*threads) *
 			    HIB_STAGED_MAX_THREADS, M_TEMP, M_NOWAIT);
@@ -3375,6 +3384,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				return (error);
 			}
 
+			selfcopied = 0;
 			for (i = 0; i < nthreads; i++) {
 				struct hibernate_md_walk walk;
 				vm_offset_t va;
@@ -3395,6 +3405,10 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					}
 					error = hibernate_md_kva_install(ha, va,
 					    walk.hmw_pa, walk.hmw_flags);
+					if (error != 0)
+						break;
+					error = hib_selfcopy_pt(ha, wvec, p, va,
+					    &selfcopied);
 					if (error != 0)
 						break;
 				}
