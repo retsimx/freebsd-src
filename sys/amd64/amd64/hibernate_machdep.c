@@ -2460,6 +2460,196 @@ hibernate_md_dtr_valid(uint16_t limit, uint64_t base)
 	return (end >= base);
 }
 
+static bool
+hib_staged_leaf(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va,
+    struct hibernate_md_walk *walk)
+{
+
+	return (hibernate_md_staged_leaf_for_live_slot(ha, wvec, p, va,
+	    walk));
+}
+
+static int
+hibernate_md_staged_read(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va, void *buf,
+    size_t len)
+{
+	struct hibernate_md_walk walk;
+	uint8_t *dst;
+	vm_offset_t cur, page_va;
+	size_t remaining, page_off, chunk;
+	vm_paddr_t live_pa;
+	uint64_t dst_idx;
+	bool resolved;
+
+	dst = buf;
+	cur = va;
+	remaining = len;
+	while (remaining > 0) {
+		page_va = trunc_page(cur);
+		page_off = (size_t)(cur - page_va);
+		chunk = MIN(PAGE_SIZE - page_off, remaining);
+		resolved = false;
+
+		if (hib_md_safe_resolve(kernel_pmap->pm_cr3, page_va,
+		    &live_pa) &&
+		    hibernate_md_dst_page_index(ha, trunc_page(live_pa),
+		    &dst_idx) == 0 && dst_idx < p) {
+			memcpy(dst, (const uint8_t *)
+			    PHYS_TO_DMAP(wvec[dst_idx]) + page_off, chunk);
+			resolved = true;
+		}
+		if (!resolved &&
+		    hibernate_md_staged_leaf_for_live_slot(ha, wvec, p,
+		    page_va, &walk) &&
+		    (walk.hmw_flags & X86_PG_V) != 0) {
+			memcpy(dst, (const uint8_t *)PHYS_TO_DMAP(walk.hmw_pa) +
+			    page_off, chunk);
+			resolved = true;
+		}
+		if (!resolved)
+			return (ENOENT);
+
+		dst += chunk;
+		cur += chunk;
+		remaining -= chunk;
+	}
+	return (0);
+}
+
+#define	HIB_STAGED_MAX_THREADS	256
+#define	HIB_STAGED_ITER_GUARD	4096
+
+struct hib_staged_thread {
+	vm_offset_t	kstack_va;
+	u_int		kstack_pages;
+};
+
+static int
+hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p, struct hib_staged_thread *out,
+    u_int max_out, u_int *n_out)
+{
+	struct pidhashhead *table;
+	struct proc **heads;
+	struct proc *proc_cursor;
+	u_long hash, i;
+	u_int chains_entered, n, swept_nonnull;
+	int error;
+
+	table = pidhashtbl;
+	hash = pidhash;
+	if (table == NULL)
+		return (EINVAL);
+
+	heads = malloc((size_t)(hash + 1) * sizeof(*heads), M_TEMP,
+	    M_NOWAIT | M_ZERO);
+	if (heads == NULL)
+		return (ENOMEM);
+
+	swept_nonnull = 0;
+	for (i = 0; i <= hash; i++) {
+		error = hibernate_md_staged_read(ha, wvec, p,
+		    (vm_offset_t)&table[i], &heads[i], sizeof(heads[i]));
+		if (error != 0)
+			continue;
+		if (heads[i] != NULL)
+			swept_nonnull++;
+	}
+
+	n = 0;
+	chains_entered = 0;
+	for (i = 0; i <= hash; i++) {
+		struct proc staged_proc;
+		u_int iter_guard;
+
+		proc_cursor = heads[i];
+		if (proc_cursor != NULL)
+			chains_entered++;
+		iter_guard = 0;
+
+		while (proc_cursor != NULL) {
+			struct thread *thread_cursor;
+			bool has_nul, proc_ok;
+			u_int k, thread_guard;
+
+			if (++iter_guard > HIB_STAGED_ITER_GUARD) {
+				error = ELOOP;
+				goto out;
+			}
+			error = hibernate_md_staged_read(ha, wvec, p,
+			    (vm_offset_t)proc_cursor, &staged_proc,
+			    sizeof(staged_proc));
+			if (error != 0)
+				break;
+
+			proc_ok = staged_proc.p_state != PRS_NEW &&
+			    staged_proc.p_state >= SIDL &&
+			    staged_proc.p_state <= SLOCK &&
+			    staged_proc.p_pid >= 0 &&
+			    staged_proc.p_pid <= PID_MAX;
+			has_nul = false;
+			for (k = 0; k < sizeof(staged_proc.p_comm); k++) {
+				if (staged_proc.p_comm[k] == '\0') {
+					has_nul = true;
+					break;
+				}
+			}
+			proc_ok = proc_ok && has_nul;
+			if (!proc_ok) {
+				proc_cursor = LIST_NEXT(&staged_proc, p_hash);
+				continue;
+			}
+
+			thread_cursor = TAILQ_FIRST(&staged_proc.p_threads);
+			thread_guard = 0;
+			while (thread_cursor != NULL) {
+				struct thread staged_thread;
+				vm_offset_t kva;
+
+				if (++thread_guard > HIB_STAGED_ITER_GUARD) {
+					error = ELOOP;
+					goto out;
+				}
+				error = hibernate_md_staged_read(ha, wvec, p,
+				    (vm_offset_t)thread_cursor,
+				    &staged_thread, sizeof(staged_thread));
+				if (error != 0)
+					break;
+
+				kva = trunc_page(
+				    (vm_offset_t)staged_thread.td_kstack);
+				if (kva >= VM_MIN_KERNEL_ADDRESS &&
+				    kva < VM_MAX_KERNEL_ADDRESS &&
+				    ((vm_offset_t)staged_thread.td_kstack &
+				    PAGE_MASK) == 0 &&
+				    staged_thread.td_kstack_pages > 0 &&
+				    staged_thread.td_kstack_pages <=
+				    KSTACK_PAGES && n < max_out) {
+					out[n].kstack_va = kva;
+					out[n].kstack_pages =
+					    staged_thread.td_kstack_pages;
+					n++;
+				}
+				thread_cursor = TAILQ_NEXT(&staged_thread,
+				    td_plist);
+			}
+			proc_cursor = LIST_NEXT(&staged_proc, p_hash);
+		}
+	}
+
+	if (swept_nonnull != chains_entered) {
+		error = EDOOFUS;
+		goto out;
+	}
+	*n_out = n;
+	error = 0;
+out:
+	free(heads, M_TEMP);
+	return (error);
+}
+
 int
 hibernate_machdep_prepare(struct hibernate_attempt *ha)
 {
@@ -3167,6 +3357,51 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					return (EINVAL);
 				error = install_err;
 			}
+		}
+		if (error == 0) {
+			struct hib_staged_thread *threads;
+			u_int i, nthreads;
+
+			threads = malloc(sizeof(*threads) *
+			    HIB_STAGED_MAX_THREADS, M_TEMP, M_NOWAIT);
+			if (threads == NULL)
+				return (ENOMEM);
+
+			error = hibernate_md_enumerate_staged_threads(ha,
+			    wvec, p, threads, HIB_STAGED_MAX_THREADS,
+			    &nthreads);
+			if (error != 0) {
+				free(threads, M_TEMP);
+				return (error);
+			}
+
+			for (i = 0; i < nthreads; i++) {
+				struct hibernate_md_walk walk;
+				vm_offset_t va;
+				bool resolved;
+				u_int pg;
+
+				for (pg = 0; pg < threads[i].kstack_pages;
+				    pg++) {
+					va = threads[i].kstack_va +
+					    (vm_offset_t)pg * PAGE_SIZE;
+					resolved = hib_staged_leaf(ha, wvec, p,
+					    va, &walk);
+					if (!resolved || (walk.hmw_flags &
+					    (X86_PG_V | X86_PG_RW)) !=
+					    (X86_PG_V | X86_PG_RW)) {
+						error = EINVAL;
+						break;
+					}
+					error = hibernate_md_kva_install(ha, va,
+					    walk.hmw_pa, walk.hmw_flags);
+					if (error != 0)
+						break;
+				}
+				if (error != 0)
+					break;
+			}
+			free(threads, M_TEMP);
 		}
 		if (error == 0) {
 			/*
