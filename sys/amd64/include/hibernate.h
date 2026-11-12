@@ -173,6 +173,11 @@ int hibernate_amd64_xsave_collect(void *buf, size_t buf_capacity,
  */
 int hibernate_amd64_pcb_populate(const struct hibernate_save_pcb *hpcb,
     const struct hibernate_xsave_terminal *xt, struct hibernate_pcb *pcb);
+
+struct hibernate_attempt;
+int hibernate_md_selfcopy_range(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, vm_offset_t va, size_t len,
+    u_int *countp);
 int hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb,
     bool *refuse_la57, bool *refuse_mtrr);
 

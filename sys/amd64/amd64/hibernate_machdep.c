@@ -27,15 +27,19 @@
 #include <sys/endian.h>
 #include <sys/errno.h>
 #include <sys/hibernate.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
+#include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
+#include <sys/sx.h>
 #include <sys/timetc.h>
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
 #include <vm/vm_page.h>
+#include <vm/vm_pagequeue.h>
 #include <vm/vm_param.h>
 
 #include <machine/cpufunc.h>
@@ -727,6 +731,15 @@ hibernate_resume_ap_entry(u_int cpu)
  * yet landed and hibernate_restore_kernel's prototype lives nowhere public.
  */
 extern void hibernate_restore_kernel(void) __dead2;
+
+void	callout_cpu_hibernate_selfcopy_range(int cpu, uintptr_t *va_out,
+	    size_t *len_out);
+void	dumpsys_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out);
+void	sleepq_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out);
+void	turnstile_hibernate_selfcopy_range(uintptr_t *va_out,
+	    size_t *len_out);
+void	witness_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out);
+void	sched_idletd(void *);
 
 static vm_paddr_t hibernate_md_arena_header_pa;
 static vm_paddr_t hibernate_md_xsave_pa;
@@ -1748,6 +1761,57 @@ hibernate_md_selfcopy_page(const struct hibernate_attempt *ha,
  * about a different failure shape instead).
  */
 static bool
+hib_md_safe_resolve(vm_paddr_t root_pa, vm_offset_t va, vm_paddr_t *pa_out)
+{
+	pml4_entry_t *pml4;
+	pdp_entry_t *pdp;
+	pd_entry_t *pd;
+	pt_entry_t *pt;
+	vm_paddr_t table_pa;
+	uint64_t entry;
+	u_int index;
+
+	table_pa = root_pa & PG_FRAME;
+	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = pml4[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	pdp = (pdp_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = pdp[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_PDP_FRAME) | (va & PDPMASK)) &
+		    PG_FRAME;
+		return (true);
+	}
+
+	table_pa = entry & PG_FRAME;
+	pd = (pd_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = pd[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_FRAME) | (va & PDRMASK)) & PG_FRAME;
+		return (true);
+	}
+
+	table_pa = entry & PG_FRAME;
+	pt = (pt_entry_t *)PHYS_TO_DMAP(table_pa);
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = pt[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+	*pa_out = (entry & PG_FRAME) | (va & PAGE_MASK);
+	return (true);
+}
+
+static bool
 hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
     const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
     struct hibernate_md_walk *walk)
@@ -2043,6 +2107,22 @@ hibernate_md_selfcopy_walk(const struct hibernate_attempt *ha,
 	if (did)
 		(*countp)++;
 	return (0);
+}
+
+int
+hibernate_md_selfcopy_range(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, vm_offset_t va, size_t len, u_int *countp)
+{
+	vm_offset_t va_start, va_end;
+	int error;
+
+	va_start = trunc_page(va);
+	va_end = round_page(va + len);
+	error = 0;
+	for (; va_start < va_end && error == 0; va_start += PAGE_SIZE)
+		error = hibernate_md_selfcopy_walk(ha, wvec, p,
+		    kernel_pmap->pm_cr3, va_start, true, countp);
+	return (error);
 }
 
 /*
@@ -2690,7 +2770,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * function scope, assigned inside that block, read at the later
 	 * site.
 	 */
-	register_t k24t00_kstack_va = 0;
+	register_t k24t00_kstack_va __unused = 0;
 	/*
 	 * staged_pcb->pcb_save is read inside the kstack_va block below,
 	 * whose own braces close before this value is needed again (the
@@ -2698,7 +2778,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * at function scope exactly like k24t00_kstack_va immediately
 	 * above, for the identical reason.
 	 */
-	struct savefpu *k24t00_staged_fpu_save = NULL;
+	struct savefpu *k24t00_staged_fpu_save __unused = NULL;
 
 	/* 1. Preconditions. */
 	if (ha == NULL)

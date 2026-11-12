@@ -502,7 +502,7 @@ dumpsys_hibernate_free_hcb(struct hibernate_save_cb *hcb)
 #endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
 
 #ifndef _HIBERNATE_DUMP_EXTENT_TEST
-static dumper_start_t dumpsys_hibernate_start;
+static dumper_start_t dumpsys_hibernate_start __unused;
 #endif /* !_HIBERNATE_DUMP_EXTENT_TEST */
 
 

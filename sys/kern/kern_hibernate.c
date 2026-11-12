@@ -1724,7 +1724,7 @@ SYSCTL_ULONG(_kern_hibernate, OID_AUTO, restore_footprint_effective, CTLFLAG_RD,
  * hib_pages_roundup: round byte count up to whole pages.
  * Returns EOVERFLOW when the result would overflow uint64_t.
  */
-static int
+static int __unused
 hib_pages_roundup(uint64_t bytes, uint64_t *pages_out)
 {
 	uint64_t pg, rounded;
