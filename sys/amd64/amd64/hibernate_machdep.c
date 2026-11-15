@@ -4668,6 +4668,39 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			}
 
 			/*
+			 * struct
+			 * acpi_pci_devinfo's own ap_handle field (sys/dev/
+			 * acpica/acpi_pci.c) is a SEPARATE malloc(M_DEVBUF)
+			 * allocation this boot's own cold PCI bus scan
+			 * performs during ordinary device-attach processing
+			 * (acpi_pci_alloc_devinfo()/acpi_pci_save_handle())
+			 * -- LIVE RESUME-KERNEL STATE by the same rule just
+			 * applied to the ACPI power-resource nodes above, but
+			 * never swept here because it lives in a different
+			 * file and is reached via a different call path
+			 * (acpi_get_handle(child) inside
+			 * acpi_pci_set_powerstate_method(), not the TAILQ-
+			 * based power-resource lists). Confirmed by direct
+			 * live capture this round: acpi_get_handle(child)
+			 * returned a handle AcpiGetType() rejected immediately
+			 * (AE_BAD_PARAMETER) on its very first post-resume use,
+			 * for device hostb0, whose own acpi_pci_devinfo the
+			 * K-10 copy's destination set evidently still
+			 * overlapped. copy_leaf is true: this boot's own cold
+			 * PCI scan already populated ap_handle correctly from
+			 * its own, live ACPI namespace; there is no
+			 * saved-image content worth restoring.
+			 */
+			if (error == 0) {
+				extern int
+				acpi_pci_hibernate_selfcopy_devinfo(
+				    const struct hibernate_attempt *ha,
+				    vm_paddr_t *wvec, uint64_t p,
+				    u_int *countp);
+				error = acpi_pci_hibernate_selfcopy_devinfo(
+				    ha, wvec, p, &selfcopied);
+			}
+			/*
 			 * install the
 			 * SAVE-SIDE __stack_chk_guard[0] into the live global,
 			 * the opposite disposition from every self-copy

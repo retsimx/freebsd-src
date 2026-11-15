@@ -92,6 +92,85 @@ hibernate_md_pci_powerstate_sxlock_va(vm_offset_t *va, size_t *len)
 	*len = sizeof(pci_powerstate_sxlock);
 }
 
+/*
+ * struct acpi_pci_devinfo (above),
+ * specifically its own ap_handle field, is a malloc(M_DEVBUF)-backed
+ * allocation this boot's own cold PCI bus scan performs during ordinary
+ * device-attach processing (acpi_pci_alloc_devinfo()/
+ * acpi_pci_save_handle(), above) -- LIVE RESUME-KERNEL STATE by the
+ * same rule already established and fixed for acpi_powerresources/
+ * acpi_powerconsumers (sys/dev/acpica/acpi_powerres.c, round 12/14):
+ * never added to that sweep because it lives in a DIFFERENT file and
+ * is reached via a DIFFERENT call path (acpi_get_handle(child) inside
+ * acpi_pci_set_powerstate_method(), not the TAILQ-based power-resource
+ * lists). Confirmed directly this round: a live capture showed
+ * acpi_get_handle(child) returning a handle that AcpiGetType() rejects
+ * immediately (AE_BAD_PARAMETER) on its very FIRST use post-resume, for
+ * a device (hostb0) whose own acpi_pci_devinfo the K-10 copy's
+ * destination set evidently still overlaps. If the K-10 copy
+ * overwrites this struct with the SAVE kernel's own, unrelated content,
+ * every subsequent acpi_get_handle()/acpi_pwr_switch_consumer() call
+ * for that device reads a foreign/stale ACPI_HANDLE. copy_leaf is
+ * true: this boot's own cold PCI scan already populated ap_handle
+ * correctly from its own, live ACPI namespace; there is no saved-image
+ * content worth restoring.
+ */
+struct hibernate_attempt;
+int	acpi_pci_hibernate_selfcopy_devinfo(
+	    const struct hibernate_attempt *ha, vm_paddr_t *wvec, uint64_t p,
+	    u_int *countp);
+int
+acpi_pci_hibernate_selfcopy_devinfo(const struct hibernate_attempt *ha,
+    vm_paddr_t *wvec, uint64_t p, u_int *countp)
+{
+	devclass_t dc;
+	device_t *buses, *children;
+	device_t bus, child;
+	int nbuses, nchildren, i, j;
+	int error;
+	u_int walked, protected_count, skipped_noivars;
+	extern int hibernate_md_selfcopy_range(const struct hibernate_attempt *,
+	    vm_paddr_t *, uint64_t, vm_offset_t, size_t, u_int *);
+
+	walked = 0;
+	protected_count = 0;
+	skipped_noivars = 0;
+
+	dc = devclass_find("pci");
+	if (dc == NULL)
+		return (0);
+	if (devclass_get_devices(dc, &buses, &nbuses) != 0)
+		return (0);
+	for (i = 0; i < nbuses; i++) {
+		bus = buses[i];
+		if (device_get_children(bus, &children, &nchildren) != 0)
+			continue;
+		for (j = 0; j < nchildren; j++) {
+			child = children[j];
+			walked++;
+			if (device_get_ivars(child) == NULL) {
+				skipped_noivars++;
+				continue;
+			}
+			error = hibernate_md_selfcopy_range(ha, wvec, p,
+			    (vm_offset_t)device_get_ivars(child),
+			    sizeof(struct acpi_pci_devinfo), countp);
+			if (error != 0) {
+				free(children, M_TEMP);
+				free(buses, M_TEMP);
+				return (error);
+			}
+			protected_count++;
+		}
+		free(children, M_TEMP);
+	}
+	free(buses, M_TEMP);
+	(void)walked;
+	(void)protected_count;
+	(void)skipped_noivars;
+	return (0);
+}
+
 /* Be sure that ACPI and PCI power states are equivalent. */
 CTASSERT(ACPI_STATE_D0 == PCI_POWERSTATE_D0);
 CTASSERT(ACPI_STATE_D1 == PCI_POWERSTATE_D1);
