@@ -70,6 +70,20 @@
 extern struct susppcb **susppcbs;
 
 /*
+ * __stack_chk_guard's own genuine
+ * staged-image content, captured by hibernate_machdep_prepare() (this
+ * file) immediately after its own source vector becomes valid, for
+ * hibernate_resume_attempt() (sys/kern/kern_hibernate.c) to install
+ * into the live __stack_chk_guard[0] AFTER hibernate_machdep_prepare()
+ * has itself already returned -- see hibernate_machdep_prepare()'s own
+ * hib_guard_image_value local-variable comment for why installing it
+ * from inside that function's own body panicked that function's own
+ * currently-executing frame (reproduced 3/3) and was reverted there.
+ */
+uint64_t hib_guard_image_value_g;
+bool hib_guard_captured_g;
+
+/*
  * Setup transient 1:1 mapping of low 4 GiB in kernel_pmap
  * mirroring mp_machdep.c:355-399.
  *
@@ -2779,6 +2793,36 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * above, for the identical reason.
 	 */
 	struct savefpu *k24t00_staged_fpu_save __unused = NULL;
+	/*
+	 * __stack_chk_guard's own genuine
+	 * staged source-vector content, captured ONCE immediately after
+	 * wvec becomes valid and BEFORE any later hibernate_md_selfcopy_walk()
+	 * sweep in this same function can overwrite that shared destination
+	 * index's entry to the LIVE page (self-referential "preserve as-is"
+	 * protection; confirmed this round, via direct diagnostic, that at
+	 * least one later sweep's own VA range resolves to the SAME physical
+	 * page as __stack_chk_guard, silently clobbering wvec[idx] before
+	 * any later read reaches it -- hibernate_md_staged_read()'s prior
+	 * use at the original, later insertion point was reading an
+	 * already-overwritten entry, not a primitive defect).  0 is a valid
+	 * sentinel-adjacent possibility in principle but vanishingly
+	 * unlikely for a 64-bit arc4rand() value; hib_guard_captured
+	 * distinguishes "never captured" from "captured, value happens to be
+	 * zero" unambiguously.
+	 *
+	 * Promoted to file-scope globals (hib_guard_image_value_g /
+	 * hib_guard_captured_g, declared below, outside this function) so
+	 * hibernate_resume_attempt() (sys/kern/kern_hibernate.c) can install
+	 * the value AFTER this function has already returned -- installing
+	 * it HERE, inside this function's own body, was tried and reverted:
+	 * it broke this function's OWN currently-executing frame (its
+	 * prologue stored the OLD guard; changing the global before this
+	 * function's own epilogue runs made ITS OWN return panic,
+	 * reproduced 3/3).  The local copies below remain for this
+	 * function's own diagnostic print.
+	 */
+	uint64_t hib_guard_image_value = 0;
+	bool hib_guard_captured = false;
 
 	/* 1. Preconditions. */
 	if (ha == NULL)
@@ -3051,6 +3095,41 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		 */
 		wvec = (vm_paddr_t *)(uintptr_t)vector_va;
 		selfcopied = 0;
+
+		/*
+		 * capture __stack_chk_guard's
+		 * own genuine wvec[] entry HERE, before the very first
+		 * hibernate_md_selfcopy_walk() call in this function has any
+		 * chance to overwrite a shared destination index.  See the
+		 * function-scope hib_guard_image_value comment above for
+		 * the full root-cause account of why the ORIGINAL, later
+		 * read point returned a tautological (already-live)  value.
+		 */
+		{
+			extern long __stack_chk_guard[8];
+			vm_paddr_t hib_guard_live_pa;
+			uint64_t hib_guard_dst_idx;
+
+			if (hib_md_safe_resolve(kernel_pmap->pm_cr3,
+			    trunc_page((vm_offset_t)__stack_chk_guard),
+			    &hib_guard_live_pa) &&
+			    hibernate_md_dst_page_index(ha,
+			    trunc_page(hib_guard_live_pa),
+			    &hib_guard_dst_idx) == 0 &&
+			    hib_guard_dst_idx < p) {
+				size_t hib_guard_pgoff;
+
+				hib_guard_pgoff = (size_t)
+				    ((vm_offset_t)__stack_chk_guard &
+				    PAGE_MASK);
+				memcpy(&hib_guard_image_value,
+				    (const uint8_t *)PHYS_TO_DMAP(
+				    wvec[hib_guard_dst_idx]) +
+				    hib_guard_pgoff,
+				    sizeof(hib_guard_image_value));
+				hib_guard_captured = true;
+			}
+		}
 		error = hibernate_md_selfcopy_walk(ha, wvec, p,
 		    kernel_pmap->pm_cr3, trampoline_saved_va, true,
 		    &selfcopied);
@@ -4587,7 +4666,127 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				error = acpi_powerres_hibernate_selfcopy_nodes(
 				    ha, wvec, p, &selfcopied);
 			}
-		}
+
+			/*
+			 * install the
+			 * SAVE-SIDE __stack_chk_guard[0] into the live global,
+			 * the opposite disposition from every self-copy
+			 * protect call above.  Root-caused this round with
+			 * side-by-side evidence, not inference: at
+			 * __stack_chk_fail() in sched_ule_switch()'s own
+			 * frame, the canary slot sched_ule_switch()'s own
+			 * prologue stored at function entry
+			 * (-0x30(%rbp), confirmed by direct objdump of this
+			 * build's own kernel.full) equals the IMAGE's own
+			 * __stack_chk_guard[0] (read directly from the
+			 * on-disk ABI 1 image's own PT_LOAD payload at the
+			 * physical address the LIVE resume kernel's own page
+			 * tables resolve for __stack_chk_guard's VA -- not
+			 * inferred, cross-checked byte-for-byte across
+			 * multiple independent captures), while the LIVE
+			 * global __stack_chk_guard[0] is a DIFFERENT value
+			 * every capture (each boot's own fresh SI_SUB_RANDOM
+			 * arc4rand() reseed, confirmed by
+			 * __stack_chk_init()'s own SYSINIT ordering, which
+			 * runs again on this resume kernel's OWN cold boot,
+			 * before any hibernate resume logic executes).  The
+			 * faulting thread in every capture is this CPU's own
+			 * BSP idle thread (pid 11 tid 100003, confirmed by
+			 * the KDB "[ thread pid ... ]" banner in every
+			 * capture) -- its kstack is a genuine K-10
+			 * destination-set page (the dormant frame Residual 1
+			 * already named as unreseedable), so its existing
+			 * stack frame's canary was computed with the SAVE
+			 * kernel's own guard value and is restored verbatim
+			 * by the destructive copy, but the comparison it is
+			 * later checked against uses whichever
+			 * __stack_chk_guard this resume kernel's own cold
+			 * boot happened to generate -- a genuine two-kernel
+			 * value conflict, not a self-inflicted "compare value
+			 * X against itself" no-op (the prior, already-
+			 * reverted "generalized guard-reconcile" attempt
+			 * read/wrote the SAME resume-kernel global on both
+			 * sides of its own comparison, which is why it
+			 * measured no effect).
+			 *
+			 * copy_leaf is explicitly false here: unlike ap_handle
+			 * or the power-resource nodes (this boot's own cold-
+			 * attach state, correctly preserved), the correct
+			 * value for a dormant, image-restored thread frame to
+			 * compare against is the image's OWN frozen guard,
+			 * since that frame's own canary was computed under
+			 * that value and will never be re-stored before this
+			 * thread's own cpu_switch() epilogue checks it.  This
+			 * mirrors saved_pcb_va/the suspended kstack's own
+			 * "content must be the save-time captured bytes" rule
+			 * immediately below, not the copy_leaf=true rule.
+			 *
+			 * Read via hibernate_md_staged_read() (the existing,
+			 * already-proven staged-byte accessor used by the
+			 * K-10 copy loop itself), at MD_PREPARE time, strictly
+			 * before the destructive copy runs, so the read
+			 * itself takes no lock and calls nothing that could
+			 * (same safety class as every other MD_PREPARE sweep
+			 * on this path).  A read failure (ENOENT: the guard's
+			 * own page is not resolvable in the staged image,
+			 * e.g. an all-RAM hibernate where the page genuinely
+			 * is not part of any destination run) is treated as a
+			 * silent no-op, not a hard error -- the live value is
+			 * then left exactly as this resume kernel's own cold
+			 * boot set it, the pre-existing, already-characterized
+			 * baseline behavior.
+			 */
+			if (error == 0) {
+				/*
+				 * REVERTED --
+				 * installing hib_guard_image_value into
+				 * the live __stack_chk_guard[0] HERE panicked
+				 * hibernate_machdep_prepare() ITSELF, 3/3
+				 * reproductions, deterministic
+				 * (__stack_chk_fail() <- hibernate_machdep_
+				 * prepare() <- hibernate_resume_attempt() <-
+				 * g_hibernate_worker(), confirmed by direct
+				 * backtrace capture): this function's own
+				 * currently-executing C frame was compiled
+				 * against the OLD live guard value at its own
+				 * entry, and its own epilogue compares against
+				 * whatever __stack_chk_guard holds at RETURN
+				 * time -- changing the global mid-function
+				 * breaks every live C frame still relying on
+				 * continuity (this function's own, plus every
+				 * caller up the still-executing chain:
+				 * hibernate_resume_attempt(),
+				 * g_hibernate_worker(), fork_exit()), not just
+				 * the dormant image-restored idle thread this
+				 * fix targeted.  The capture itself is proven
+				 * correct (the staged value was confirmed
+				 * distinct from the live global in every
+				 * run) -- only the INSTALL POINT here was
+				 * wrong.  This function therefore only
+				 * captures and publishes the value; the
+				 * install itself is done by
+				 * hibernate_resume_attempt() (kern_
+				 * hibernate.c), immediately before the
+				 * no-return hibernate_machdep_enter()
+				 * call, after every resume-kernel C frame
+				 * expected to survive has already returned.
+				 */
+				extern long __stack_chk_guard[8];
+
+				/*
+				 * Publish to the file-scope globals for
+				 * hibernate_resume_attempt() to install
+				 * AFTER this function has returned (see the
+				 * function-scope declaration's own comment
+				 * above for why installing HERE panicked
+				 * this function's own frame, reproduced
+				 * 3/3).  No write to __stack_chk_guard in
+				 * this function.
+				 */
+				hib_guard_image_value_g =
+				    hib_guard_image_value;
+				hib_guard_captured_g = hib_guard_captured;
+			}		}
 		if (error == 0) {
 			/*
 			 * The save-side hcb allocation (sys/kern/kern_dump.c) is a

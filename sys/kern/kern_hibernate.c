@@ -5998,7 +5998,44 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		goto cleanup;
 
 	(void)intr_disable();
-#endif
+
+	/*
+	 * install __stack_chk_guard's own
+	 * genuine staged-image value HERE, immediately before the no-return
+	 * transition, not inside hibernate_machdep_prepare() itself (tried
+	 * and reverted there -- see that function's own comment: changing
+	 * the live global mid-function broke ITS OWN currently-executing
+	 * frame's epilogue check, reproduced 3/3).
+	 *
+	 * This point is safe because hibernate_resume_attempt() (this
+	 * function) does not return normally past this call on the success
+	 * path: hibernate_machdep_enter() is itself no-return (the K-10
+	 * destructive copy and resumectx() jump happen inside it), so this
+	 * function's own epilogue -- which would check the OLD guard value
+	 * its own prologue stored -- is never reached here.  No other
+	 * resume-kernel C frame executes between this write and the
+	 * no-return call: intr_disable() has already run (no further
+	 * interrupt-driven code can observe the change before the copy),
+	 * and hibernate_machdep_enter() takes no locks.
+	 *
+	 * The idle thread's own dormant kstack frame (the confirmed
+	 * faulting thread, pid 11 tid 100003, Residual 1) is restored
+	 * verbatim by the destructive copy immediately inside
+	 * hibernate_machdep_enter() and will check against whatever
+	 * __stack_chk_guard holds AFTER that copy -- i.e. exactly the value
+	 * installed here, by construction.  This is the consistent choice:
+	 * the image's own value, not the resume kernel's cold-boot value,
+	 * because the dormant frame's own canary was computed under the
+	 * image's value and cannot itself be changed (it is dead, saved-
+	 * image byte content, not live code).
+	 */
+	extern uint64_t hib_guard_image_value_g;
+	extern bool hib_guard_captured_g;
+	extern long __stack_chk_guard[8];
+
+	if (hib_guard_captured_g) {
+		__stack_chk_guard[0] = (long)hib_guard_image_value_g;
+	}#endif
 	hibernate_machdep_enter();
 
 classify_non_pending:
