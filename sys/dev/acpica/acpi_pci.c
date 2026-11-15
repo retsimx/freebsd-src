@@ -126,6 +126,8 @@ acpi_pci_hibernate_selfcopy_devinfo(const struct hibernate_attempt *ha,
 	devclass_t dc;
 	device_t *buses, *children;
 	device_t bus, child;
+	struct pci_devinfo *pdinfo;
+	struct pci_map *pm;
 	int nbuses, nchildren, i, j;
 	int error;
 	u_int walked, protected_count, skipped_noivars;
@@ -155,6 +157,20 @@ acpi_pci_hibernate_selfcopy_devinfo(const struct hibernate_attempt *ha,
 			error = hibernate_md_selfcopy_range(ha, wvec, p,
 			    (vm_offset_t)device_get_ivars(child),
 			    sizeof(struct acpi_pci_devinfo), countp);
+			/*
+			 * The BAR list nodes hanging off cfg.maps are separate
+			 * M_DEVBUF allocations from this boot's cold PCI scan.
+			 * Protecting only the devinfo keeps the list head but
+			 * lets the copy overwrite the nodes, and
+			 * pci_restore_bars() then walks freed memory.
+			 */
+			pdinfo = device_get_ivars(child);
+			STAILQ_FOREACH(pm, &pdinfo->cfg.maps, pm_link) {
+				if (error != 0)
+					break;
+				error = hibernate_md_selfcopy_range(ha, wvec, p,
+				    (vm_offset_t)pm, sizeof(*pm), countp);
+			}
 			if (error != 0) {
 				free(children, M_TEMP);
 				free(buses, M_TEMP);
