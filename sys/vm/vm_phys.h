@@ -134,7 +134,7 @@ int vm_phys_hibernate_reserve_count(struct hibernate_attempt *ha, size_t count,
     struct vm_phys_reservation *res);
 void vm_phys_hibernate_release(struct vm_phys_reservation *res);
 /*
- * K24-T00 (reconciliation round 2): narrow accessor, see sys/vm/vm_phys.c
+ * narrow accessor, see sys/vm/vm_phys.c
  * for the full comment.
  */
 void hibernate_md_vm_phys_free_queues_va(vm_offset_t *va, size_t *len);

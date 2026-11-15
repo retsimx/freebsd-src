@@ -68,7 +68,7 @@ int		vm_reserv_size(int level);
 vm_paddr_t	vm_reserv_startup(vm_offset_t *vaddr, vm_paddr_t end);
 vm_page_t	vm_reserv_to_superpage(vm_page_t m);
 /*
- * K24-T00 (lead 2): narrow accessor exposing vm_reserv_array's own VA
+ * narrow accessor exposing vm_reserv_array's own VA
  * and byte size to sys/amd64/amd64/hibernate_machdep.c. Declared here
  * (not in a hibernate-specific header) matching this file's own
  * existing convention -- sys/vm/vm_phys.h declares
@@ -76,7 +76,7 @@ vm_page_t	vm_reserv_to_superpage(vm_page_t m);
  */
 void		hibernate_md_vm_reserv_array_va(vm_offset_t *va, size_t *len);
 /*
- * K24-T00 (exhaustive sweep): narrow accessors for vm_rvd[]/
+ * narrow accessors for vm_rvd[]/
  * vm_reserv_object_mtx[], mirroring hibernate_md_vm_reserv_array_va()'s
  * own convention exactly. See sys/vm/vm_reserv.c for the full comment.
  */

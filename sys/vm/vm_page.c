@@ -128,7 +128,7 @@ static int vm_severe_waiters;
 static int vm_pageproc_waiters;
 
 /*
- * K24-T00 (exhaustive sweep): vm_domainset_lock plus the domain-state
+ * vm_domainset_lock plus the domain-state
  * fields it protects (vm_min_domains/vm_severe_domains, this file,
  * directly above) -- ordinary BSS globals the vm_wait()/vm_wait_min()/
  * vm_wakeup() family locks and reads on every low-memory wait/wake

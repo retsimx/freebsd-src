@@ -151,7 +151,7 @@ static struct mtx td_contested_lock;
 static struct turnstile_chain turnstile_chains[TC_TABLESIZE];
 
 /*
- * K24-T00 (round 42): expose turnstile_chains[]'s own byte range for
+ * expose turnstile_chains[]'s own byte range for
  * hibernate_machdep_prepare()'s self-copy protection, matching the
  * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
  * file has no public header to declare a prototype in otherwise.
@@ -167,7 +167,7 @@ turnstile_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
 }
 
 /*
- * K24-T00 (round 44): structural fix, matching
+ * structural fix, matching
  * sleepq_hibernate_reinit_chains()'s own reasoning exactly --
  * turnstile_chains[] is the identical shape of registry (pending
  * priority-propagating lock contention, keyed by the lock object, not

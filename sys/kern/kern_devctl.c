@@ -99,8 +99,7 @@ static void devctl_detach_handler(void *arg __unused, device_t dev,
 static void devctl_nomatch_handler(void *arg __unused, device_t dev);
 
 /*
- * K24-T00 (sibling sweep, defect 4 of 5 -- devctl_queue corruption,
- * CORRECTED disposition): the first attempt at this fix self-copy
+ * the first attempt at this fix self-copy
  * protected devsoftc's own fields (treating it as "live content this
  * boot already built correctly") -- live N-run evidence shows this
  * does NOT close the defect: devsoftc.devq is not necessarily EMPTY

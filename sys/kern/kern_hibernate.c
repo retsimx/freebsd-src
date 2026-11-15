@@ -2054,7 +2054,7 @@ hibernate_barrier_unwind(struct hibernate_attempt *ha,
 	if (s & HIB_STAGE_RESERVED) {
 		hibernate_barrier_retract_attempt();
 		/*
-		 * K24-T00: acpi_s4_resume_discard_snapshot() zeroes
+		 * acpi_s4_resume_discard_snapshot() zeroes
 		 * curthread->td_critnest and td_md.md_spinlock_count on the
 		 * EJUSTRETURN resume path before this function is reached
 		 * (sys/dev/acpica/acpi.c), precisely because the restored

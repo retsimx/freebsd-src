@@ -107,7 +107,7 @@ static struct mtx rman_mtx; /* mutex to protect rman_head */
 MTX_SYSINIT(rman_mtx, &rman_mtx, "rman head", MTX_DEF);
 
 /*
- * K24-T00 (disposition b, live-captured root cause): rman_head/rman_mtx
+ * rman_head/rman_mtx
  * -- the static registry every struct rman (irq_rman, drq_rman,
  * port_rman, mem_rman, and every bus-specific rman created via
  * rman_init()) is linked onto -- and every struct resource_i node

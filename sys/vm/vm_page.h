@@ -465,7 +465,7 @@ vm_page_t PHYS_TO_VM_PAGE(vm_paddr_t pa);
 #define	DMAP_TO_VM_PAGE(va)	PHYS_TO_VM_PAGE(DMAP_TO_PHYS(va))
 
 /*
- * K24-T00 (exhaustive sweep): narrow accessor for vm_domainset_lock and
+ * narrow accessor for vm_domainset_lock and
  * the domain-state fields it protects, mirroring
  * hibernate_md_vm_reserv_array_va()'s own convention. See
  * sys/vm/vm_page.c for the full comment.

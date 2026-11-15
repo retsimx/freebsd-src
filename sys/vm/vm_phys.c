@@ -2242,7 +2242,7 @@ hib_append_page(struct vm_phys_reservation *res, vm_page_t m,
 }
 
 /*
- * K24-T00 (reconciliation round 2): hibernate_md_vm_phys_free_queues_va()
+ * hibernate_md_vm_phys_free_queues_va()
  * -- a narrow accessor exposing vm_phys_free_queues's own VA and total
  * byte size to sys/amd64/amd64/hibernate_machdep.c, whose self-copy-walk
  * fix needs this address but cannot see the file-static array directly
@@ -2258,7 +2258,7 @@ hibernate_md_vm_phys_free_queues_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (T23): close the vm_page_array/vm_phys_free_queues disagreement
+ * close the vm_page_array/vm_phys_free_queues disagreement
  * `vm_page_alloc_check()`'s own "page ... has object" panic reaches
  * (reproduced three times this epic, every capture naming
  * kernel_object_store as the claiming object, via vm_page_alloc_noobj_
@@ -2267,8 +2267,7 @@ hibernate_md_vm_phys_free_queues_va(vm_offset_t *va, size_t *len)
  * (both already correctly self-copy-protected, round 59) say is NOT
  * free at all).
  *
- * Two-sided overlap, pinned directly from a live capture (K24T00-T20/
- * T22): the SAME page simultaneously satisfies (a) kernel_object's own
+ * Two-sided overlap, pinned directly from a live capture: the SAME page simultaneously satisfies (a) kernel_object's own
  * ownership claim -- m->object == &kernel_object_store, m->ref_count ==
  * VPRC_OBJREF|1 (genuinely wired), m->busy_lock exclusive-busy, not
  * VPB_FREED/VPB_UNBUSIED -- and (b) the free-list path's own membership
@@ -2379,7 +2378,7 @@ vm_phys_hibernate_reconcile_object_owned(void)
 }
 
 /*
- * K24-T00: vm_phys_segs[], the per-segment physical-memory descriptor
+ * vm_phys_segs[], the per-segment physical-memory descriptor
  * array -- sibling to vm_phys_free_queues and vm_reserv_array (both
  * already self-copy protected in hibernate_machdep_prepare()), and
  * read by the identical allocator call chain

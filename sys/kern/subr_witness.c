@@ -470,7 +470,7 @@ SYSCTL_PROC(_debug_witness, OID_AUTO, badstacks,
 static struct mtx w_mtx;
 
 /*
- * K24-T00 (round 42): expose w_mtx's own byte range for
+ * expose w_mtx's own byte range for
  * hibernate_machdep_prepare()'s self-copy protection, matching the
  * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
  * file has no public header to declare a prototype in otherwise.

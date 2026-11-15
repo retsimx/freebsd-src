@@ -351,7 +351,7 @@ static struct tdq	tdq_cpu;
 #define	TDQ_LOCK_ASSERT(t, type)	mtx_assert(TDQ_LOCKPTR((t)), (type))
 
 /*
- * K24-T00 (reconciliation, Defect B): reseed this CPU's own run-queue
+ * reseed this CPU's own run-queue
  * identity field (tdq->tdq_curthread) to the resumed thread, mirroring
  * hibernate_coordinator_mtx_reseed()'s own established pattern exactly
  * (sys/kern/kern_hibernate.c) -- a single per-object field whose cold-
@@ -394,7 +394,7 @@ tdq_curthread_reseed(struct thread *td)
 }
 
 /*
- * K24-T00 (reconciliation round 3): tdq_runq's own stale entries.
+ * tdq_runq's own stale entries.
  * Direct traversal analysis this round established that
  * sched_ule_ap_entry() -> sched_throw_grab() -> choosethread() ->
  * sched_ule_choose() -> tdq_choose() DOES traverse tdq_runq

@@ -362,7 +362,7 @@ callout_callwheel_init(void *dummy)
 SYSINIT(callwheel_init, SI_SUB_CPU, SI_ORDER_ANY, callout_callwheel_init, NULL);
 
 /*
- * K24-T00 (round 42): expose a given CPU's own cc_callwheel array
+ * expose a given CPU's own cc_callwheel array
  * (its address and byte size) for hibernate_machdep_prepare()'s self-
  * copy protection, matching the tc_hibernate_selfcopy_range()
  * precedent (sys/kern/kern_tc.c) this file has no public header to

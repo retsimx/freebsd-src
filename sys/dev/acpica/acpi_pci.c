@@ -68,8 +68,7 @@ struct acpi_pci_devinfo {
 ACPI_SERIAL_DECL(pci_powerstate, "ACPI PCI power methods");
 
 /*
- * K24-T00 (round 13, ACPI subsystem sweep, done properly per explicit
- * instruction): pci_powerstate_sxlock, the sx this file's own
+ * pci_powerstate_sxlock, the sx this file's own
  * ACPI_SERIAL_DECL() expands to, is `ACPI_SERIAL_BEGIN(pci_powerstate)`'d
  * as the FIRST statement in acpi_pci_set_powerstate_method() (this
  * file) -- the exact function one frame above acpi_pwr_switch_

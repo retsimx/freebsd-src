@@ -146,7 +146,7 @@ struct mtx vm_object_list_mtx;	/* lock for object list and count */
 struct vm_object kernel_object_store;
 
 /*
- * K24-T00 (T21): expose kernel_object_store's own VA/size to
+ * expose kernel_object_store's own VA/size to
  * sys/amd64/amd64/hibernate_machdep.c, which cannot itself reference
  * kernel_object/struct vm_object directly (this file does not pull in
  * sys/vm/vm_object.h). Mirrors this epic's own existing convention for

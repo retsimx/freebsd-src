@@ -3610,7 +3610,7 @@ allproc_loop:
 }
 
 /*
- * K24-T00 (round 24): resume_all_proc()'s own LIST_REMOVE(cp, p_list)
+ * resume_all_proc()'s own LIST_REMOVE(cp, p_list)
  * below assumes cp (curproc) is ALREADY a valid member of this kernel's
  * own allproc list -- true for every ordinary cold-boot process (linked
  * via fork1()/proc0_init()'s own LIST_INSERT_HEAD(&allproc, ...)), but
@@ -3671,7 +3671,7 @@ proc_hibernate_insert_curproc(void)
 	cp = curproc;
 	sx_xlock(&allproc_lock);
 	/*
-	 * K24-T00 (round 33): guard against double-insertion. Round 31's
+	 * guard against double-insertion. Round 31's
 	 * own live capture proved cp is already image content, genuinely
 	 * linked into the restored allproc chain (immediately after proc0)
 	 * by the K-10 copy itself -- this function's own original,
@@ -3694,7 +3694,7 @@ proc_hibernate_insert_curproc(void)
 }
 
 /*
- * K24-T00 (T13): post-copy normalization pass for the allproc chain.
+ * post-copy normalization pass for the allproc chain.
  *
  * Rounds 34/T10 healed one poisoned p_list back-reference at a time (the
  * allproc head, then a mutual/cyclic pair elsewhere in the chain). The
@@ -3855,7 +3855,7 @@ resume_all_proc(void)
 again:
 	LIST_REMOVE(cp, p_list);
 	/*
-	 * K24-T00 (round 34): self-heal a single, narrowly-confirmed
+	 * self-heal a single, narrowly-confirmed
 	 * defect on the CURRENT head of allproc, found by direct live
 	 * evidence (a ddb-callable diagnostic wrapper around the
 	 * destination-set predicate, plus a
@@ -3893,11 +3893,11 @@ again:
 		if (p == NULL)
 			break;
 		/*
-		 * K24-T00 (T10 round): self-heal a single, narrowly-
+		 * self-heal a single, narrowly-
 		 * confirmed defect on 'p' (the node immediately following
 		 * 'cp'), the exact sibling case to this same function's
 		 * own round-34 fix for allproc's own head, several lines
-		 * above. Direct evidence this round (K24T00-T10's own
+		 * above. Direct evidence this round (an earlier
 		 * diagnostic, confirmed firing and removed again here):
 		 * 'p' itself can carry a p_list.le_next that still names
 		 * 'cp' -- a genuine, saved-image mutual/cyclic link between
@@ -3957,7 +3957,7 @@ again:
 	sx_xunlock(&allproc_lock);
 
 	/*
-	 * K24-T00 (T13): lock-family normalization, sapblk
+	 * lock-family normalization, sapblk
 	 * (stop_all_proc_blocker). Live capture this round
 	 * (restore-20261109-090639.log): sx_xlocked=0, owner=0,
 	 * raw_lock=0x1 -- decoded against SX_LOCK_UNLOCKED

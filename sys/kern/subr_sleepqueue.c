@@ -160,7 +160,7 @@ static struct sleepqueue_chain sleepq_chains[SC_TABLESIZE];
 static uma_zone_t sleepq_zone;
 
 /*
- * K24-T00 (round 42): expose sleepq_chains[]'s own byte range for
+ * expose sleepq_chains[]'s own byte range for
  * hibernate_machdep_prepare()'s self-copy protection, matching the
  * tc_hibernate_selfcopy_range() precedent (sys/kern/kern_tc.c) this
  * file has no public header to declare a prototype in otherwise.
@@ -175,7 +175,7 @@ sleepq_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
 }
 
 /*
- * K24-T00 (round 44): structural fix, replacing round 42/43's own
+ * structural fix, replacing round 42/43's own
  * per-structure copy_leaf toggling. sleepq_chains[] is a REGISTRY of
  * currently-pending sleep operations; every entry names a thread that
  * was asleep AT SAVE TIME. Every such thread, except the resumed BSP

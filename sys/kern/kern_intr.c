@@ -111,7 +111,7 @@ static struct mtx event_lock;
 MTX_SYSINIT(intr_event_list, &event_lock, "intr event list", MTX_DEF);
 
 /*
- * K24-T00 (round 17, corrected classification): round 16's own
+ * round 16's own
  * sweep of this subsystem concluded "no unprotected static global"
  * because it looked for a registry-style list and found none directly
  * reachable from intr_event_resume_handler()'s own call chain -- but
@@ -157,7 +157,7 @@ hibernate_md_intr_event_lock_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (round 17): walks event_list (now protected, above) and
+ * walks event_list (now protected, above) and
  * protects every struct intr_event node and every struct intr_handler
  * hanging off its own ie_handlers list -- the exact node-protection
  * walk eventhandler_hibernate_selfcopy_nodes() (sys/kern/

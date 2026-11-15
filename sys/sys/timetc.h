@@ -91,7 +91,7 @@ void	tc_ticktock(long cnt);
 void	cpu_tick_calibration(void);
 
 /*
- * K24-T00: hibernate_machdep_prepare() (sys/amd64/amd64/hibernate_machdep.c)
+ * hibernate_machdep_prepare() (sys/amd64/amd64/hibernate_machdep.c)
  * must self-copy the page-table path backing the timehands ring buffer
  * (the `ths[]` array in kern_tc.c) before the K-10 destructive copy runs,
  * the same protection already applied to pc_gdt/vm_page_array/kstack.

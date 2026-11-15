@@ -44,7 +44,7 @@ static int				eventhandler_lists_initted = 0;
 static struct mtx			eventhandler_mutex;
 
 /*
- * K24-T00 (measurement-method fix round): eventhandler_lists (this
+ * eventhandler_lists (this
  * file)/eventhandler_mutex/eventhandler_lists_initted, the global
  * registry every EVENTHANDLER_INVOKE()/eventhandler_find_list() call
  * anywhere in the kernel walks and locks. None of the three were ever
@@ -91,7 +91,7 @@ hibernate_md_eventhandler_lists_initted_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (round 12, eventhandler subsystem sweep): per explicit
+ * per explicit
  * instruction, every structure this subsystem's own resume-path
  * consumers touch was enumerated once by direct source reading, not
  * rediscovered by panic. eventhandler_lists/_mutex/_lists_initted

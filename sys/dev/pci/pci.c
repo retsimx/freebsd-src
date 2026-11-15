@@ -5329,7 +5329,7 @@ pci_resume_child(device_t dev, device_t child)
 	 */
 	if (pci_do_power_suspend) {
 		/*
-		 * K24-T00 (round 21, fix): See pci_suspend_child for
+		 * See pci_suspend_child for
 		 * details on rle. Direct, repeated live measurement
 		 * (N=12, 4/4 ie_lock_gpf hits + 5/5 other-panic hits
 		 * at this same halted instant) proved the specific
@@ -5355,7 +5355,7 @@ pci_resume_child(device_t dev, device_t child)
 		 */
 		rle = resource_list_find(&dinfo->resources, SYS_RES_IRQ, 0);
 		/*
-		 * K24-T00 (sibling sweep, round 23): direct live evidence
+		 * direct live evidence
 		 * (N=14 batch, runs r22_02/r22_05/r22_06/r22_09, identical
 		 * GPF every time) shows this round-21 fix's own
 		 * rman_get_flags(rle->res) call can itself fault: rax

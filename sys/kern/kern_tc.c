@@ -98,7 +98,7 @@ struct timecounter *timecounter = &dummy_timecounter;
 static struct timecounter *timecounters = &dummy_timecounter;
 
 /*
- * K24-T00: expose ths[]'s byte range so hibernate_machdep_prepare()
+ * expose ths[]'s byte range so hibernate_machdep_prepare()
  * (sys/amd64/amd64/hibernate_machdep.c) can self-copy its page-table path
  * before the K-10 destructive copy runs.  Root cause this fixes: every
  * time-reading primitive built on GETTHBINTIME() (binuptime()/

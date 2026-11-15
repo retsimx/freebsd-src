@@ -685,7 +685,7 @@ hibernate_resume_ap_entry(u_int cpu)
 	 */
 	sched_init_ap();
 	/*
-	 * K24-T00 (reconciliation, Defect B -- corrected ordering): the
+	 * the
 	 * BSP-side fix (sys/dev/acpica/acpi.c's EJUSTRETURN branch,
 	 * tdq_curthread_reseed(saved_td) immediately after
 	 * PCPU_SET(curthread, saved_td)) has an exact AP-side twin here:
@@ -712,7 +712,7 @@ hibernate_resume_ap_entry(u_int cpu)
 	 */
 	tdq_curthread_reseed(pc->pc_idlethread);
 	/*
-	 * K24-T00 (reconciliation round 3): tdq_runq's own stale,
+	 * tdq_runq's own stale,
 	 * saved-image entries -- traversal analysis this round proved
 	 * sched_ap_entry() (immediately below) reaches
 	 * sched_throw_grab() -> choosethread() -> tdq_choose(), which
@@ -1743,7 +1743,7 @@ hibernate_md_selfcopy_page(const struct hibernate_attempt *ha,
 }
 
 /*
- * K24-T00 (reconciliation): round 63 and round 64 both measured the LIVE
+ * round 63 and round 64 both measured the LIVE
  * kernel_pmap at hibernate_machdep_prepare() time and both found the walk
  * (hibernate_md_tree_walk()/hib_md_safe_resolve()) returns false for
  * kstack_va -- reported loosely as "no page-table entry at all". A precise,
@@ -1874,7 +1874,7 @@ hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
 }
 
 /*
- * K24-T00 (round 64): install one exact 4 KiB mapping, VA va -> leaf_pa,
+ * install one exact 4 KiB mapping, VA va -> leaf_pa,
  * into the LIVE kernel_pmap -- Design 041's option 1, "installed in the
  * live kernel_pmap ... before resumectx() runs". Missing intermediate
  * tables are allocated via pmap_page_alloc_below_4g(), the identical
@@ -1966,7 +1966,7 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 	    (saved_flags & (X86_PG_RW | X86_PG_U | X86_PG_NX));
 	if ((entry & X86_PG_V) != 0) {
 		/*
-		 * K24-T00 (reconciliation): a pre-existing leaf here is not
+		 * a pre-existing leaf here is not
 		 * automatically a conflict. The live PT page can already,
 		 * via ordinary deterministic early-boot allocation order,
 		 * hold exactly the frame+permissions the image needs at this
@@ -3286,7 +3286,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * saved image, so copy_leaf is false here, exactly like
 			 * saved_pcb_va/pc_gdt above.
 			 *
-			 * K24-T00: reading susppcbs[0]->sp_pcb.pcb_rsp directly
+			 * reading susppcbs[0]->sp_pcb.pcb_rsp directly
 			 * on THIS (resume) boot reads this boot's own
 			 * never-written PCB allocation (acpi_wakeup.c's
 			 * acpi_install_wakeup_handler(), M_WAITOK, not M_ZERO):
@@ -3396,7 +3396,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 
 			k24t00_kstack_va = kstack_va;
 			/*
-			 * K24-T00 (T06 round): do NOT source k24t00_staged_
+			 * do NOT source hib_staged_
 			 * fpu_save from staged_pcb->pcb_save. staged_pcb here
 			 * is susppcbs[0]->sp_pcb (see hibernate_md_patch_
 			 * saved_domain() above) -- a per-CPU scratch struct
@@ -3578,13 +3578,13 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (T14): per-thread user-FPU save area --
+			 * per-thread user-FPU save area --
 			 * requested after direct testing isolated the AP-
 			 * side fpurestore_xrstor3264() GPF/double-fault
 			 * cascade (T13's own outcome table, runs 5/9; T12's
 			 * own runs 6-7) to shape (1) of the two candidates:
 			 * PCB_FPUINITDONE already set (a genuine, working
-			 * thread per the K24T00-T14 restore_fpu capture
+			 * thread per the restore_fpu capture
 			 * taken immediately before the K-10 copy) on a
 			 * thread whose pcb_save area reads a MALFORMED
 			 * XSAVE header post-copy (live capture,
@@ -3656,7 +3656,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * an ordinary user thread reached via the interrupt-
 			 * resume path, not an idle thread.
 			 *
-			 * K24-T00 (T15): a zone-wide variant of this fix
+			 * a zone-wide variant of this fix
 			 * (protecting fpu_save_area_zone's own backing pages
 			 * as a unit) was tried and REVERTED: an 8-run
 			 * campaign showed it recurred on 3/3 runs that
@@ -3665,7 +3665,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * "immune by construction" reasoning it was built
 			 * on. Its own failure mode was never re-diagnosed.
 			 *
-			 * K24-T00 (T16): CONTENT PROTECTION REPLACED WITH A
+			 * CONTENT PROTECTION REPLACED WITH A
 			 * GATE. Both T14 (per-thread self-copy-protect) and
 			 * T15 (zone-wide self-copy-protect) tried to make
 			 * td_md.md_usr_fpu_save's own CONTENT survive the
@@ -3772,7 +3772,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00: ths[]'s (timehands ring buffer,
+			 * ths[]'s (timehands ring buffer,
 			 * sys/kern/kern_tc.c) own page-table path can fall
 			 * inside the K-10 destination set and collapse,
 			 * exactly like pc_gdt/vm_page_array/kstack above.
@@ -3858,8 +3858,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (round 43, comment corrected by the repair
-			 * session that found this contradiction): this comment
+			 * this comment
 			 * previously argued for copy_leaf=false ("Corrected
 			 * disposition, matching vm_page_array's own precedent
 			 * exactly"), but the CODE below has always passed
@@ -4009,7 +4008,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (reconciliation round 2): vm_phys_free_queues
+			 * vm_phys_free_queues
 			 * (sys/vm/vm_phys.c), the per-domain/per-freelist/
 			 * per-pool array of struct vm_freelist, each embedding
 			 * a TAILQ_HEAD of free vm_page_t's at every buddy
@@ -4063,7 +4062,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (lead 2, this round): vm_reserv_array
+			 * vm_reserv_array
 			 * (sys/vm/vm_reserv.c), the per-superpage reservation
 			 * array -- functionally parallel to vm_page_array
 			 * (round 59) and allocated the same way (a single,
@@ -4134,7 +4133,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00: vm_phys_segs[] (sys/vm/vm_phys.c), the
+			 * vm_phys_segs[] (sys/vm/vm_phys.c), the
 			 * per-segment physical-memory descriptor array --
 			 * functionally parallel to vm_phys_free_queues and
 			 * vm_reserv_array (both already protected above) and
@@ -4181,7 +4180,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (exhaustive sweep): vm_rvd[] (sys/vm/
+			 * vm_rvd[] (sys/vm/
 			 * vm_reserv.c), the per-domain reservation-queue
 			 * lock/partpop-list/scan-marker array -- sibling to
 			 * vm_reserv_array above, same disposition and
@@ -4204,7 +4203,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (exhaustive sweep): vm_reserv_object_mtx[]
+			 * vm_reserv_object_mtx[]
 			 * (sys/vm/vm_reserv.c), the hashed per-object lock
 			 * array -- sibling to vm_rvd[] above, same
 			 * disposition. See sys/vm/vm_reserv.c for the full
@@ -4227,7 +4226,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (exhaustive sweep): vm_domainset_lock plus
+			 * vm_domainset_lock plus
 			 * the domain-state fields it protects (sys/vm/
 			 * vm_page.c). See sys/vm/vm_page.c for the full
 			 * comment.
@@ -4337,7 +4336,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (measurement-method fix round):
+			 *
 			 * eventhandler_lists/eventhandler_mutex/
 			 * eventhandler_lists_initted (sys/kern/
 			 * subr_eventhandler.c) -- confirmed by direct, live
@@ -4388,7 +4387,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					    &selfcopied);
 			}
 			/*
-			 * K24-T00 (round 12, eventhandler subsystem sweep):
+			 *
 			 * per this round's own explicit instruction, every
 			 * structure this subsystem's resume-path consumers
 			 * touch was enumerated once, not rediscovered by
@@ -4433,7 +4432,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (round 17, corrected classification):
+			 *
 			 * event_list/event_lock (sys/kern/kern_intr.c) --
 			 * the static registry every struct intr_event is
 			 * linked onto -- and every intr_event/intr_handler
@@ -4486,7 +4485,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (disposition b, live-captured root cause):
+			 *
 			 * rman_head/rman_mtx (sys/kern/subr_rman.c) -- the
 			 * static registry every struct rman (irq_rman et al)
 			 * is linked onto -- and every struct resource_i node
@@ -4539,8 +4538,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (round 13, ACPI subsystem sweep, done
-			 * properly per explicit instruction): pci_powerstate_
+			 * pci_powerstate_
 			 * sxlock (sys/dev/acpica/acpi_pci.c) is
 			 * ACPI_SERIAL_BEGIN()'d as the FIRST statement of
 			 * acpi_pci_set_powerstate_method() -- the exact
@@ -4569,8 +4567,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (round 12, ACPI power-resource subsystem
-			 * sweep, found this round): powerres_sxlock (the
+			 * powerres_sxlock (the
 			 * ACPI_SERIAL_DECL()-expanded sx this file's own
 			 * acpi_pwr_switch_consumer() locks as its FIRST
 			 * statement) was never added to this file's own
@@ -4597,7 +4594,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (measurement-method fix round):
+			 *
 			 * acpi_powerresources/acpi_powerconsumers
 			 * (sys/dev/acpica/acpi_powerres.c) -- confirmed by
 			 * direct, live backtrace capture to be reached and
@@ -4634,8 +4631,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					    &selfcopied);
 			}
 			/*
-			 * K24-T00 (round 12, ACPI power-resource subsystem
-			 * sweep): per this round's own instruction ("check
+			 * per this round's own instruction ("check
 			 * whether the ENTRIES need the do-not-free/protect
 			 * disposition rather than the heads"), the two static
 			 * TAILQ HEADS above are correctly protected (live BSS
@@ -4893,7 +4889,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (exhaustive sweep): bucket_zones[]
+			 * bucket_zones[]
 			 * (sys/vm/uma_core.c), the per-size cache-bucket
 			 * zone descriptor table, each entry's own ubz_zone
 			 * an identity pointer into this boot's own,
@@ -4916,7 +4912,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (measurement-method fix round): kmemzones[]
+			 * kmemzones[]
 			 * (sys/kern/kern_malloc.c) -- the table EVERY malloc(9)
 			 * call anywhere resolves through to find its backing
 			 * UMA zone. Confirmed by direct source reading to be
@@ -4941,7 +4937,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
-			 * K24-T00 (T21): kernel_object (sys/vm/vm_object.c's
+			 * kernel_object (sys/vm/vm_object.c's
 			 * own kernel_object_store, extern'd as
 			 * &kernel_object_store via sys/vm/vm_object.h's
 			 * kernel_object macro) -- the single, statically-
@@ -4950,7 +4946,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * kmem_malloc-class slabs via keg_alloc_slab() ->
 			 * kmem_malloc(), and any other kmem_back()-style
 			 * caller) is inserted into. Confirmed this round by
-			 * a direct, instrumented capture (K24T00-T20,
+			 * a direct, instrumented capture (
 			 * vm_page_alloc_check()'s own "page ... has object"
 			 * panic, sys/vm/vm_page.c): obj=0xffffffff81eb31d8
 			 * resolves via this binary's own symbol table to

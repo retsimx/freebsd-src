@@ -4093,7 +4093,7 @@ acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
 	curthread->td_critnest = 0;
 	curthread->td_md.md_spinlock_count = 0;
 	/*
-	 * K24-T00 (round 15, Giant/WITNESS reconciliation): td_locks/
+	 * td_locks/
 	 * td_sleeplocks are WITNESS's own separate bookkeeping of which
 	 * locks this thread holds -- restoring them from the SAVE-side
 	 * snapshot values leaves them naming lock_instance entries in
@@ -4106,7 +4106,7 @@ acpi_s4_resume_discard_snapshot(int saved_td_locks, int saved_td_pinned,
 	curthread->td_pinned = saved_td_pinned;
 	curthread->td_sleeplocks = NULL;
 	/*
-	 * K24-T00 (round 15, Giant/WITNESS reconciliation): established
+	 * established
 	 * this round, established by direct evidence after THREE failed
 	 * attempts, not assumed: this function's own caller
 	 * (acpi_EnterSleepState()) calls bus_topo_lock() -- a REAL,
@@ -4186,7 +4186,7 @@ acpi_s4_resume_bsp_cpu(void)
 
 	pmap_init_pat();
 	/*
-	 * K24-T00: the same stale-nesting-counter WITNESS panic class fixed
+	 * the same stale-nesting-counter WITNESS panic class fixed
 	 * at hibernate_barrier_unwind()'s Stage 7 call site recurs here, one
 	 * call further down this same EJUSTRETURN resume chain:
 	 * initializecpu() -> getenv_int() -> getenv_quad() -> kenv_acquire()
@@ -4942,7 +4942,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	int saved_td_pinned = curthread->td_pinned;
 	struct lock_list_entry *saved_td_sleeplocks = curthread->td_sleeplocks;
 	/*
-	 * K24-T00: capture the hibernating thread's own identity now, on the
+	 * capture the hibernating thread's own identity now, on the
 	 * SAVE side, where curthread is unambiguously correct.  This pointer
 	 * survives in the saved image as an ordinary stack local (the same
 	 * protection mechanism already proven correct for hib_res_pages: the
@@ -5007,7 +5007,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 *   2. free the reservation array
 		 *   1. hibernate_coordinator_release() -- release lock LAST
 		 *
-		 * K24-T00: re-establish PCPU(curthread)/PCPU(curpcb) FIRST,
+		 * re-establish PCPU(curthread)/PCPU(curpcb) FIRST,
 		 * before any other resume-path code runs, including
 		 * acpi_s4_resume_discard_snapshot() immediately below.
 		 *
@@ -5062,7 +5062,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 			    PCB_FPUINITDONE | PCB_USERFPUINITDONE);
 		}
 		/*
-		 * K24-T00 (reconciliation, Defect B): tdq->tdq_curthread
+		 * tdq->tdq_curthread
 		 * (sys/kern/sched_ule.c's own DPCPU-backed run-queue
 		 * identity field) is a SEPARATE field from PCPU(curthread)
 		 * just restored above -- resumectx() writes neither, and
@@ -5078,7 +5078,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void tdq_curthread_reseed(struct thread *td);
 		tdq_curthread_reseed(saved_td);
 		/*
-		 * K24-T00 (reconciliation round 4): the BSP's own tdq_runq
+		 * the BSP's own tdq_runq
 		 * ALSO needs reinitializing -- round 3's own analysis
 		 * correctly found the AP's own direct-entry traversal
 		 * (sched_throw_grab() -> choosethread()) but missed that
@@ -5155,7 +5155,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * mtx_lock()).
 		 */
 		/*
-		 * K24-T00 (T09 round): ORDER FIX. acpi_s4_resume_discard_
+		 * ORDER FIX. acpi_s4_resume_discard_
 		 * snapshot() unconditionally sets curthread->td_locks = 0
 		 * and curthread->td_sleeplocks = NULL (establishing a clean
 		 * WITNESS baseline, then re-adding exactly Giant's own
@@ -5206,7 +5206,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    saved_td_sleeplocks);
 		hibernate_coordinator_mtx_reseed(saved_td);
 		/*
-		 * K24-T00 (reconciliation, Defect A): rebuild UMA's own
+		 * rebuild UMA's own
 		 * plinks.uma reverse-lookup index (vm_page_t's own
 		 * slab/zone-identity fields, stale/zero after round 59's
 		 * own vm_page_array reinit, while each keg's own slab
@@ -5222,7 +5222,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void uma_hibernate_reinit_plinks(void);
 		uma_hibernate_reinit_plinks();
 		/*
-		 * K24-T00 (Job 2, exhaustive sweep): per-CPU cache-bucket
+		 * per-CPU cache-bucket
 		 * identity reinit -- see sys/vm/uma_core.c's own
 		 * uma_hibernate_reinit_cache_buckets() for the full
 		 * root-cause account. Called immediately after
@@ -5233,7 +5233,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void uma_hibernate_reinit_cache_buckets(void);
 		uma_hibernate_reinit_cache_buckets();
 		/*
-		 * K24-T00 (T23): close the vm_page_array/vm_phys_free_queues
+		 * close the vm_page_array/vm_phys_free_queues
 		 * two-sided overlap -- see sys/vm/vm_phys.c's own
 		 * vm_phys_hibernate_reconcile_object_owned() for the full
 		 * root-cause account and disposition. Called immediately
@@ -5244,7 +5244,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void vm_phys_hibernate_reconcile_object_owned(void);
 		vm_phys_hibernate_reconcile_object_owned();
 		/*
-		 * K24-T00 (round 14, disposition chosen and argued): the
+		 * the
 		 * ACPI power-resource/consumer/reference lists
 		 * (sys/dev/acpica/acpi_powerres.c) are reinitialised (list
 		 * drained, not reconciled) BEFORE any device-resume callee
@@ -5307,7 +5307,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		sleepq_hibernate_reinit_chains();
 		turnstile_hibernate_reinit_chains();
 		/*
-		 * K24-T00 (sibling sweep, round 23): devsoftc.devq (sys/
+		 * devsoftc.devq (sys/
 		 * kern/kern_devctl.c) reinitialised through the public
 		 * interface, same rule and same safety window as the two
 		 * calls immediately above (strictly before any sleep/lock-
@@ -5327,7 +5327,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 				callout_cpu_hibernate_reinit_chains(reinit_cpu);
 		}
 		/*
-		 * K24-T00: clear HIB_STAGE_RESERVED before unwinding on this
+		 * clear HIB_STAGE_RESERVED before unwinding on this
 		 * specific EJUSTRETURN resume-continuation path, so
 		 * hibernate_barrier_unwind()'s Stage 7
 		 * (vm_phys_hibernate_release()) does not run here at all.
@@ -5381,7 +5381,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		hib_stages &= ~HIB_STAGE_RESERVED;
 		hibernate_barrier_unwind(&ha, &hib_res, &hib_stages);
 		/*
-		 * K24-T00: do NOT free(hib_res_pages, M_TEMP) on this specific
+		 * do NOT free(hib_res_pages, M_TEMP) on this specific
 		 * EJUSTRETURN resume-continuation path.  hib_res_pages is a
 		 * value captured on the suspended thread's own saved stack
 		 * (this function's local variable, restored correctly by the
@@ -5413,7 +5413,7 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		 * this boot, with no effect on any shared allocator or
 		 * free-list state -- the smallest provable-safe fix for the
 		 * proven defect, not a route-around of shared-state
-		 * bookkeeping (contrast the K24-T00 round 8 vm_phys.c skip,
+		 * bookkeeping (contrast the earlier vm_phys.c skip,
 		 * which was unsafe because it touched the shared buddy
 		 * free-list; this is a single leaked allocation, not shared
 		 * state).
@@ -5630,7 +5630,7 @@ backout:
 	sc->acpi_resume_sbt = getsbinuptime();
 	EVENTHANDLER_INVOKE(acpi_pre_dev_resume, stype);
 	/*
-	 * K24-T00: wire up uma_hibernate_dbg_suppress_begin()/_end()
+	 * wire up uma_hibernate_dbg_suppress_begin()/_end()
 	 * (sys/vm/uma_core.c), bracketing this one DEVICE_RESUME(root_bus)
 	 * call, strictly on the EJUSTRETURN resume-continuation path
 	 * (hib_workspace_resume_continuation, set only there -- see this
@@ -5690,7 +5690,7 @@ backout:
 #endif
 
     /*
-     * K24-T00 (round 24, corrected placement): resume_all_proc()'s own
+     * resume_all_proc()'s own
      * first action, LIST_REMOVE(curproc, p_list), assumes curproc is
      * ALREADY a member of THIS kernel's own allproc list -- never true
      * for the resumectx()-restored continuation thread, which bypasses
@@ -5715,7 +5715,7 @@ backout:
      * lock-order pair is created here.
      */
     /*
-     * K24-T00: proc_hibernate_insert_curproc() is conditional (only
+     * proc_hibernate_insert_curproc() is conditional (only
      * inserts if cp is not already correctly linked) -- safe to call
      * unconditionally here regardless of whether cp is image content
      * (the proven common case) or genuinely absent.
@@ -5724,7 +5724,7 @@ backout:
     proc_hibernate_insert_curproc();
     resume_all_fs();
     /*
-     * K24-T00 (T13): run the allproc normalization pass BEFORE
+     * run the allproc normalization pass BEFORE
      * resume_all_proc()'s own per-node self-heals. T10-T12's own
      * outcome table shows the SAME p_list corruption class recurring
      * at a DIFFERENT node pair each round after the prior one was

@@ -209,7 +209,7 @@ SYSCTL_PROC(_vm, OID_AUTO, kmem_map_size,
     sysctl_kmem_map_size, "LU", "Current kmem allocation size");
 
 /*
- * K24-T00 (measurement-method fix round): kmemzones[]/kmemsize[]
+ * kmemzones[]/kmemsize[]
  * (this file), the two tables EVERY malloc(9) call anywhere in the
  * kernel resolves through on its hot path (malloc(): indx =
  * kmemsize[size >> KMEM_ZSHIFT]; zone =

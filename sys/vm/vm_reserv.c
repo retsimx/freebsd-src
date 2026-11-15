@@ -202,7 +202,7 @@ TAILQ_HEAD(vm_reserv_queue, vm_reserv);
 static vm_reserv_t vm_reserv_array;
 
 /*
- * K24-T00 (lead 2): the byte size of vm_reserv_array's own backing
+ * the byte size of vm_reserv_array's own backing
  * allocation, computed once in vm_reserv_startup() and stored here so
  * sys/amd64/amd64/hibernate_machdep.c's own self-copy walk can protect
  * this array's page-table path the same way it already protects every
@@ -1497,7 +1497,7 @@ vm_reserv_startup(vm_offset_t *vaddr, vm_paddr_t end)
 }
 
 /*
- * K24-T00 (lead 2): narrow accessor exposing vm_reserv_array's own VA
+ * narrow accessor exposing vm_reserv_array's own VA
  * and byte size to sys/amd64/amd64/hibernate_machdep.c, matching this
  * file's own existing convention (vm_reserv_array is file-static;
  * sys/vm/vm_phys.c's own hibernate_md_vm_phys_free_queues_va() is the
@@ -1516,7 +1516,7 @@ hibernate_md_vm_reserv_array_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (exhaustive sweep): vm_rvd[] (struct vm_reserv_domain, this
+ * vm_rvd[] (struct vm_reserv_domain, this
  * file), the per-domain reservation-queue lock/partpop-list/scan-marker
  * array -- read and locked directly by vm_reserv_alloc_page()/
  * vm_reserv_reclaim()/vm_reserv_break() on every reservation-level
@@ -1536,7 +1536,7 @@ hibernate_md_vm_rvd_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (exhaustive sweep): vm_reserv_object_mtx[] (this file), the
+ * vm_reserv_object_mtx[] (this file), the
  * hashed per-object lock array vm_reserv_from_object()/
  * vm_reserv_object_lock()/vm_reserv_object_unlock() index into for
  * every reservation-to-object association -- the identical "ordinary

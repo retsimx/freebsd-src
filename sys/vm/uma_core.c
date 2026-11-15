@@ -4909,7 +4909,7 @@ slab_free_item(uma_zone_t zone, uma_slab_t slab, void *item)
 }
 
 /*
- * K24-T00 (reconciliation, Defect A): rebuild every VTOSLAB keg's own
+ * rebuild every VTOSLAB keg's own
  * reverse per-page lookup (vm_page_t's plinks.uma.{slab,zone}, set by
  * vsetzoneslab() at slab-construction time) after a hibernate resume.
  *
@@ -4961,7 +4961,7 @@ slab_free_item(uma_zone_t zone, uma_slab_t slab, void *item)
  * documents for sleepq/turnstile/callout.
  */
 /*
- * K24-T00 (reconciliation round 2, fault fix): vsetzoneslab() ->
+ * vsetzoneslab() ->
  * vtozoneslab()'s own pmap_kextract(va) assumes a PRESENT mapping and
  * dereferences the page-table path with no check -- direct testing this
  * round found it faulting ("kernel trap 12 with interrupts disabled",
@@ -4990,7 +4990,7 @@ slab_free_item(uma_zone_t zone, uma_slab_t slab, void *item)
 #include <machine/vmparam.h>
 
 /*
- * K24-T00 (lead 1, this round): renamed from uma_hibernate_pte_present()
+ * renamed from uma_hibernate_pte_present()
  * and changed to return the resolved physical address rather than a
  * bare boolean. The prior boolean-only form was used solely to decide
  * whether to SKIP a slab/page -- confirmed this round, by direct
@@ -5064,7 +5064,7 @@ uma_hibernate_resolve_pa(vm_offset_t va, vm_paddr_t *pa_out)
 }
 
 /*
- * K24-T00 (lead 1, this round): counters making every genuinely
+ * counters making every genuinely
  * unresolvable slab/page/list-node VISIBLE rather than silently
  * skipped. uma_hibernate_reinit_plinks_unresolved is incremented once
  * per VA this reinit could not resolve to a physical address at all
@@ -5079,7 +5079,7 @@ uma_hibernate_resolve_pa(vm_offset_t va, vm_paddr_t *pa_out)
 static u_int uma_hibernate_reinit_plinks_unresolved;
 static u_int uma_hibernate_reinit_plinks_resolved;
 /*
- * K24-T00 (lead 1 fix, this round): hard per-list iteration bound,
+ * hard per-list iteration bound,
  * added after direct live testing caught this exact reinit looping
  * for hundreds of millions of iterations without the restore
  * continuation ever progressing (live GDB capture:
@@ -5107,7 +5107,7 @@ static u_int uma_hibernate_reinit_plinks_resolved;
 static u_int uma_hibernate_reinit_plinks_runaway;
 
 /*
- * K24-T00 (reconciliation round 3, second fault fix): the previous
+ * the previous
  * round's fault fix guarded vsetzoneslab()'s own write, but LIST_FOREACH
  * itself (walking ud_part_slab/ud_free_slab/ud_full_slab) dereferences
  * each uma_slab_t's own us_link.le_next field BEFORE vsetzoneslab() is
@@ -5151,7 +5151,7 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			break;
 		}
 		/*
-		 * K24-T00 (lead 1): resolve THIS slab's own data pages by
+		 * resolve THIS slab's own data pages by
 		 * PHYSICAL address (needed regardless, below), then resolve
 		 * the list-node's own us_link.le_next FIELD by physical
 		 * address too, and read the actual next-slab POINTER VALUE
@@ -5181,7 +5181,7 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			}
 			uma_hibernate_reinit_plinks_resolved++;
 			/*
-			 * K24-T00 (lead 1): write via PHYS_TO_VM_PAGE(pa)
+			 * write via PHYS_TO_VM_PAGE(pa)
 			 * directly -- the same field vsetzoneslab() itself
 			 * writes, reached without vsetzoneslab()'s own
 			 * pmap_kextract(pg_va) call, which requires pg_va to
@@ -5195,7 +5195,7 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			 */
 			pg_m = PHYS_TO_VM_PAGE(pg_pa);
 			/*
-			 * K24-T00 (T01 round): plinks is a UNION
+			 * plinks is a UNION
 			 * (sys/vm/vm_page.h) -- plinks.uma.{slab,zone} (just
 			 * below) and plinks.q (the free-list/page-queue
 			 * TAILQ_ENTRY vm_freelist_add()/vm_freelist_rem()
@@ -5259,7 +5259,7 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			 * behaviour, unchanged.
 			 */
 			/*
-			 * K24-T00 (T08 round): validity gate, discovered and
+			 * validity gate, discovered and
 			 * added this round after a direct, instrumented
 			 * crash capture. pg_m->order != VM_NFREEORDER alone
 			 * is NOT sufficient proof this page is a genuine
@@ -5326,7 +5326,7 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 }
 
 /*
- * K24-T00 (exhaustive sweep): kegs whose slab header is INLINE (neither
+ * kegs whose slab header is INLINE (neither
  * UMA_ZFLAG_VTOSLAB nor UMA_ZFLAG_HASH -- e.g. the "N Bucket" cache-
  * bucket kegs, sys/vm/uma_core.c's own bucket_zones[]) are deliberately
  * excluded from the loop below, confirmed by direct source reading
@@ -5374,7 +5374,7 @@ uma_hibernate_reinit_plinks(void)
 }
 
 /*
- * K24-T00 (Job 2, exhaustive sweep): per-CPU UMA cache buckets
+ * per-CPU UMA cache buckets
  * (struct uma_cache's own uc_allocbucket/uc_freebucket/uc_crossbucket,
  * sys/vm/uma_int.h, embedded inline in each zone's own variable-length
  * uz_cpu[] array) are NEVER reached by ANY existing hibernate
@@ -6346,13 +6346,12 @@ sysctl_handle_uma_zone_items(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * K24-T00 (round 11, second lead): the debug-bitmap defect's root cause
- * (sys/vm/uma_core.c's own uma_hibernate_reinit_dbgbits() comment, above,
- * unchanged) is correctly identified and argued, but THREE independent
+ * the debug-bitmap defect's root cause
+ * is correctly identified and argued, but THREE independent
  * implementations of the slab-walk-and-rewrite reconciliation itself have
  * now faulted live, each a different resolution technique, each at a
- * different offset inside uma_hibernate_reinit_dbgbits_slablist() (round
- * 10: byte-offset-from-one-base and VA-relative; round 11: per-field
+ * different offset inside the rejected slab walk (round 10:
+ * byte-offset-from-one-base and VA-relative; round 11: per-field
  * independent-VA, mirroring uma_hibernate_reinit_plinks() exactly, per
  * this round's own first-lead instruction -- see
  * k24-t00-resumectx-fault-diagnosis.md for all three captures). Three
@@ -6440,7 +6439,7 @@ uma_dbg_getslab(uma_zone_t zone, void *item)
 		return (NULL);
 	if (zone->uz_flags & UMA_ZFLAG_VTOSLAB) {
 		/*
-		 * K24-T00 (round 14): vtoslab() resolves via
+		 * vtoslab() resolves via
 		 * PHYS_TO_VM_PAGE(pmap_kextract((vm_offset_t)mem)) --
 		 * pmap_kextract() requires a LIVE kernel_pmap mapping of
 		 * mem, the exact precondition this epic's own kstack_va
@@ -6490,9 +6489,9 @@ uma_dbg_zskip(uma_zone_t zone, void *mem)
 		return (true);
 
 	/*
-	 * K24-T00 (round 17, disposition chosen and argued): FOUR
+	 * FOUR
 	 * independent attempts to walk and rewrite the debug bitmap
-	 * in-place (uma_hibernate_reinit_dbgbits(), rounds 10/11/16) have
+	 * in-place (rounds 10/11/16) have
 	 * now faulted live at four distinct offsets inside the identical
 	 * function -- conclusive, not merely suspicious, evidence that
 	 * reaching into a VTOSLAB keg's own slab-header bytes at this
@@ -6591,7 +6590,7 @@ uma_dbg_alloc(uma_zone_t zone, uma_slab_t slab, void *item)
 	was_set = BIT_TEST_SET_ATOMIC(keg->uk_ipers, freei,
 	    slab_dbg_bits(slab, keg));
 	/*
-	 * K24-T00 (round 11, second lead): uma_hibernate_dbg_suppress,
+	 * uma_hibernate_dbg_suppress,
 	 * set only around this one resume continuation's own
 	 * DEVICE_RESUME(root_bus) call (sys/dev/acpica/acpi.c), bounds
 	 * this skip to exactly the window where the debug bitmap can
@@ -6640,7 +6639,7 @@ uma_dbg_free(uma_zone_t zone, uma_slab_t slab, void *item)
 	was_clr = BIT_TEST_CLR_ATOMIC(keg->uk_ipers, freei,
 	    slab_dbg_bits(slab, keg));
 	/*
-	 * K24-T00 (round 11, second lead): see the identical comment
+	 * see the identical comment
 	 * above uma_dbg_alloc()'s own suppressed check. The
 	 * BIT_TEST_CLR_ATOMIC above still runs unconditionally, so this
 	 * slot's debug bit is corrected regardless of whether the panic

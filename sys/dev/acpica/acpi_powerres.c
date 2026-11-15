@@ -95,7 +95,7 @@ static TAILQ_HEAD(acpi_powerconsumer_list, acpi_powerconsumer)
     acpi_powerconsumers = TAILQ_HEAD_INITIALIZER(acpi_powerconsumers);
 
 /*
- * K24-T00 (measurement-method fix round): acpi_powerresources/
+ * acpi_powerresources/
  * acpi_powerconsumers (this file), the two static TAILQ heads every
  * ACPI power-resource/consumer registration and lookup
  * (acpi_pwr_register_consumer()/acpi_pwr_find_consumer(), etc.) walks
@@ -135,7 +135,7 @@ hibernate_md_acpi_powerconsumers_va(vm_offset_t *va, size_t *len)
 }
 
 /*
- * K24-T00 (round 12, ACPI power-resource subsystem sweep): per
+ * per
  * explicit instruction, every structure this subsystem's resume-path
  * consumers touch was enumerated once by direct source reading.
  * acpi_powerresources/acpi_powerconsumers (above) are the only
@@ -194,8 +194,7 @@ acpi_powerres_hibernate_selfcopy_nodes(const struct hibernate_attempt *ha,
 ACPI_SERIAL_DECL(powerres, "ACPI power resources");
 
 /*
- * K24-T00 (round 12, ACPI power-resource subsystem sweep, found during
- * live capture): ACPI_SERIAL_DECL() (acpivar.h) expands to a static
+ * ACPI_SERIAL_DECL() (acpivar.h) expands to a static
  * `struct sx powerres_sxlock` (this file), SX_SYSINIT()'d at this
  * boot's own cold-boot time -- a live BSS global this epic's own
  * established rule already covers for every sibling mutex/sx this
@@ -372,7 +371,7 @@ acpi_pwr_register_consumer(ACPI_HANDLE consumer)
 	return_ACPI_STATUS (AE_NO_MEMORY);
     TAILQ_INSERT_HEAD(&acpi_powerconsumers, pc, ac_link);
     /*
-     * K24-T00 (round 13, validation harness): confirm the insert this
+     * confirm the insert this
      * line just performed is itself coherent -- the just-inserted
      * node must now be TAILQ_FIRST, and if a second node exists, that
      * second node's own prev must point back to this one. This
@@ -458,7 +457,7 @@ acpi_pwr_switch_consumer(ACPI_HANDLE consumer, int state)
     ACPI_SERIAL_BEGIN(powerres);
 
     /*
-     * K24-T00 (round 13): validate every list this function is about
+     * validate every list this function is about
      * to traverse BEFORE traversing it, converting the unreproducible
      * corruption this call site has shown (7/9 recurrence, round 12)
      * into a named, observable invariant failure on its first
@@ -922,7 +921,7 @@ acpi_pwr_find_consumer(ACPI_HANDLE consumer)
 }
 
 /*
- * K24-T00 (round 13, validation harness per explicit instruction):
+ *
  * node/lock protection (round 12) did not close the residual
  * acpi_pwr_switch_consumer() GPF / acpi_pwr_register_consumer() tailq
  * corruption (7/9 recurrence), and two live GDB attempts failed to
@@ -1036,7 +1035,7 @@ acpi_pwr_validate_or_panic(void)
 }
 
 /*
- * K24-T00 (round 14, disposition argued and chosen): the validation
+ * the validation
  * harness (above) converted the unreproducible corruption into a
  * deterministic fault, confirming the poisoned field is an
  * ACPI_HANDLE -- a pointer into the ACPI namespace -- stored in an
@@ -1115,7 +1114,7 @@ void
 acpi_pwr_hibernate_reinit(void)
 {
 	/*
-	 * K24-T00 (round 14, corrected after live capture): the first
+	 * the first
 	 * version of this function walked and TAILQ_REMOVE()'d every
 	 * node, trusting the list's own internal link structure to be
 	 * sound even though only the ACPI_HANDLE field had been shown
