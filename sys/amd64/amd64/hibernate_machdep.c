@@ -4822,6 +4822,42 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		/*
+		 * pidhashtbl's own
+		 * backing array (sys/kern/kern_proc.c, one hashinit() ->
+		 * hashalloc() malloc() block) is staged here with
+		 * copy_leaf=FALSE, correcting the previous round's
+		 * copy_leaf=true attempt (reverted after a confirmed
+		 * regression, see git history/evidence record). With
+		 * copy_leaf=false, hibernate_md_selfcopy_walk() still
+		 * self-copy-protects every PAGE-TABLE page along the walk
+		 * (PML4/PDPT/PD/PT), keeping the VA range mapped and
+		 * readable, but does NOT self-copy the terminal LEAF data
+		 * page itself -- that page is left to participate normally
+		 * in the K-10 destination-set copy, so its content becomes
+		 * the IMAGE's own saved bucket-pointer bytes. This is the
+		 * saved_pcb_va rule, not the sleepq_chains rule: the table
+		 * the walk reads is now internally consistent BECAUSE both
+		 * the pointers (now image content) and the struct proc
+		 * objects they reference (already image content, via the
+		 * ordinary destination-set copy) come from the SAME saved
+		 * boot, rather than the live/image mismatch copy_leaf=true
+		 * produced.
+		 */
+		if (error == 0) {
+			extern struct pidhashhead *pidhashtbl;
+			extern u_long pidhash;
+			vm_offset_t ph_va, ph_end;
+
+			ph_va = trunc_page((vm_offset_t)pidhashtbl);
+			ph_end = round_page((vm_offset_t)pidhashtbl +
+			    (pidhash + 1) * sizeof(*pidhashtbl));
+			for (; ph_va < ph_end && error == 0;
+			    ph_va += PAGE_SIZE)
+				error = hibernate_md_selfcopy_walk(ha,
+				    wvec, p, kernel_pmap->pm_cr3,
+				    ph_va, false, &selfcopied);
+		}
 		if (error == 0) {
 			/*
 			 * K24-T00 (exhaustive sweep): bucket_zones[]
