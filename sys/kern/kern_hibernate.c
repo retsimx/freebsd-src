@@ -6035,7 +6035,8 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 
 	if (hib_guard_captured_g) {
 		__stack_chk_guard[0] = (long)hib_guard_image_value_g;
-	}#endif
+	}
+#endif
 	hibernate_machdep_enter();
 
 classify_non_pending:
