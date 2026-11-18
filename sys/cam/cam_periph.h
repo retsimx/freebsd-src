@@ -53,6 +53,24 @@ void periphdriver_register(void *);
 int periphdriver_unregister(void *);
 void periphdriver_init(int level);
 
+/*
+ * hibernate self-copy-protect accessors for the periph_drivers[]
+ * registry, defined in cam_periph.c -- see that file's own
+ * cam_periph_hibernate_selfcopy_range() comment for the destination-set-
+ * accounting-gap rationale (same class as pc_gdt/ths[]/vm_dom[]/DPCPU).
+ * sys/amd64/amd64/hibernate_machdep.c is the sole consumer and declares
+ * its own local extern prototypes at the call site (mirroring this
+ * file's own existing cross-subsystem hibernate-accessor precedent,
+ * e.g. tc_hibernate_selfcopy_range()) rather than including this header,
+ * since <cam/cam_periph.h>'s own transitive includes (cam_xpt.h ->
+ * cam_ccb.h) require CAM-specific typedefs (path_id_t, cam_pinfo, union
+ * ccb, ...) that are not visible/needed in that file's own include
+ * context.
+ */
+u_int	cam_periph_hibernate_ndrivers(void);
+void	cam_periph_hibernate_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+
 #include <sys/module.h>
 #define PERIPHDRIVER_DECLARE(name, driver) \
 	static int name ## _modevent(module_t mod, int type, void *data) \

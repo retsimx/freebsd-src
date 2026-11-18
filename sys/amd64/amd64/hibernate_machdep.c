@@ -3816,6 +3816,67 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * CAM peripheral driver structs (ata_da.c's own
+			 * "adadriver", scsi_da.c's "dadriver", etc.) -- the
+			 * NINTH instance of the same destination-set-
+			 * accounting-gap class as pc_gdt/KPML4phys/ths[]/
+			 * vm_page_array/idle kstacks/vm_dom[]/DPCPU/FPU save
+			 * area above.  Confirmed by direct disassembly of a
+			 * live crash this round: adaresume()'s own
+			 * CAM_PERIPH_FOREACH(periph, &adadriver) loads
+			 * adadriver.units.tqh_first directly ("mov
+			 * 0x10(%rbx),%rbx" at adaresume+0x19, rbx=
+			 * 0xdeadc0dedeadc0de observed at the fault), then
+			 * faults dereferencing periph->flags at adaresume+
+			 * 0x30 -- i.e. the driver struct's own TAILQ_HEAD
+			 * sentinel, populated once by THIS boot's own
+			 * periphdriver_register() (sys/cam/cam_periph.c) at
+			 * module-load time, was overwritten by the SAVED
+			 * image's cross-boot content.  Content must be the
+			 * RESUME kernel's own cold-boot value (copy_leaf=
+			 * true, the same rule as pc_gdt/ths[]/vm_dom[]/
+			 * DPCPU), since each driver's own periph TAILQ was
+			 * built by this boot's own device probes, not the
+			 * saved image's.  cam_periph_hibernate_ndrivers()/
+			 * cam_periph_hibernate_selfcopy_range()
+			 * (sys/cam/cam_periph.c, declared sys/cam/
+			 * cam_periph.h) reuse the existing periph_drivers[]
+			 * registry so every registered CAM peripheral driver
+			 * (ada, da, cd, sa, nda, pass, ...) is protected
+			 * uniformly, not just the one (adadriver) this
+			 * round's own crash happened to surface.
+			 */
+			extern u_int cam_periph_hibernate_ndrivers(void);
+			extern void cam_periph_hibernate_selfcopy_range(
+			    u_int idx, uintptr_t *va_out, size_t *len_out);
+			u_int cam_ndrivers, cam_idx;
+
+			cam_ndrivers = cam_periph_hibernate_ndrivers();
+			for (cam_idx = 0; cam_idx < cam_ndrivers && error == 0;
+			    cam_idx++) {
+				uintptr_t cam_va;
+				size_t cam_len;
+				vm_offset_t cam_pg, cam_end;
+
+				cam_periph_hibernate_selfcopy_range(cam_idx,
+				    &cam_va, &cam_len);
+				if (cam_va == 0 || cam_len == 0)
+					continue;
+				cam_pg = trunc_page((vm_offset_t)cam_va);
+				cam_end = round_page((vm_offset_t)cam_va +
+				    cam_len);
+				for (; cam_pg < cam_end;
+				    cam_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    cam_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
+		if (error == 0) {
+			/*
 			 * Each live CPU's own DPCPU (dynamic per-CPU) region.
 			 * Confirmed by direct testing: once the AP idle-thread
 			 * reseed above lets the continuation run further, a NEW

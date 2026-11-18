@@ -108,6 +108,59 @@ static int nperiph_drivers;
 static int initialized = 0;
 struct periph_driver **periph_drivers;
 
+/*
+ * each registered struct periph_driver (ata_da.c's own
+ * "adadriver", scsi_da.c's "dadriver", etc.) is ordinary static/BSS
+ * resume-kernel state -- its own TAILQ_HEAD(units) sentinel and
+ * generation counter are populated once, at module-load time, by this
+ * boot's own periphdriver_register() below, exactly like pc_gdt/ths[]/
+ * vm_dom[]/DPCPU (sys/amd64/amd64/hibernate_machdep.c's own established
+ * precedent for this bug class). If the backing page happens to fall
+ * inside the K-10 destination set, the destructive copy silently
+ * overwrites it with the SAVED image's own cross-boot content, and a
+ * subsequent CAM_PERIPH_FOREACH() walk (adaresume()'s own
+ * "mov 0x10(%rbx),%rbx" direct load of adadriver.units.tqh_first,
+ * confirmed by direct disassembly) dereferences whatever junk byte
+ * pattern the backing UMA/static-malloc slab held in the SAVED boot
+ * instead of this boot's own live, correctly-populated head pointer --
+ * the exact 0xdeadc0dedeadc0de poison this epic's own prior rounds have
+ * already named for this same class (pcb_save, kstack, FPU save area).
+ * The content needed post-resume is the RESUME kernel's own cold-boot
+ * value (copy_leaf=true, the same rule as pc_gdt/ths[]/vm_dom[]/DPCPU,
+ * not vm_page_array/kstack's copy_leaf=false), since each driver's own
+ * TAILQ of periph nodes was built by THIS boot's own device probes, not
+ * the saved image's.
+ *
+ * periph_drivers[] (this file's own registry array, populated by
+ * periphdriver_register() below) already enumerates every driver
+ * struct's own address -- this accessor reuses it directly rather than
+ * hardcoding any one driver by name, so the protection covers every
+ * CAM peripheral driver (ada, da, cd, sa, nda, pass, ...) uniformly,
+ * not just the one (adadriver) this round's own crash happened to
+ * surface.
+ */
+void
+cam_periph_hibernate_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+
+	if (idx >= (u_int)nperiph_drivers || periph_drivers == NULL ||
+	    periph_drivers[idx] == NULL) {
+		*va_out = 0;
+		*len_out = 0;
+		return;
+	}
+	*va_out = (uintptr_t)periph_drivers[idx];
+	*len_out = sizeof(*periph_drivers[idx]);
+}
+
+u_int
+cam_periph_hibernate_ndrivers(void)
+{
+
+	return ((u_int)nperiph_drivers);
+}
+
 static MALLOC_DEFINE(M_CAMPERIPH, "CAM periph", "CAM peripheral buffers");
 
 static int periph_selto_delay = 1000;
