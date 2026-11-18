@@ -5323,8 +5323,35 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		{
 			int reinit_cpu;
 
-			CPU_FOREACH(reinit_cpu)
+			/*
+			 * callout_cpu_hibernate_reinit_chains()
+			 * re-initialises each CPU's own cc_lock (a spin
+			 * mutex) via mtx_init(..., MTX_NEW), which resets
+			 * the lock's internal state -- but interrupts are
+			 * NOT masked here (acpi_s4_resume_interrupts()
+			 * already ran earlier, in acpi_s4_resume_bsp(),
+			 * restoring the saved intr_state), so a timer
+			 * interrupt landing on either CPU during this exact
+			 * window can enter callout_process() (which asserts
+			 * THREAD_LOCK_ASSERT(cc->cc_thread, MA_OWNED) on
+			 * cc_lock) while cc_lock is mid-reinitialisation,
+			 * producing the "mutex callout not owned" panic at
+			 * kern_timeout.c:673 (observed this session, not
+			 * reproduced on every run -- a genuine race, not a
+			 * deterministic consequence of the reinit itself).
+			 * spinlock_enter()/spinlock_exit() (the same
+			 * primitive callout_cpu_switch() already uses for
+			 * an analogous cc_lock transition) masks interrupts
+			 * on this CPU for the narrow duration of the
+			 * reinit, with no lock taken and no blocking
+			 * possible, closing the window without widening any
+			 * check or touching the wire format.
+			 */
+			CPU_FOREACH(reinit_cpu) {
+				spinlock_enter();
 				callout_cpu_hibernate_reinit_chains(reinit_cpu);
+				spinlock_exit();
+			}
 		}
 		/*
 		 * clear HIB_STAGE_RESERVED before unwinding on this
