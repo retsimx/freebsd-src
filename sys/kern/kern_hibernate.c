@@ -1790,6 +1790,36 @@ hibernate_coordinator_mtx_reseed(struct thread *td)
 {
 
 	hibernate_coordinator_mtx.mtx_lock = (uintptr_t)td;
+	/*
+	 * The raw mtx_lock field write above makes mtx_owned()/
+	 * mtx_unlock_flags()'s own ownership check pass, but WITNESS keeps
+	 * a SEPARATE, independent per-thread record (td->td_sleeplocks)
+	 * of which locks this thread holds, populated only by an actual
+	 * WITNESS_LOCK() call (i.e. a real mtx_lock()); this field write
+	 * never performs one, so the mutex's own WITNESS registration was
+	 * never (re-)established across the resume discontinuity.  The
+	 * eventual hibernate_coordinator_release() -> mtx_unlock_flags()
+	 * -> witness_unlock() call walks exactly that list looking for
+	 * this lock and panics ("not locked") when it is absent -- this
+	 * is true immediately after this function returns, confirmed by
+	 * direct probe (after reseed ... found_in_
+	 * sleeplocks=0), before any of the later reinit calls run.  Call
+	 * the public witness_lock() directly, with the exact same
+	 * LOP_EXCLUSIVE flag an ordinary mtx_lock() uses (sys/kern/
+	 * kern_mutex.c's own __mtx_lock_flags()), so WITNESS's own
+	 * bookkeeping matches the raw mtx_lock field this function
+	 * already installs.
+	 */
+	witness_lock(&hibernate_coordinator_mtx.lock_object, LOP_EXCLUSIVE,
+	    __FILE__, __LINE__);
+	/*
+	 * Also mirror the public mtx_lock() path's own td_locks
+	 * accounting increment.  Without it td_locks is one short of the
+	 * td_sleeplocks contents, and the eventual mtx_unlock_flags() ->
+	 * TD_LOCKS_DEC() trips KASSERT(td_locks > 0) ("Thread %p owns no
+	 * locks") even though witness_unlock() finds the lock.
+	 */
+	TD_LOCKS_INC(td);
 }
 
 /* Pointer to the active hibernate attempt, set/cleared by the coordinator. */
