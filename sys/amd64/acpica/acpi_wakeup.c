@@ -374,7 +374,33 @@ acpi_alloc_wakeup_handler(void **wakeaddr,
 	}
 	susppcbs = malloc(mp_ncpus * sizeof(*susppcbs), M_DEVBUF, M_WAITOK);
 	for (i = 0; i < mp_ncpus; i++) {
-		susppcbs[i] = malloc(sizeof(**susppcbs), M_DEVBUF, M_WAITOK);
+		/*
+		 * M_ZERO (not just M_WAITOK).  struct pcb's own
+		 * savectx() (sys/amd64/amd64/cpu_switch.S) writes only a
+		 * fixed subset of fields (pcb_rip, pcb_rbx/rsp/rbp/r12-r15,
+		 * pcb_cr0-cr4, pcb_dr0-dr7, pcb_fsbase/gsbase/kgsbase, the
+		 * EFER/STAR/LSTAR/CSTAR/SFMASK/FRED_* MSR block, and
+		 * pcb_idt/gdt/ldt/tr) -- every other struct pcb field
+		 * (pcb_flags, pcb_initial_fpucw, pcb_onfault,
+		 * pcb_saved_ucr3, pcb_tssp, pcb_save, pcb_tlsbase) is never
+		 * written by savectx() and was previously left holding
+		 * whatever the backing UMA slab last held (confirmed this
+		 * epic's own prior round: a freed-and-rejunked slab reads
+		 * back as uma_junk, 0xdeadc0dedeadc0de).  This per-CPU
+		 * scratch struct pcb is populated SOLELY by savectx() (see
+		 * sys/amd64/amd64/hibernate_machdep.c's own
+		 * dumpsys_hibernate_savectx() and this file's own
+		 * acpi_wakeup()), never by cpu_fork()/thread creation, so
+		 * there is no other, earlier zeroing this allocation could
+		 * otherwise rely on.  Zeroing here makes every
+		 * savectx()-unwritten field a deterministic, well-defined
+		 * zero in both the live allocation and (once captured) the
+		 * hibernate image, instead of boot-dependent poison; this
+		 * is a one-time, small (sizeof(struct susppcb) per CPU)
+		 * cost at one-time setup, not a hot path.
+		 */
+		susppcbs[i] = malloc(sizeof(**susppcbs), M_DEVBUF,
+		    M_WAITOK | M_ZERO);
 		susppcbs[i]->sp_fpususpend = alloc_fpusave(M_WAITOK);
 	}
 	return;
