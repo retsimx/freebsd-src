@@ -106,6 +106,7 @@ static struct {
 } hibernate_k12_owner;
 
 #include <vm/vm.h>
+#include <vm/vm_extern.h>
 #include <vm/vm_page.h>
 #include <vm/vm_phys.h>
 #endif /* _HIBERNATE_USERLAND_BUILD */
@@ -4146,6 +4147,26 @@ struct hibernate_staging {
 	struct hib_page_set hs_aux;
 	u_long hs_vector_pages; /* V */
 	u_long hs_xsave_pages;	/* X (always 1; X > 1 refuses E2BIG). */
+	/*
+	 * hs_aux's first V backing pages (the source-PA vector
+	 * storage) are an ordinary scattered, count-based reservation --
+	 * NOT physically contiguous in general -- so a flat multi-page
+	 * C pointer across them cannot be built via hib_pages_map()'s
+	 * one-page-at-a-time PHYS_TO_DMAP().  hs_vector_kva is a
+	 * pmap_qenter()-built flat kernel VA window spanning exactly
+	 * those V scattered physical pages, established lazily by
+	 * hibernate_staging_source_pages() and torn down by
+	 * hibernate_safe_pages_free(); it is what every C-side flat-
+	 * array reader of the vector's CONTENT (hibernate_md_source_
+	 * disjoint(), the self-copy protection mutation) actually reads
+	 * through.  Distinct from the private-domain VA window
+	 * (HIBERNATE_MD_VECTOR_SLOT, sys/amd64/amd64/hibernate_machdep.c)
+	 * the trampoline reads through post-CR3-switch -- that one maps
+	 * the same scattered frames a second time, under a different
+	 * page table, for a different reader.
+	 */
+	vm_offset_t hs_vector_kva;
+	bool hs_vector_kva_valid;
 };
 
 /*
@@ -4366,8 +4387,19 @@ hibernate_safe_pages_alloc(struct hibernate_attempt *ha)
 	/* Step 7: wiring is performed inside hib_pages_reserve (step 5). */
 
 	/*
-	 * Step 8: a second distinct reserve_count() instance for aux,
-	 * plus the same verification, plus aux-intersect-src == empty.
+	 * Step 8: aux no longer needs to be physically
+	 * contiguous.  hibernate_staging_source_pages() (below) now
+	 * window-maps the V vector-storage pages (both a pmap_qenter()
+	 * flat KVA for this kernel's own C-side reads, and a separate
+	 * private-domain-only VA for the resume trampoline) instead of
+	 * requiring a single contiguous run; an ordinary scattered,
+	 * count-based reservation -- the SAME primitive hs_src above
+	 * uses -- is therefore correct and sufficient here too.  This
+	 * also removes the genuine, reproducible ENOMEM this round's own
+	 * evidence recorded: vm_phys_hibernate_reserve_contig()'s first
+	 * attempt finding zero eligible contiguous runs once hs_src's own
+	 * scattered reservation has already fragmented the remaining free
+	 * pool on a full-system hibernate.
 	 */
 	error = hib_pages_reserve(ha, (size_t)A, &st->hs_aux);
 	if (error != 0)
@@ -4413,42 +4445,52 @@ hibernate_safe_pages_alloc(struct hibernate_attempt *ha)
  * #12, Design 036 S5.3/S5.4).  struct hibernate_staging stays file-private
  * to this file; this is the sole cross-translation-unit read of its
  * K-8-built shape, for hibernate_machdep_prepare() (sys/amd64/amd64/
- * hibernate_machdep.c).  Performs no allocation and no state change.
+ * hibernate_machdep.c).  Performs no allocation beyond a one-time,
+ * lazily-built flat KVA window (see hs_vector_kva); no other state change.
  *
- * The source-PA vector written by hibernate_safe_pages_alloc() (step 9)
- * occupies the first hs_vector_pages pages of hs_aux, holding exactly P
- * (ha->ha_image.hi_destination_pages) checked 64-bit source physical
- * addresses, one per destination page in destination order.  A single
- * arena-header PA field (hah_source_vector_pa) can represent this vector
- * only if those hs_vector_pages pages are physically contiguous; this
- * function verifies that contiguity and refuses (EINVAL) otherwise, rather
- * than guessing a scatter-list representation this issue does not define.
+ * the source-PA vector written by hibernate_safe_pages_alloc()
+ * (step 9) occupies the first hs_vector_pages (V) pages of hs_aux, holding
+ * exactly P (ha->ha_image.hi_destination_pages) checked 64-bit source
+ * physical addresses, one per destination page in destination order.
+ * Those V backing pages are an ORDINARY SCATTERED, count-based reservation
+ * and are no longer required to be physically contiguous -- the prior
+ * contiguity requirement (and its EINVAL refusal) is gone; a full-system
+ * hibernate's fragmented free pool made that requirement frequently
+ * unsatisfiable (observed ENOMEM at the ALLOCATE stage).
  *
- * On success (0): *vector_pa is the physical address of the first vector
- * page; *vector_va is a kernel VA (direct-map) at which the complete
- * P-entry vm_paddr_t array can be read sequentially (vector_va[0..P-1]);
- * *vector_pages is the page count of that vector storage (hs_vector_pages);
- * *xsave_pa is the physical address of the single already-staged XSAVE
- * page immediately following the vector storage
- * (hs_aux.hp_pa[hs_vector_pages]).
+ * On success (0):
+ *   *storage_pa is the raw, possibly-scattered per-page physical array
+ *     itself (hs_aux.hp_pa), V entries, for hibernate_machdep.c's
+ *     per-page private-domain window-map of the SAME frames the resume
+ *     trampoline reads post-CR3-switch.
+ *   *storage_pages is V, the page count of that backing storage.
+ *   *vector_va is a SEPARATE flat KERNEL VA (built via pmap_qenter() across
+ *     the V scattered physical pages, cached in hs_vector_kva) at which the
+ *     complete P-entry vm_paddr_t CONTENT array can be read sequentially
+ *     (vector_va[0..P-1]), for this kernel's own C-side disjointness/self-
+ *     copy-protection logic in hibernate_machdep.c.
+ *   *xsave_pa is the physical address of the single already-staged XSAVE
+ *     page immediately following the vector storage
+ *     (hs_aux.hp_pa[hs_vector_pages]).
  *
  * Returns EINVAL if ha is NULL, any out pointer is NULL, ha->ha_staging is
- * NULL (ALLOCATE not yet complete), the staged XSAVE page count is not
- * exactly 1 (K-8 refuses E2BIG otherwise, so this should not occur), or
- * the vector's pages are not physically contiguous.
+ * NULL (ALLOCATE not yet complete), or the staged XSAVE page count is not
+ * exactly 1 (K-8 refuses E2BIG otherwise, so this should not occur).
+ * Returns ENOMEM if the one-time KVA window cannot be built.
  */
 int
 hibernate_staging_source_pages(struct hibernate_attempt *ha,
-    vm_paddr_t *vector_pa, const vm_paddr_t **vector_va, size_t *vector_pages,
-    vm_paddr_t *xsave_pa)
+    const vm_paddr_t **storage_pa, size_t *storage_pages,
+    const vm_paddr_t **vector_va, vm_paddr_t *xsave_pa)
 {
+#ifdef _KERNEL
+	vm_page_t *qpages;
+#endif
 	struct hibernate_staging *st;
-	vm_paddr_t expect;
-	void *va;
 	u_long i, v;
 
-	if (ha == NULL || vector_pa == NULL || vector_va == NULL ||
-	    vector_pages == NULL || xsave_pa == NULL)
+	if (ha == NULL || storage_pa == NULL || storage_pages == NULL ||
+	    vector_va == NULL || xsave_pa == NULL)
 		return (EINVAL);
 	st = ha->ha_staging;
 	if (st == NULL || st->hs_aux.hp_pa == NULL)
@@ -4459,19 +4501,49 @@ hibernate_staging_source_pages(struct hibernate_attempt *ha,
 	if (v == 0 || v + st->hs_xsave_pages > st->hs_aux.hp_count)
 		return (EINVAL);
 
-	expect = st->hs_aux.hp_pa[0];
-	for (i = 0; i < v; i++) {
-		if (st->hs_aux.hp_pa[i] != expect)
-			return (EINVAL);
-		expect += (vm_paddr_t)HIB_PAGE_SIZE;
+	/*
+	 * hs_aux's own V backing pages are an ordinary count-based
+	 * reservation and are NOT required to be physically contiguous.
+	 * *storage_pa is the raw per-page array itself (one checked 64-bit
+	 * PA per backing page), for hibernate_machdep.c's private-domain
+	 * window-map of the SAME scattered frames the resume trampoline
+	 * reads post-CR3-switch.
+	 *
+	 * *vector_va is a SEPARATE flat KERNEL VA this kernel's own C code
+	 * (hibernate_md_source_disjoint(), the self-copy-protection
+	 * mutation, both in hibernate_machdep.c) reads/writes as an
+	 * ordinary contiguous vm_paddr_t[P] array -- built once here via
+	 * pmap_qenter() across the V scattered physical pages, since
+	 * hib_pages_map()'s one-page-at-a-time PHYS_TO_DMAP() cannot name
+	 * a flat multi-page span when the backing is scattered.  Built
+	 * lazily (hs_vector_kva_valid) so repeated calls in the same
+	 * attempt are idempotent; torn down by hibernate_safe_pages_free().
+	 */
+#ifdef _KERNEL
+	if (!st->hs_vector_kva_valid) {
+		qpages = hib_malloc(v * sizeof(*qpages));
+		if (qpages == NULL)
+			return (ENOMEM);
+		for (i = 0; i < v; i++)
+			qpages[i] = PHYS_TO_VM_PAGE(st->hs_aux.hp_pa[i]);
+		st->hs_vector_kva = (vm_offset_t)kva_alloc(
+		    v * (u_long)HIB_PAGE_SIZE);
+		if (st->hs_vector_kva == 0) {
+			hib_free(qpages);
+			return (ENOMEM);
+		}
+		pmap_qenter((void *)st->hs_vector_kva, qpages, (int)v);
+		hib_free(qpages);
+		st->hs_vector_kva_valid = true;
 	}
-
-	va = hib_pages_map(st->hs_aux.hp_pa[0]);
-	if (va == NULL)
+	*vector_va = (const vm_paddr_t *)st->hs_vector_kva;
+#else
+	*vector_va = (const vm_paddr_t *)hib_pages_map(st->hs_aux.hp_pa[0]);
+	if (*vector_va == NULL)
 		return (EINVAL);
-	*vector_pa = st->hs_aux.hp_pa[0];
-	*vector_va = (const vm_paddr_t *)va;
-	*vector_pages = (size_t)v;
+#endif
+	*storage_pa = st->hs_aux.hp_pa;
+	*storage_pages = (size_t)v;
 	*xsave_pa = st->hs_aux.hp_pa[v];
 	return (0);
 }
@@ -5462,6 +5534,22 @@ hibernate_safe_pages_free(struct hibernate_attempt *ha)
 		ha->ha_has_safe_pages = false;
 		return;
 	}
+
+#ifdef _KERNEL
+	/*
+	 * tear down the flat qenter() KVA window (if ever built)
+	 * before releasing the physical pages it mapped -- pmap_qremove()
+	 * must run while the frames are still valid, and this must happen
+	 * before hib_pages_release() below unwires/frees them.
+	 */
+	if (st->hs_vector_kva_valid) {
+		pmap_qremove((void *)st->hs_vector_kva,
+		    (int)st->hs_vector_pages);
+		kva_free((void *)st->hs_vector_kva,
+		    st->hs_vector_pages * (u_long)HIB_PAGE_SIZE);
+		st->hs_vector_kva_valid = false;
+	}
+#endif
 
 	hib_pages_release(&st->hs_aux);
 	hib_pages_release(&st->hs_src);

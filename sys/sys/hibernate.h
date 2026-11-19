@@ -1184,8 +1184,8 @@ void hibernate_attempt_cleanup(struct hibernate_attempt *ha);
 int hibernate_machdep_prepare(struct hibernate_attempt *ha);
 void hibernate_machdep_enter(void) __noreturn;
 int hibernate_staging_source_pages(struct hibernate_attempt *ha,
-    vm_paddr_t *vector_pa, const vm_paddr_t **vector_va, size_t *vector_pages,
-    vm_paddr_t *xsave_pa);
+    const vm_paddr_t **storage_pa, size_t *storage_pages,
+    const vm_paddr_t **vector_va, vm_paddr_t *xsave_pa);
 
 int hibernate_quiesce(struct hibernate_attempt *ha);
 int hibernate_quiesce_rollback(struct hibernate_attempt *ha);
@@ -1199,6 +1199,7 @@ int hibernate_resume_park_release(cpuset_t target);
  */
 struct thread;
 void hibernate_coordinator_mtx_reseed(struct thread *td);
+
 
 /* K-8-owned stage functions (bodies in kern/kern_hibernate.c). */
 int hibernate_meta_read(struct hibernate_attempt *ha, void *meta_buf,
