@@ -772,6 +772,24 @@ _Static_assert(HIBERNATE_MD_SAVED_SLOT != 0,
     "K-10 saved-domain slot must differ from hibernate_setup_identity_map()'s slot 0");
 
 /*
+ * dedicated low-memory PML4 slot for the source-PA vector's
+ * private-domain-only virtual window.  The vector's backing pages
+ * (hs_aux.hp_pa[0..vector_pages-1]) are an ordinary count-based, possibly
+ * SCATTERED reservation (ENOMEM under fragmentation is the whole problem
+ * this slot removes); this window maps them at consecutive 4 KiB VAs
+ * regardless of their physical scatter, so hibernate_tramp.S's flat
+ * "movq (%r10),%rsi; addq $8,%r10" source-vector read (HAH_SOURCE_VECTOR_PA)
+ * keeps working completely unmodified -- it already runs under the
+ * private CR3, so it never needs vector_pa to equal a real physical
+ * address, only a valid private-domain VA.  Distinct from both slot 0
+ * (identity) and HIBERNATE_MD_SAVED_SLOT (saved-domain stub/PCB).
+ */
+#define HIBERNATE_MD_VECTOR_SLOT 2
+_Static_assert(HIBERNATE_MD_VECTOR_SLOT != 0 &&
+    HIBERNATE_MD_VECTOR_SLOT != HIBERNATE_MD_SAVED_SLOT,
+    "K-10 vector window slot must differ from slot 0 and HIBERNATE_MD_SAVED_SLOT");
+
+/*
  * One coalesced destination run, read by hibernate_tramp.S's copy loop
  * under private CR3 (Design 036 S5.4).  Exactly HIBERNATE_ARENA_COPY_RUN_BYTES
  * (32) bytes; hmr_reserved is zero-filled and must stay zero so a future
@@ -1264,6 +1282,63 @@ hibernate_md_private_page_map(struct hibernate_md_private_builder *builder,
 }
 
 /*
+ * map one exact 4 KiB PRIVATE-DOMAIN-ONLY translation at an
+ * explicit virtual address distinct from the mapped physical frame.
+ * hibernate_md_private_pd_get()/_leaf_get()/_super_get() key every
+ * table lookup purely off the address passed to them (to choose which
+ * PML4/PDPT/PD/leaf slot to install into); they never read or write the
+ * mapped frame value, so passing a window VA in place of the identity PA
+ * they were written for is already correct and needs no change there.
+ * Only the terminal PTE write must name the real (possibly scattered)
+ * physical frame separately from the VA used to key the walk.  This is
+ * the sole helper that may legitimately set VA != PA; every other
+ * private-domain mapping in this file remains a strict identity map.
+ */
+static int
+hibernate_md_private_window_map(struct hibernate_md_private_builder *builder,
+    vm_offset_t va, vm_paddr_t frame_pa, pt_entry_t flags)
+{
+	pt_entry_t entry, *pt, pde;
+	vm_paddr_t key, super_base, super_pa;
+	u_int leaf, pte_index, pd;
+	int error;
+
+	if ((va & PAGE_MASK) != 0 || (frame_pa & PAGE_MASK) != 0)
+		return (EINVAL);
+	key = (vm_paddr_t)va;
+
+	error = hibernate_md_private_pd_get(builder, key, &pd);
+	if (error != 0)
+		return (error);
+	pde = builder->hmb_pd[pd]
+		  .hmp_entries[(u_int)((key >> PDRSHIFT) & (NPDEPG - 1))];
+	if ((pde & X86_PG_V) != 0 && (pde & PG_PS) != 0) {
+		super_base = pde & PG_PS_FRAME;
+		super_pa = super_base | (key & PDRMASK);
+		if (super_pa == frame_pa &&
+		    (pde & (X86_PG_V | X86_PG_RW)) == (X86_PG_V | X86_PG_RW) &&
+		    (pde & X86_PG_NX) == (flags & X86_PG_NX))
+			return (0);
+		return (EINVAL);
+	}
+
+	error = hibernate_md_private_leaf_get(builder, key, &leaf);
+	if (error != 0)
+		return (error);
+	pt = builder->hmb_leaf[leaf].hml_entries;
+	pte_index = (u_int)((key >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = frame_pa | X86_PG_V | X86_PG_RW | flags;
+	if ((pt[pte_index] & X86_PG_V) != 0) {
+		if ((pt[pte_index] & (PG_FRAME | X86_PG_NX)) !=
+		    (entry & (PG_FRAME | X86_PG_NX)))
+			return (EINVAL);
+		return (0);
+	}
+	pt[pte_index] = entry;
+	return (0);
+}
+
+/*
  * Map only the 2 MiB chunks intersecting the arena.  The first and last
  * chunks may include padding outside the arena, but untouched PDEs in the
  * same 1 GiB PD remain zero.
@@ -1472,9 +1547,9 @@ static int
 hibernate_md_private_tree_build(struct hibernate_attempt *ha,
     const struct hibernate_md_arena_layout *layout,
     const struct hibernate_md_run *runs, uint64_t run_count,
-    const vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t vector_pa,
-    uint64_t vector_pages, vm_paddr_t xsave_pa, vm_paddr_t *private_cr3_out,
-    uint64_t *leaf_pages_out)
+    const vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t window_va,
+    const vm_paddr_t *storage_pa, uint64_t vector_pages, vm_paddr_t xsave_pa,
+    vm_paddr_t *private_cr3_out, uint64_t *leaf_pages_out)
 {
 	struct hibernate_md_private_builder builder;
 	vm_paddr_t arena_end, pa, run_end, root_pa;
@@ -1492,7 +1567,7 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 	 * budget is already exhausted.
 	 */
 	error = hibernate_md_private_leaf_requirement(ha, arena_end, vector,
-	    vector_count, vector_pa, vector_pages, xsave_pa, &leaf_required);
+	    vector_count, window_va, vector_pages, xsave_pa, &leaf_required);
 	if (error != 0)
 		return (error);
 	if (!hibernate_md_leaf_budget_ok(leaf_required,
@@ -1562,14 +1637,26 @@ hibernate_md_private_tree_build(struct hibernate_attempt *ha,
 		if (error != 0)
 			goto out;
 	}
+	/*
+	 * the V source-vector BACKING pages (storage_pa[0..V-1])
+	 * are an ordinary scattered, count-based reservation -- they need
+	 * not be, and in general are not, physically contiguous.  Map each
+	 * one at a deterministic, private-domain-only, VA-contiguous window
+	 * (window_va + j*PAGE_SIZE, frame storage_pa[j]) instead of
+	 * identity-mapping a contiguous physical run.  hibernate_tramp.S's
+	 * copy loop reads HAH_SOURCE_VECTOR_PA (== window_va) as a flat
+	 * pointer entirely under the private CR3, so it never observes or
+	 * needs the physical scatter.
+	 */
 	for (j = 0; j < vector_pages; j++) {
 		if (__builtin_mul_overflow(j, (uint64_t)HIB_PAGE_SIZE,
 			&bytes) ||
-		    __builtin_add_overflow(vector_pa, bytes, &pa)) {
+		    __builtin_add_overflow(window_va, bytes, &pa)) {
 			error = EOVERFLOW;
 			goto out;
 		}
-		error = hibernate_md_private_page_map(&builder, pa);
+		error = hibernate_md_private_window_map(&builder, pa,
+		    storage_pa[j], 0);
 		if (error != 0)
 			goto out;
 	}
@@ -2146,8 +2233,9 @@ hibernate_md_selfcopy_range(const struct hibernate_attempt *ha,
 static int
 hibernate_md_private_tree_validate(const struct hibernate_attempt *ha,
     const struct hibernate_md_run *runs, uint64_t run_count,
-    const vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t vector_pa,
-    uint64_t vector_pages, vm_paddr_t xsave_pa, vm_paddr_t private_cr3)
+    const vm_paddr_t *vector, uint64_t vector_count, vm_paddr_t window_va,
+    const vm_paddr_t *storage_pa, uint64_t vector_pages, vm_paddr_t xsave_pa,
+    vm_paddr_t private_cr3)
 {
 	vm_paddr_t arena_end, pa, run_end;
 	uint64_t bytes, i, j;
@@ -2178,13 +2266,20 @@ hibernate_md_private_tree_validate(const struct hibernate_attempt *ha,
 			vector[i], X86_PG_V | X86_PG_RW))
 			return (EINVAL);
 	}
+	/*
+	 * independently re-walk each window-mapped backing page,
+	 * proving VA window_va+j*PAGE_SIZE resolves to the EXACT scattered
+	 * frame storage_pa[j] the builder was given -- the same
+	 * independent-walk discipline every other object in this function
+	 * already receives, just keyed by window VA instead of identity PA.
+	 */
 	for (j = 0; j < vector_pages; j++) {
 		if (__builtin_mul_overflow(j, (uint64_t)HIB_PAGE_SIZE,
 			&bytes) ||
-		    __builtin_add_overflow(vector_pa, bytes, &pa))
+		    __builtin_add_overflow(window_va, bytes, &pa))
 			return (EOVERFLOW);
-		if (!hibernate_md_walk_matches(private_cr3, pa, pa,
-			X86_PG_V | X86_PG_RW))
+		if (!hibernate_md_walk_matches(private_cr3, pa,
+			storage_pa[j], X86_PG_V | X86_PG_RW))
 			return (EINVAL);
 	}
 	{
@@ -2573,6 +2668,69 @@ hib_staged_leaf(const struct hibernate_attempt *ha,
 	    walk));
 }
 
+/*
+ * hib_saved_domain_leaf_valid() -- quiet (non-printf) variant of
+ * the saved-domain leaf capture, used by the per-thread kstack self-copy
+ * loop's own fail-closed decision below. Walks the SAVED domain's own
+ * page tables (rooted at hi_pcb.hp_cr3), reading each intermediate
+ * table page via the destination-set+wvec mechanism when that page is
+ * itself part of the K-10 destination set, or directly via
+ * PHYS_TO_DMAP() otherwise (a page outside the destination set is never
+ * touched by the destructive copy, so its current live content is
+ * already byte-identical to what the saved image held -- the same
+ * reasoning this function's own saved-domain walk already documents).
+ * Returns true only if every level down to a terminal 4 KiB PTE is
+ * present/valid; never returns a superpage leaf as "valid" here (this
+ * caller only needs a yes/no answer for a specific 4 KiB VA, matching
+ * the page-at-a-time granularity the kstack loop already uses).
+ */
+static u_int hibernate_resume_kstack_skip_count;
+
+static bool
+hib_saved_domain_leaf_valid(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va)
+{
+	vm_paddr_t table_pa;
+	uint64_t entry, idx;
+	u_int index;
+	int err;
+
+	table_pa = ha->ha_image.hi_pcb.hp_cr3 & PG_FRAME;
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	return ((entry & X86_PG_V) != 0);
+}
+
 static int
 hibernate_md_staged_read(const struct hibernate_attempt *ha,
     const vm_paddr_t *wvec, uint64_t p, vm_offset_t va, void *buf,
@@ -2760,9 +2918,10 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	struct hibernate_arena_header hah;
 	struct hibernate_handoff_record hhr;
 	struct hibernate_md_run *runs;
-	vm_paddr_t vector_pa, xsave_pa, private_cr3, arena_end;
+	vm_paddr_t window_va, xsave_pa, private_cr3, arena_end;
 	vm_paddr_t trampoline_stub_pa;
 	const vm_paddr_t *vector_va;
+	const vm_paddr_t *storage_pa;
 	vm_paddr_t *scratch;
 	size_t vector_pages;
 	uintptr_t trampoline_size;
@@ -2922,11 +3081,20 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	 * K-10 source-page accessor (companion amendment,
 	 * sys/kern/kern_hibernate.c).
 	 */
-	error = hibernate_staging_source_pages(ha, &vector_pa, &vector_va,
-	    &vector_pages, &xsave_pa);
+	error = hibernate_staging_source_pages(ha, &storage_pa, &vector_pages,
+	    &vector_va, &xsave_pa);
 	if (error != 0)
 		return (error);
 	p = ha->ha_image.hi_destination_pages;
+	/*
+	 * window_va is a fixed, VA-only private-domain window base
+	 * (HIBERNATE_MD_VECTOR_SLOT * NBPML4, no PA offset -- unlike
+	 * HIBERNATE_MD_SAVED_SLOT's use, this window never aliases a real
+	 * identity PA, it is purely a destination for the per-page
+	 * hibernate_md_private_window_map() calls below), so it can be
+	 * computed here with no allocation or page-table side effects.
+	 */
+	window_va = (vm_paddr_t)HIBERNATE_MD_VECTOR_SLOT * (vm_paddr_t)NBPML4;
 
 	/*
 	 * The internal entry ABI carries the separately staged XSAVE identity
@@ -2950,11 +3118,18 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	if (cpu_maxphyaddr == 0 || cpu_maxphyaddr > 64)
 		return (EINVAL);
 	phys_limit = UINT64_C(1) << cpu_maxphyaddr;
-	if ((uint64_t)arena_end > phys_limit ||
-	    (uint64_t)xsave_pa >= phys_limit ||
-	    (uint64_t)vector_pa + (uint64_t)vector_pages * HIB_PAGE_SIZE >
-		phys_limit) {
+	if ((uint64_t)arena_end > phys_limit || (uint64_t)xsave_pa >= phys_limit) {
 		return (EINVAL);
+	}
+	/*
+	 * storage_pa[] is a scattered per-page array, not a
+	 * contiguous range -- prove each backing frame individually
+	 * representable, rather than checking a single base+extent that no
+	 * longer corresponds to how the pages are laid out.
+	 */
+	for (di = 0; di < (uint64_t)vector_pages; di++) {
+		if ((uint64_t)storage_pa[di] >= phys_limit)
+			return (EINVAL);
 	}
 	for (di = 0; di < ha->ha_dst_count; di++) {
 		if ((uint64_t)ha->ha_dst_intervals[di * 2 + 1] > phys_limit)
@@ -2990,15 +3165,22 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	free(scratch, M_TEMP);
 	if (error != 0)
 		return (error);
-	if (vector_pa >= ha->ha_arena_start && vector_pa < arena_end)
-		return (EINVAL);
+	/*
+	 * each scattered backing frame (storage_pa[j]), not a
+	 * single contiguous range, must be disjoint from the arena.
+	 */
+	for (di = 0; di < (uint64_t)vector_pages; di++) {
+		if (storage_pa[di] >= ha->ha_arena_start &&
+		    storage_pa[di] < arena_end)
+			return (EINVAL);
+	}
 	if (xsave_pa >= ha->ha_arena_start && xsave_pa < arena_end)
 		return (EINVAL);
 
 	/* 5. Build the private CR3 tree. */
 	error = hibernate_md_private_tree_build(ha, &layout, runs, run_count,
-	    vector_va, p, vector_pa, (uint64_t)vector_pages, xsave_pa,
-	    &private_cr3, &private_leaf_pages);
+	    vector_va, p, window_va, storage_pa, (uint64_t)vector_pages,
+	    xsave_pa, &private_cr3, &private_leaf_pages);
 	if (error != 0)
 		return (error);
 
@@ -3050,8 +3232,8 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 
 	/* 6. Independently walk and validate both page-table domains. */
 	error = hibernate_md_private_tree_validate(ha, runs, run_count,
-	    vector_va, p, vector_pa, (uint64_t)vector_pages, xsave_pa,
-	    private_cr3);
+	    vector_va, p, window_va, storage_pa, (uint64_t)vector_pages,
+	    xsave_pa, private_cr3);
 	if (error != 0)
 		return (error);
 	error = hibernate_md_saved_domain_validate(trampoline_saved_va,
@@ -3552,11 +3734,74 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 
 				for (pg = 0; pg < threads[i].kstack_pages;
 				    pg++) {
+					vm_paddr_t live_pa;
+
 					va = threads[i].kstack_va +
 					    (vm_offset_t)pg * PAGE_SIZE;
 					resolved = hib_staged_leaf(ha, wvec, p,
 					    va, &walk);
-					if (!resolved || (walk.hmw_flags &
+					if (!resolved) {
+						if (hib_md_safe_resolve(
+						    kernel_pmap->pm_cr3, va,
+						    &live_pa)) {
+							continue;
+						}
+						/*
+						 * neither the staged
+						 * leaf resolver NOR the live-
+						 * superpage fallback can
+						 * resolve this VA. Before
+						 * refusing, check whether the
+						 * SAVED domain's own page
+						 * tables (hi_pcb.hp_cr3, the
+						 * CR3 that will be in force
+						 * immediately after this
+						 * resume continuation) have a
+						 * valid terminal PTE here.
+						 * Confirmed by direct
+						 * capture: this
+						 * case DOES occur (a kstack
+						 * page genuinely unmapped in
+						 * the LIVE resume-kernel tree
+						 * at this early point, but
+						 * also unmapped in the saved
+						 * domain's own tree -- the
+						 * saved image's own terminal
+						 * PTE read back as 0/invalid,
+						 * not merely unreachable). A
+						 * page absent from BOTH
+						 * domains is not a resolution
+						 * gap to paper over: it means
+						 * this exact 4 KiB kstack
+						 * page was never written by
+						 * either kernel and will
+						 * never be read before being
+						 * written again (ordinary
+						 * kernel stacks are sized for
+						 * worst-case depth, not
+						 * guaranteed fully touched) --
+						 * skip it, counted and named,
+						 * exactly as the sibling
+						 * thread0-superpage case
+						 * above already skips a
+						 * disjoint-but-resolvable
+						 * page for an analogous
+						 * reason. If the saved domain
+						 * DID show a valid leaf here,
+						 * that would be a different,
+						 * install-worthy case this
+						 * branch does not take --
+						 * fail closed instead.
+						 */
+						if (!hib_saved_domain_leaf_valid(
+						    ha, wvec, p, va)) {
+							hibernate_resume_kstack_skip_count++;
+							continue;
+						}
+						error = EINVAL;
+						break;
+					}
+					if ((walk.hmw_flags &
 					    (X86_PG_V | X86_PG_RW)) !=
 					    (X86_PG_V | X86_PG_RW)) {
 						error = EINVAL;
@@ -5230,7 +5475,18 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 	hah.hah_trampoline_saved_va = trampoline_saved_va;
 	hah.hah_arena_stack_pa = layout.stack_pa;
 	hah.hah_arena_stack_size = HIBERNATE_ARENA_STACK_BYTES;
-	hah.hah_source_vector_pa = vector_pa;
+	/*
+	 * hah_source_vector_pa now names the PRIVATE-DOMAIN window
+	 * VA (window_va), not a physical base address -- hibernate_tramp.S
+	 * only ever dereferences this field after the private CR3 is
+	 * already loaded (step 2 of its own sequence, before the copy loop
+	 * in step 3 reads it), so a valid private-domain VA is exactly as
+	 * usable there as a real PA was.  No on-disk/wire-format change:
+	 * this field is produced and consumed entirely within this same
+	 * resume boot, never encoded by the save-side writer or decoded
+	 * across a reboot.
+	 */
+	hah.hah_source_vector_pa = window_va;
 	hah.hah_first_destination_pa = run_count != 0 ? runs[0].hmr_pa : 0;
 	hah.hah_destination_page_count = p;
 	hah.hah_iterator_pa = layout.run_table_pa;
