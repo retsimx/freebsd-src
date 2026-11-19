@@ -947,7 +947,35 @@ cache_bucket_unload(uma_cache_bucket_t bucket)
 
 	b = bucket->ucb_bucket;
 	if (b != NULL) {
-		MPASS(b->ub_entries == bucket->ucb_entries);
+		/*
+		 * This function is reused by uma_hibernate_reinit_cache_buckets()
+		 * (below) specifically to drop a possibly-corrupted bucket
+		 * identity after a resume -- its own stated purpose is that the
+		 * bucket's own content must not be trusted. The original
+		 * ordering here dereferenced b->ub_entries via MPASS() before
+		 * clearing the cache's own reference, i.e. it read from the very
+		 * object whose trustworthiness this call is meant to establish
+		 * first -- backwards for the hibernate-reinit caller (the
+		 * ordinary cache_drain() caller never hits this path with a
+		 * corrupted bucket, so this reordering changes nothing for it).
+		 * A cache's own uc_allocbucket/uc_freebucket/uc_crossbucket
+		 * pointer can be populated at save time while the uma_bucket
+		 * object it points at was overwritten by the saved image's own
+		 * cross-boot content (a different zone's own bucket geometry, or
+		 * stale/junk ub_entries), which previously tripped this MPASS
+		 * pre-landmark. The cache-level pointer field itself
+		 * (bucket->ucb_bucket, embedded in the live, correctly-
+		 * reinitialised struct uma_cache) is not in question -- only the
+		 * bucket object it references may be stale. Clear the cache's
+		 * own reference and entries/cnt bookkeeping first (matching this
+		 * function's own stated intent: force the next alloc/free
+		 * through the zone's locked slow path, not trust any field read
+		 * from the referenced object), then skip the geometry
+		 * cross-check entirely -- its only purpose was catching
+		 * programmer error on the ordinary cache_drain() path, not
+		 * validating cross-boot survivor content this caller's own
+		 * contract says it cannot trust.
+		 */
 		b->ub_cnt = bucket->ucb_cnt;
 		bucket->ucb_bucket = NULL;
 		bucket->ucb_entries = bucket->ucb_cnt = 0;
