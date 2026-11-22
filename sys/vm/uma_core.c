@@ -5450,6 +5450,48 @@ uma_hibernate_reinit_plinks(void)
  * themselves ordinary BSS globals this file's own existing code
  * already dereferences on every boot) already reach correctly.
  */
+/*
+ * DSA00 round 2 extension: the bucket-item self-copy PROTECTION this
+ * epic previously tried (sys/amd64/amd64/hibernate_machdep.c's own
+ * bucket-item walk, now reverted) targeted exactly the structures this
+ * function already reaches -- every CPU's own per-zone cache buckets --
+ * one level deeper (the items INSIDE each bucket). Protection is wrong
+ * for that content by the same logic as every structure in this file's
+ * own class: a bucket/item only falls inside the K-10 destination set
+ * when it carries the SAVED image's own cross-boot content, so keeping
+ * it is never an option -- it must be dropped and rebuilt from this
+ * boot's own fresh state instead.
+ *
+ * The per-CPU case is already handled above (cache_bucket_unload_*()
+ * drops the live uc_allocbucket/uc_freebucket/uc_crossbucket pointer on
+ * every CPU, for every zone). The one bucket-holding structure NOT
+ * reached by that walk is each zone-domain's own `uzd_buckets` STAILQ
+ * (struct uma_zone_domain, sys/vm/uma_int.h) -- queued, currently-unused
+ * full buckets a CPU will later dequeue via bucket_cache_fetch(). If a
+ * queued bucket's own backing page (or an item inside it) falls inside
+ * the destination set, its post-copy content is the saved image's cross-
+ * boot snapshot -- the exact shape already established for "32 Bucket"/
+ * "UMA Slabs 0" trash-detection panics (sys/vm/uma_dbg.c's trash_ctor()/
+ * trash_dtor() both validate a repeating pattern that a saved-image
+ * snapshot of a DIFFERENT boot's allocator state will not match).
+ *
+ * Disposition: REINITIALIZE, not protect -- reset each zone-domain's own
+ * `uzd_buckets` STAILQ head to empty (STAILQ_INIT), dropping every queued
+ * bucket reference, and zero the domain's own item-count bookkeeping
+ * (uzd_nitems/uzd_imax/uzd_imin/uzd_bimin/uzd_wss/uzd_limin/uzd_timin),
+ * matching the cold-boot zone_ctor() state (bzero(zone, size) followed by
+ * STAILQ_INIT -- see zone_ctor(), this file) exactly. This does not free
+ * or dereference any bucket or item the queue pointed at: once the queue
+ * head is reset, nothing in this kernel can ever reach them again (the
+ * backing pages belong to the keg/bucket-zone's own slabs, already
+ * reinitialised identically to every other never-activated allocator
+ * structure in this class), so this is a pure pointer-drop, not a leak
+ * in any sense the resume continuation needs to care about. Runs in the
+ * identical safety window as the per-CPU drop above: before any
+ * malloc()/free() this continuation or any later device-resume callee
+ * performs, so no concurrent CPU can be touching any zone's own
+ * uzd_buckets at this point.
+ */
 void	uma_hibernate_reinit_cache_buckets(void);
 void
 uma_hibernate_reinit_cache_buckets(void)
@@ -5457,7 +5499,8 @@ uma_hibernate_reinit_cache_buckets(void)
 	uma_keg_t keg;
 	uma_zone_t zone;
 	uma_cache_t cache;
-	int cpu;
+	uma_zone_domain_t zdom;
+	int cpu, dom;
 
 	LIST_FOREACH(keg, &uma_kegs, uk_link) {
 		LIST_FOREACH(zone, &keg->uk_zones, uz_link) {
@@ -5467,6 +5510,17 @@ uma_hibernate_reinit_cache_buckets(void)
 				(void)cache_bucket_unload_free(cache);
 				(void)cache_bucket_unload_cross(cache);
 			}
+			for (dom = 0; dom < vm_ndomains; dom++) {
+				zdom = ZDOM_GET(zone, dom);
+				STAILQ_INIT(&zdom->uzd_buckets);
+				zdom->uzd_nitems = 0;
+				zdom->uzd_imax = 0;
+				zdom->uzd_imin = 0;
+				zdom->uzd_bimin = 0;
+				zdom->uzd_wss = 0;
+				zdom->uzd_limin = 0;
+				zdom->uzd_timin = 0;
+			}
 		}
 	}
 	LIST_FOREACH(zone, &uma_cachezones, uz_link) {
@@ -5475,6 +5529,17 @@ uma_hibernate_reinit_cache_buckets(void)
 			(void)cache_bucket_unload_alloc(cache);
 			(void)cache_bucket_unload_free(cache);
 			(void)cache_bucket_unload_cross(cache);
+		}
+		for (dom = 0; dom < vm_ndomains; dom++) {
+			zdom = ZDOM_GET(zone, dom);
+			STAILQ_INIT(&zdom->uzd_buckets);
+			zdom->uzd_nitems = 0;
+			zdom->uzd_imax = 0;
+			zdom->uzd_imin = 0;
+			zdom->uzd_bimin = 0;
+			zdom->uzd_wss = 0;
+			zdom->uzd_limin = 0;
+			zdom->uzd_timin = 0;
 		}
 	}
 }
