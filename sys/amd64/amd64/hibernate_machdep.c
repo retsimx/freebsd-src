@@ -5371,6 +5371,66 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * DSA00 round 3: item #11 conversion ATTEMPTED and
+			 * REVERTED. Removing keg protection (to resolve the
+			 * documented contradiction with uma_hibernate_reinit_
+			 * plinks()'s own precondition) was tested directly:
+			 * N=3 with protection removed reproduced the
+			 * previously-closed "32 Bucket" trash-detect panic at
+			 * 3/3 (the IDENTICAL address,
+			 * 0xfffff8000142af00, every time) -- a reproducible
+			 * regression, and a WORSE rate than the 2/9 plinks
+			 * GPF rate this conversion was meant to fix. Per the
+			 * standing rule (a change that raises another class
+			 * is a regression), this conversion is rolled back:
+			 * keg protection is RESTORED exactly as before this
+			 * round. The contradiction with
+			 * uma_hibernate_reinit_plinks()'s own documented
+			 * precondition is real and UNRESOLVED -- neither
+			 * disposition (protect, or let the saved image
+			 * through) is fully correct for this single object;
+			 * the keg almost certainly needs a finer-grained
+			 * split (list-head reinit distinct from the keg's
+			 * other, structural fields) that this round's budget
+			 * does not extend to designing and verifying. Flagged
+			 * for the next round, not force-fixed here.
+			 *
+			 * Every struct uma_keg (sys/vm/uma_core.c),
+			 * enumerated via the existing uma_kegs list.  Each
+			 * keg's own uk_domain[] slab lists are this boot's
+			 * own live allocator state -- copy_leaf=true.
+			 */
+			extern u_int uma_hibernate_nkegs(void);
+			extern void uma_hibernate_keg_selfcopy_range(u_int idx,
+			    uintptr_t *va_out, size_t *len_out);
+			u_int keg_n, keg_idx;
+
+			keg_n = uma_hibernate_nkegs();
+			for (keg_idx = 0; keg_idx < keg_n &&
+			    error == 0; keg_idx++) {
+				uintptr_t keg_va;
+				size_t keg_len;
+				vm_offset_t keg_pg, keg_end;
+
+				uma_hibernate_keg_selfcopy_range(keg_idx,
+				    &keg_va, &keg_len);
+				if (keg_va == 0 || keg_len == 0)
+					continue;
+				keg_pg = trunc_page((vm_offset_t)keg_va);
+				keg_end = round_page((vm_offset_t)keg_va +
+				    keg_len);
+				for (; keg_pg < keg_end;
+				    keg_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    keg_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
+		if (error == 0) {
+			/*
 			 * Every struct uma_zone reachable from each keg's
 			 * own uk_zones, plus the standalone uma_cachezones
 			 * list (sys/vm/uma_core.c).  copy_leaf=true: this

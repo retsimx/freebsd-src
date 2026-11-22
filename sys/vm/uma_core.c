@@ -5488,6 +5488,69 @@ hibernate_md_bucket_zones_va(vm_offset_t *va, size_t *len)
 }
 
 /*
+ * DSA00 this-round fix: each struct uma_keg's own embedded uk_domain[]
+ * array -- specifically each domain's own ud_part_slab/ud_free_slab/
+ * ud_full_slab LIST_HEAD sentinels (sys/vm/uma_int.h) -- is ordinary live
+ * resume-kernel bookkeeping, populated by THIS boot's own keg_ctor()/
+ * slab_alloc_item()/keg_free_slab() calls, never saved-image content worth
+ * restoring. If a keg's own backing page (each keg is a single, fixed-size
+ * allocation: ksize = sizeof(struct uma_keg) + sizeof(struct uma_domain) *
+ * vm_ndomains, see uma_startup1()/keg_alloc()) falls inside the K-10
+ * destination set, the destructive copy silently overwrites its own list
+ * sentinels with the SAVED image's cross-boot content; a subsequent
+ * LIST_INSERT_HEAD()/LIST_REMOVE() on that domain's own slab list (e.g.
+ * slab_alloc_item()'s own "LIST_INSERT_HEAD(&dom->ud_full_slab, slab,
+ * us_link)") then trips QMD_LIST_CHECK_HEAD()'s own "Bad list head
+ * first->prev != head" assertion (uma_core.c:4111, captured this round,
+ * firing post-landmark) -- the same destination-set-accounting-gap class
+ * as pc_gdt/DPCPU/kobj_ops/etc. above, an ELEVENTH instance. Content must
+ * be THIS boot's own cold-boot-built slab lists (copy_leaf=true, same rule
+ * as every sibling in this class): the saved image's own slab-list
+ * topology describes a DIFFERENT boot's physical slab layout entirely.
+ *
+ * Every keg is reached via the existing uma_kegs list this file already
+ * walks in uma_hibernate_reinit_cache_buckets() above, so this accessor is
+ * placed in the same file (uma_kegs is file-static) and enumerated the
+ * same idx-based way as cam_periph_hibernate_selfcopy_range()/
+ * device_hibernate_class_selfcopy_range() above: callers loop idx from 0
+ * while *va_out != 0.
+ */
+u_int	uma_hibernate_nkegs(void);
+u_int
+uma_hibernate_nkegs(void)
+{
+	uma_keg_t keg;
+	u_int n;
+
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link)
+		n++;
+	return (n);
+}
+
+void	uma_hibernate_keg_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+void
+uma_hibernate_keg_selfcopy_range(u_int idx, uintptr_t *va_out, size_t *len_out)
+{
+	uma_keg_t keg;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		if (n == idx) {
+			*va_out = (uintptr_t)keg;
+			*len_out = sizeof(struct uma_keg) +
+			    sizeof(struct uma_domain) * (size_t)vm_ndomains;
+			return;
+		}
+		n++;
+	}
+}
+
+/*
  * DSA00 this-round fix (continuation): captured directly this round --
  * a GPF INSIDE uma_hibernate_reinit_cache_buckets() itself (r8 =
  * 0xdeadc0dedeadc0de, the same UMA-junk poison) proves struct uma_zone
