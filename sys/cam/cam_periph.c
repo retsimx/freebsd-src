@@ -161,6 +161,78 @@ cam_periph_hibernate_ndrivers(void)
 	return ((u_int)nperiph_drivers);
 }
 
+/*
+ * DSA00 this-round fix: individual struct cam_periph nodes -- the
+ * SIBLING this round's own crash (adaresume() GPF, rbx=
+ * 0xdeadc0dedeadc0de, the SAME UMA-junk poison constant this epic has
+ * already named for pcb_save/kstack/FPU-save-area) proves the driver-
+ * registry fix above did NOT cover. Direct disassembly this round:
+ * adaresume()'s own "mov 0x40(%rbx),.. ; testb $8,0x40(%rbx) ; mov
+ * 0x68(%rbx),%rbx" is CAM_PERIPH_FOREACH()'s own cam_periph_acquire_
+ * next() walk of periph->unit_links (TAILQ_ENTRY(cam_periph), sys/cam/
+ * cam_periph.h) -- each INDIVIDUAL struct cam_periph node's own
+ * unit_links.tqe_next/tqe_prev back-pointers, not periph_drivers[]'s
+ * own TAILQ_HEAD sentinel (which the prior round's fix already
+ * protects correctly -- that fix was not wrong, merely incomplete: it
+ * named "the driver struct's own TAILQ_HEAD", not every node linked
+ * from it). Each struct cam_periph is a separate malloc(M_CAMPERIPH)
+ * allocation (cam_periph_alloc(), this file), so protecting the driver
+ * struct alone leaves every node it points at unprotected -- the exact
+ * gap this round's own crash demonstrates. Disposition: SAME epic, same
+ * class, same fix shape (copy_leaf=true, this boot's own live CAM
+ * topology, never saved-image content), extended to every periph node
+ * reachable from every registered driver's own units TAILQ.
+ * idx-based like the driver accessor immediately above: callers loop
+ * idx from 0 while *va_out != 0.
+ */
+u_int	cam_periph_hibernate_nperiphs(void);
+u_int
+cam_periph_hibernate_nperiphs(void)
+{
+	struct periph_driver **p_drv;
+	struct cam_periph *periph;
+	u_int n;
+
+	n = 0;
+	xpt_lock_buses();
+	for (p_drv = periph_drivers; p_drv != NULL && *p_drv != NULL;
+	    p_drv++) {
+		TAILQ_FOREACH(periph, &(*p_drv)->units, unit_links)
+			n++;
+	}
+	xpt_unlock_buses();
+	return (n);
+}
+
+void	cam_periph_hibernate_periph_selfcopy_range(u_int idx,
+	    uintptr_t *va_out, size_t *len_out);
+void
+cam_periph_hibernate_periph_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	struct periph_driver **p_drv;
+	struct cam_periph *periph;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	xpt_lock_buses();
+	for (p_drv = periph_drivers; p_drv != NULL && *p_drv != NULL;
+	    p_drv++) {
+		TAILQ_FOREACH(periph, &(*p_drv)->units, unit_links) {
+			if (n == idx) {
+				*va_out = (uintptr_t)periph;
+				*len_out = sizeof(*periph);
+				xpt_unlock_buses();
+				return;
+			}
+			n++;
+		}
+	}
+	xpt_unlock_buses();
+}
+
 static MALLOC_DEFINE(M_CAMPERIPH, "CAM periph", "CAM peripheral buffers");
 
 static int periph_selto_delay = 1000;

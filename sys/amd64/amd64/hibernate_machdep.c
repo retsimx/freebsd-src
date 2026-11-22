@@ -5501,6 +5501,45 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Individual struct cam_periph nodes reachable
+			 * from every registered CAM driver's own units
+			 * TAILQ (sys/cam/cam_periph.c) -- the sibling fix
+			 * to the already-wired driver-registry
+			 * (periph_drivers[]) above.  copy_leaf=true: this
+			 * boot's own live CAM topology.
+			 */
+			extern u_int cam_periph_hibernate_nperiphs(void);
+			extern void
+			cam_periph_hibernate_periph_selfcopy_range(
+			    u_int idx, uintptr_t *va_out, size_t *len_out);
+			u_int cph_n, cph_idx;
+
+			cph_n = cam_periph_hibernate_nperiphs();
+			for (cph_idx = 0; cph_idx < cph_n &&
+			    error == 0; cph_idx++) {
+				uintptr_t cph_va;
+				size_t cph_len;
+				vm_offset_t cph_pg, cph_end;
+
+				cam_periph_hibernate_periph_selfcopy_range(
+				    cph_idx, &cph_va, &cph_len);
+				if (cph_va == 0 || cph_len == 0)
+					continue;
+				cph_pg = trunc_page((vm_offset_t)cph_va);
+				cph_end = round_page((vm_offset_t)cph_va +
+				    cph_len);
+				for (; cph_pg < cph_end;
+				    cph_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    cph_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
