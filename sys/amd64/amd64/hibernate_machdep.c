@@ -5369,6 +5369,42 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Every struct uma_zone reachable from each keg's
+			 * own uk_zones, plus the standalone uma_cachezones
+			 * list (sys/vm/uma_core.c).  copy_leaf=true: this
+			 * boot's own live zone bookkeeping.
+			 */
+			extern u_int uma_hibernate_nzones(void);
+			extern void uma_hibernate_zone_selfcopy_range(u_int idx,
+			    uintptr_t *va_out, size_t *len_out);
+			u_int zone_n, zone_idx;
+
+			zone_n = uma_hibernate_nzones();
+			for (zone_idx = 0; zone_idx < zone_n &&
+			    error == 0; zone_idx++) {
+				uintptr_t zone_va;
+				size_t zone_len;
+				vm_offset_t zone_pg, zone_end;
+
+				uma_hibernate_zone_selfcopy_range(zone_idx,
+				    &zone_va, &zone_len);
+				if (zone_va == 0 || zone_len == 0)
+					continue;
+				zone_pg = trunc_page((vm_offset_t)zone_va);
+				zone_end = round_page((vm_offset_t)zone_va +
+				    zone_len);
+				for (; zone_pg < zone_end;
+				    zone_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    zone_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "

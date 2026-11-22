@@ -5487,6 +5487,81 @@ hibernate_md_bucket_zones_va(vm_offset_t *va, size_t *len)
 	*len = sizeof(bucket_zones);
 }
 
+/*
+ * DSA00 this-round fix (continuation): captured directly this round --
+ * a GPF INSIDE uma_hibernate_reinit_cache_buckets() itself (r8 =
+ * 0xdeadc0dedeadc0de, the same UMA-junk poison) proves struct uma_zone
+ * objects (reachable via keg->uk_zones and the separate uma_cachezones
+ * list this function's own two LIST_FOREACH loops walk) are the SAME
+ * destination-set-accounting gap one layer deeper than the keg fix
+ * above: protecting each keg's own uk_domain[] slab lists is necessary
+ * but not sufficient, since the reinit function must first walk every
+ * zone hanging off each keg (and every cache-only zone) to REACH those
+ * domains, and a zone object itself can equally fall inside the K-10
+ * destination set. Each zone is one fixed-size allocation (zsize =
+ * sizeof(struct uma_zone) + sizeof(struct uma_cache) * (mp_maxid + 1) +
+ * sizeof(struct uma_zone_domain) * vm_ndomains, confirmed by reading
+ * uma_startup1()'s own zsize computation) -- protected as a unit for
+ * the same reason as the keg fix (every field, not just uz_link, is
+ * this boot's own live bookkeeping). Enumerated across BOTH lists this
+ * function itself walks (every keg's own uk_zones, then the standalone
+ * uma_cachezones), in the same relative order, so coverage exactly
+ * matches what uma_hibernate_reinit_cache_buckets() itself dereferences.
+ */
+u_int	uma_hibernate_nzones(void);
+u_int
+uma_hibernate_nzones(void)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	u_int n;
+
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link)
+		LIST_FOREACH(zone, &keg->uk_zones, uz_link)
+			n++;
+	LIST_FOREACH(zone, &uma_cachezones, uz_link)
+		n++;
+	return (n);
+}
+
+void	uma_hibernate_zone_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+void
+uma_hibernate_zone_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	size_t zsize;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	zsize = sizeof(struct uma_zone) +
+	    sizeof(struct uma_cache) * (size_t)(mp_maxid + 1) +
+	    sizeof(struct uma_zone_domain) * (size_t)vm_ndomains;
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		LIST_FOREACH(zone, &keg->uk_zones, uz_link) {
+			if (n == idx) {
+				*va_out = (uintptr_t)zone;
+				*len_out = zsize;
+				return;
+			}
+			n++;
+		}
+	}
+	LIST_FOREACH(zone, &uma_cachezones, uz_link) {
+		if (n == idx) {
+			*va_out = (uintptr_t)zone;
+			*len_out = zsize;
+			return;
+		}
+		n++;
+	}
+}
+
 static void
 zone_release(void *arg, void **bucket, int cnt)
 {
