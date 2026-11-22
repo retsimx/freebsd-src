@@ -5222,6 +5222,23 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void uma_hibernate_reinit_plinks(void);
 		uma_hibernate_reinit_plinks();
 		/*
+		 * DSA00 round 3: re-establish hib_dumper's own refcount
+		 * (item #12 conversion -- see dumper_hibernate_reinit_
+		 * refcount()'s own comment, sys/kern/kern_shutdown.c, for
+		 * the full disposition argument). Must run before the
+		 * single dumper_drop(hib_dumper) call at this function's
+		 * own backout: label, which is unconditionally reached by
+		 * every path out of this continuation including the normal
+		 * one -- i.e. before any opportunity for that drop to fire
+		 * against the frozen, saved-image refs value instead of a
+		 * freshly re-established one. No malloc()/free() precedes
+		 * this call, matching the ordering rule every other reinit
+		 * in this block already follows.
+		 */
+		extern void dumper_hibernate_reinit_refcount(
+		    struct dumperinfo *di);
+		dumper_hibernate_reinit_refcount(hib_dumper);
+		/*
 		 * per-CPU cache-bucket
 		 * identity reinit -- see sys/vm/uma_core.c's own
 		 * uma_hibernate_reinit_cache_buckets() for the full

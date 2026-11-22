@@ -1280,6 +1280,122 @@ dumper_drop(struct dumperinfo *di)
 }
 
 /*
+ * DSA00 round 3: item #12 conversion -- the rest of struct dumperinfo
+ * (dumper/dumper_read/dumper_start/dumper_hdr/dumper_flush/priv/
+ * blocksize/maxiosize/mediaoffset/mediasize/provider_name/
+ * provider_media_size/provider_valid/blockbuf/dumpoff/origdumpoff/
+ * kdcrypto/kdcomp/di_next) stays copy_leaf=false, unchanged: that content
+ * genuinely is the SAVE-side kernel's own active dump-provider binding
+ * (acquired via dumper_hold() before suspend specifically so the resume
+ * continuation keeps using the SAME GEOM/CAM binding the dump itself was
+ * written through, not whatever this boot's own independent device
+ * re-probe would produce), which is sound -- static, boot-fixed content
+ * for the lifetime of one hibernate attempt, not a case the protect-vs-
+ * reinit distinction applies to.
+ *
+ * The one DYNAMIC field inside that otherwise-static object is di->refs:
+ * it is a live reference COUNT, incremented/decremented by ordinary
+ * kernel traffic (every dumper_hold()/dumper_drop() pair, system-wide,
+ * not specific to hibernate) for as long as the object exists. Freezing
+ * it at its save-time value (copy_leaf=false's necessary side effect)
+ * is the same self-defeating-protection shape as every other dynamic
+ * field in this class: the SAVE-side refs value reflects the SAVE
+ * kernel's own hold count at the instant of suspend, which this
+ * continuation's own single dumper_drop() call (acpi.c's backout: label)
+ * neither produced nor can safely rely on matching.
+ *
+ * Disposition: REINITIALIZE the refs field only, post-copy, to the
+ * exact value this continuation's own usage establishes: one baseline
+ * reference for continued dumper_configs TAILQ membership (the same
+ * invariant dumper_create()'s own refcount_init(&newdi->refs, 1)
+ * establishes at registration time) plus one transient reference for
+ * the single hold this resume continuation itself is holding (acquired
+ * via the dumper_hold() call in acpi.c's own dump-path SIM acquisition
+ * block, never dropped before the EJUSTRETURN jump) and which backout:'s
+ * own single dumper_drop() call is written to release exactly once.
+ * refcount_init() is the correct primitive here (not a raw assignment):
+ * it is the same public interface dumper_create() itself already uses
+ * to establish this object's refcount invariant, so this reinit is
+ * re-establishing the object through its own normal API, not reaching
+ * into implementation detail.
+ */
+void	dumper_hibernate_reinit_refcount(struct dumperinfo *di);
+void
+dumper_hibernate_reinit_refcount(struct dumperinfo *di)
+{
+	if (di == NULL)
+		return;
+	refcount_init(&di->refs, 2);
+}
+
+/*
+ * DSA00 this-round fix: each registered struct dumperinfo (dumper_configs,
+ * this file) is a variable-length malloc(M_DUMPER) allocation -- the TWELFTH
+ * instance of the same destination-set-accounting-gap class as pc_gdt/
+ * DPCPU/kobj_ops/uma_keg/uma_zone/CAM periph nodes above. Captured this
+ * round: dumper_drop()'s own "refcount wraparound" panic (sys/sys/
+ * refcount.h's own REFCOUNT_SATURATED()/underflow detection) fires when a
+ * dumperinfo's own refs field was overwritten with the SAVED image's
+ * cross-boot content -- NOT a double-drop logic bug (confirmed: every
+ * dumper_drop() call site, including acpi.c's own backout: label this
+ * round's own crash traces to, pairs correctly with exactly one prior
+ * acquisition/refcount_init(), and the struct's own pointer VALUE survives
+ * the K-10 copy intact on the kstack/global that holds it -- only the
+ * OBJECT's own refs content is in question, the identical shape already
+ * established for every other instance of this class). Content must be
+ * THIS boot's own live refcount/registration state (copy_leaf=true, same
+ * rule as every sibling): the saved image's own dumperinfo refs describe a
+ * different boot's own dump-consumer reference count entirely.
+ *
+ * Enumerated via the existing dumper_configs TAILQ under its own
+ * dumpconf_list_lk (ordinary mutex, not a fault handler), idx-based like
+ * every other accessor in this class: callers loop idx from 0 while
+ * *va_out != 0. Each node's own variable length is recomputed exactly as
+ * dumper_create() itself computes it (sizeof(*di) + strlen(di_devname) + 1)
+ * so the full allocation, not merely the fixed-size header, is protected.
+ */
+u_int	dumper_hibernate_nconfigs(void);
+u_int
+dumper_hibernate_nconfigs(void)
+{
+	struct dumperinfo *di;
+	u_int n;
+
+	n = 0;
+	mtx_lock(&dumpconf_list_lk);
+	TAILQ_FOREACH(di, &dumper_configs, di_next)
+		n++;
+	mtx_unlock(&dumpconf_list_lk);
+	return (n);
+}
+
+void	dumper_hibernate_config_selfcopy_range(u_int idx,
+	    uintptr_t *va_out, size_t *len_out);
+void
+dumper_hibernate_config_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	struct dumperinfo *di;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	mtx_lock(&dumpconf_list_lk);
+	TAILQ_FOREACH(di, &dumper_configs, di_next) {
+		if (n == idx) {
+			*va_out = (uintptr_t)di;
+			*len_out = sizeof(*di) +
+			    strlen(di->di_devname) + 1;
+			mtx_unlock(&dumpconf_list_lk);
+			return;
+		}
+		n++;
+	}
+	mtx_unlock(&dumpconf_list_lk);
+}
+
+/*
  * Allocate and set up a new dumper from the provided template.
  */
 int

@@ -5625,6 +5625,48 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Every struct dumperinfo on the dumper_configs
+			 * TAILQ (sys/kern/kern_shutdown.c).  copy_leaf=false:
+			 * hib_dumper is acquired via dumper_hold() BEFORE
+			 * suspend specifically so its content must be the
+			 * SAVED image's own, not this boot's -- the
+			 * saved_pcb_va rule, not the live-state rule every
+			 * other accessor in this set follows (evidence
+			 * record: copy_leaf=true was tried and reverted,
+			 * confirmed NOT to close the refcount-wraparound
+			 * panic).
+			 */
+			extern u_int dumper_hibernate_nconfigs(void);
+			extern void dumper_hibernate_config_selfcopy_range(
+			    u_int idx, uintptr_t *va_out, size_t *len_out);
+			u_int dmp_n, dmp_idx;
+
+			dmp_n = dumper_hibernate_nconfigs();
+			for (dmp_idx = 0; dmp_idx < dmp_n &&
+			    error == 0; dmp_idx++) {
+				uintptr_t dmp_va;
+				size_t dmp_len;
+				vm_offset_t dmp_pg, dmp_end;
+
+				dumper_hibernate_config_selfcopy_range(dmp_idx,
+				    &dmp_va, &dmp_len);
+				if (dmp_va == 0 || dmp_len == 0)
+					continue;
+				dmp_pg = trunc_page((vm_offset_t)dmp_va);
+				dmp_end = round_page((vm_offset_t)dmp_va +
+				    dmp_len);
+				for (; dmp_pg < dmp_end;
+				    dmp_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    dmp_pg, false, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
