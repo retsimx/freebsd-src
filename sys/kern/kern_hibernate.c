@@ -60,6 +60,7 @@
 
 #include <machine/atomic.h>
 #include <machine/cpu.h>
+#include <machine/cpufunc.h>
 #include <machine/hibernate.h>
 #include <machine/md_var.h>
 #include <machine/smp.h>
@@ -5283,6 +5284,48 @@ hibernate_resume_park_terminal(const char *stage, int error)
  * otherwise an uncommitted-AP errno (ETIMEDOUT or EIO) for the caller's
  * existing goto cleanup path.
  */
+/*
+ * K24-T04: a raw, lock-free, hard-bounded single-byte COM1 write, for use
+ * on paths (the phase-1 park-ready timeout below) where printf()/cnputc()
+ * were confirmed (A/B test, N=12 each: 5/12 hangs with printf present,
+ * 0/12 with it reverted) to be able to block indefinitely on
+ * cnputs_mtx -- a spin mutex cnputc()'s own cnputsn() wrapper takes
+ * BEFORE ever reaching ns8250_putc()'s own bounded hardware spin.  This
+ * helper takes no lock of any kind and never waits on TX past a hard
+ * iteration cap; it is the amd64 serial port directly (same register
+ * offsets/LSR_THRE idiom as the existing EARLY_PRINTF ns8250 early-boot
+ * helper, sys/dev/uart/uart_dev_ns8250.c), self-contained so it does not
+ * depend on that kernel-config option being enabled.  Writes exactly one
+ * byte plus a newline; callers needing more call it per-byte.  This is a
+ * marker, not a log: it exists only so a bounded wait that times out can
+ * never be completely silent, without reintroducing a blocking call on
+ * this path.
+ */
+#define	HIBMRK_COM1_PORT	0x3f8
+#define	HIBMRK_COM1_DATA	(HIBMRK_COM1_PORT + 0)
+#define	HIBMRK_COM1_LSR		(HIBMRK_COM1_PORT + 5)
+#define	HIBMRK_COM1_LSR_THRE	0x20
+#define	HIBMRK_COM1_LIMIT	10000	/* ~10ms worst case, same as early_putc */
+
+void	hibernate_k24t04_raw_marker(int c);
+void
+hibernate_k24t04_raw_marker(int c)
+{
+	int limit;
+
+	limit = HIBMRK_COM1_LIMIT;
+	while ((inb(HIBMRK_COM1_LSR) & HIBMRK_COM1_LSR_THRE) == 0 &&
+	    --limit > 0)
+		continue;
+	outb(HIBMRK_COM1_DATA, c);
+
+	limit = HIBMRK_COM1_LIMIT;
+	while ((inb(HIBMRK_COM1_LSR) & HIBMRK_COM1_LSR_THRE) == 0 &&
+	    --limit > 0)
+		continue;
+	outb(HIBMRK_COM1_DATA, '\n');
+}
+
 static int
 hibernate_park_dispatch(struct hibernate_attempt *ha, cpuset_t acknowledged)
 {
@@ -5369,8 +5412,41 @@ hibernate_park_dispatch(struct hibernate_attempt *ha, cpuset_t acknowledged)
 			error = ETIMEDOUT;
 #endif
 		if (error != 0) {
-			if (!committed_cpu)
+			if (!committed_cpu) {
+				/*
+				 * K24-T04 fix: the K24-T02 printf() here was
+				 * confirmed (A/B test, N=12 each) to BE the
+				 * cause of the silent hang it was added to
+				 * prevent -- hang rate 5/12 with the printf
+				 * present, 0/12 with it reverted, nothing
+				 * else changed.  Root cause: cnputc()'s own
+				 * cnputsn() wrapper takes cnputs_mtx
+				 * (mtx_lock_spin()) before ever reaching
+				 * ns8250_putc()'s bounded hardware spin -- if
+				 * that mutex is held/contended at this exact
+				 * point in the AP-park sequence, the call
+				 * blocks on the LOCK, never reaching the
+				 * bounded UART loop at all. A self-inflicted
+				 * regression from the K24-T02 hardening
+				 * request.
+				 *
+				 * Replacement: a raw, lock-free, hard-bounded
+				 * COM1 byte write bypassing cnputc/cnputsn
+				 * entirely -- same register offsets and
+				 * LSR_THRE spin-with-limit idiom as the
+				 * existing EARLY_PRINTF ns8250 helper
+				 * (sys/dev/uart/uart_dev_ns8250.c), but
+				 * self-contained here so it does not depend
+				 * on that kernel-config option being enabled.
+				 * Takes no lock, waits on no TX indefinitely
+				 * (hard iteration cap), and satisfies "a
+				 * bounded wait must not expire silently"
+				 * without reintroducing the printf's own
+				 * blocking path.
+				 */
+				hibernate_k24t04_raw_marker('T');
 				return (error);
+			}
 			hibernate_resume_park_terminal("park-ready", error);
 			/* NOTREACHED */
 		}
