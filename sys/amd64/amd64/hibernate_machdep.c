@@ -84,6 +84,46 @@ uint64_t hib_guard_image_value_g;
 bool hib_guard_captured_g;
 
 /*
+ * DSA00 "keg topology" round: staged (saved-image) copies of every
+ * keg's own three per-domain slab-list HEAD pointers (ud_part_slab.
+ * lh_first / ud_free_slab.lh_first / ud_full_slab.lh_first,
+ * sys/vm/uma_int.h's LIST_HEAD(slabhead, uma_slab) -- lh_first is the
+ * ONLY field in a list head), captured during hibernate_machdep_prepare()
+ * (this function, below) via hibernate_md_staged_read() -- the existing,
+ * already-proven staged-byte accessor the K-10 copy loop itself uses --
+ * strictly BEFORE the destructive copy runs, so the read itself takes no
+ * lock and calls nothing that could (same safety class as the
+ * __stack_chk_guard capture immediately above). Published to these
+ * file-scope globals for uma_hibernate_reinit_plinks() (sys/vm/
+ * uma_core.c) to consume AFTER the jump, on the resume continuation,
+ * exactly mirroring the hib_guard_image_value_g/hib_guard_captured_g
+ * publish-then-install split this file already establishes for the
+ * identical "must read image content at MD_PREPARE time, must use it
+ * only after the jump" shape.
+ *
+ * Bounded by HIB_KEG_TOPO_MAX_KEGS * MAXMEMDOM * 3 uintptr_t slots -- a
+ * fixed-size array, no allocation, matching the "no allocation in the
+ * hot path" requirement. A keg beyond this bound, or a domain beyond
+ * vm_ndomains, is simply not captured (hib_keg_topo_captured_n records
+ * exactly how many kegs WERE captured, so the consumer can detect and
+ * report the shortfall rather than silently using stale/zero data).
+ */
+/*
+ * DSA00 "keg topology" round, correction (N=1 re-verification): the
+ * initial bound of 64 was too small -- live testing showed topo_oob=125
+ * (100% of consumer calls falling back), i.e. this boot's own actual
+ * VTOSLAB keg count exceeds 64 (inline_skipped=80 alone, from a SEPARATE,
+ * non-VTOSLAB keg class, already proves this kernel has well over 100
+ * kegs total). Raised to 512, a generous bound for any GENERIC-class
+ * kernel config, still only 512*8*3*8 = 98304 bytes = 24 pages -- small,
+ * fixed-size, no allocation.
+ */
+#define	HIB_KEG_TOPO_MAX_KEGS	512
+uintptr_t hib_keg_topo_head_g[HIB_KEG_TOPO_MAX_KEGS][MAXMEMDOM][3];
+u_int hib_keg_topo_captured_n_g;
+bool hib_keg_topo_captured_g;
+
+/*
  * Setup transient 1:1 mapping of low 4 GiB in kernel_pmap
  * mirroring mp_machdep.c:355-399.
  *
@@ -5410,6 +5450,167 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					    dc_pg, true, &selfcopied);
 					if (error != 0)
 						break;
+				}
+			}
+		}
+		if (error == 0) {
+			/*
+			 * DSA00 "keg topology" round: capture every keg's
+			 * own three per-domain slab-list HEAD pointers from
+			 * the STAGED (saved) image, via hibernate_md_staged_
+			 * read(), before the destructive copy below runs.
+			 * This removes uma_hibernate_reinit_plinks()'s own
+			 * dependency on live uk_domain[] content being the
+			 * saved image's topology -- the root cause of the
+			 * item #11 contradiction (confirmed prior round: that
+			 * function needs the SAVED list topology to walk
+			 * slabs, while keg protection forces uk_domain[] to
+			 * hold the RESUME kernel's own pre-jump topology
+			 * instead). Keg protection (immediately below, inside
+			 * this same "if (error == 0)" chain) is UNCHANGED and
+			 * STAYS: with the reinit no longer reading uk_domain[]
+			 * live, there is no remaining reason to remove it, and
+			 * every other keg field (uk_hash, uk_zones, uk_align,
+			 * etc.) still needs this boot's own live content.
+			 */
+			{
+				extern u_int uma_hibernate_nkegs_raw(void);
+				extern void uma_hibernate_keg_domain_headvas(
+				    u_int keg_idx, u_int dom,
+				    vm_offset_t *part_va, vm_offset_t *free_va,
+				    vm_offset_t *full_va,
+				    int *is_vtoslab_keg);
+				u_int topo_nkegs, topo_ki;
+				int topo_dom;
+
+				topo_nkegs = uma_hibernate_nkegs_raw();
+				if (topo_nkegs > HIB_KEG_TOPO_MAX_KEGS)
+					topo_nkegs = HIB_KEG_TOPO_MAX_KEGS;
+				for (topo_ki = 0; topo_ki < topo_nkegs;
+				    topo_ki++) {
+					for (topo_dom = 0;
+					    topo_dom < vm_ndomains &&
+					    topo_dom < MAXMEMDOM; topo_dom++) {
+						vm_offset_t pva, fva, uva;
+						int is_vtoslab;
+						uintptr_t hv;
+						int terr;
+
+						uma_hibernate_keg_domain_headvas(
+						    topo_ki, (u_int)topo_dom,
+						    &pva, &fva, &uva,
+						    &is_vtoslab);
+						if (!is_vtoslab)
+							continue;
+
+						terr = hibernate_md_staged_read(
+						    ha, wvec, p, pva, &hv,
+						    sizeof(hv));
+						hib_keg_topo_head_g[topo_ki]
+						    [topo_dom][0] =
+						    (terr == 0) ? hv : 0;
+
+						terr = hibernate_md_staged_read(
+						    ha, wvec, p, fva, &hv,
+						    sizeof(hv));
+						hib_keg_topo_head_g[topo_ki]
+						    [topo_dom][1] =
+						    (terr == 0) ? hv : 0;
+
+						terr = hibernate_md_staged_read(
+						    ha, wvec, p, uva, &hv,
+						    sizeof(hv));
+						hib_keg_topo_head_g[topo_ki]
+						    [topo_dom][2] =
+						    (terr == 0) ? hv : 0;
+					}
+				}
+				hib_keg_topo_captured_n_g = topo_nkegs;
+				hib_keg_topo_captured_g = true;
+
+				/*
+				 * DSA00 "keg topology" round, correction:
+				 * hib_keg_topo_head_g[]/hib_keg_topo_captured_
+				 * n_g/hib_keg_topo_captured_g are ordinary
+				 * file-scope globals -- their OWN backing
+				 * pages are exactly as subject to the K-10
+				 * destructive copy (executed later, by
+				 * hibernate_tramp.S's copy loop, not by this
+				 * function) as any other live structure in
+				 * this class. Captured directly this round:
+				 * N=1 verification showed topo_fallback=139,
+				 * topo_oob=0 -- EVERY consumer call fell back
+				 * to the live uk_domain[] read, proving these
+				 * globals' own correct, just-written content
+				 * was being silently overwritten by the
+				 * saved image's stale content before the
+				 * resume continuation ever read them. This is
+				 * the same destination-set-accounting-gap
+				 * class as every other site in this file --
+				 * the fix is the same: copy_leaf=true
+				 * protection, since the correct content is
+				 * THIS boot's own just-captured values, never
+				 * the saved image's. Protected here,
+				 * immediately after the final write above, so
+				 * the self-copy walk sees the fully-populated
+				 * array.
+				 */
+				if (error == 0) {
+					vm_offset_t topo_pg, topo_end;
+
+					topo_pg = trunc_page(
+					    (vm_offset_t)&hib_keg_topo_head_g);
+					topo_end = round_page(
+					    (vm_offset_t)&hib_keg_topo_head_g +
+					    sizeof(hib_keg_topo_head_g));
+					for (; topo_pg < topo_end;
+					    topo_pg += PAGE_SIZE) {
+						error = hibernate_md_selfcopy_walk(
+						    ha, wvec, p,
+						    kernel_pmap->pm_cr3,
+						    topo_pg, true,
+						    &selfcopied);
+						if (error != 0)
+							break;
+					}
+				}
+				if (error == 0) {
+					vm_offset_t topo_pg, topo_end;
+
+					topo_pg = trunc_page((vm_offset_t)
+					    &hib_keg_topo_captured_n_g);
+					topo_end = round_page((vm_offset_t)
+					    &hib_keg_topo_captured_n_g +
+					    sizeof(hib_keg_topo_captured_n_g));
+					for (; topo_pg < topo_end;
+					    topo_pg += PAGE_SIZE) {
+						error = hibernate_md_selfcopy_walk(
+						    ha, wvec, p,
+						    kernel_pmap->pm_cr3,
+						    topo_pg, true,
+						    &selfcopied);
+						if (error != 0)
+							break;
+					}
+				}
+				if (error == 0) {
+					vm_offset_t topo_pg, topo_end;
+
+					topo_pg = trunc_page((vm_offset_t)
+					    &hib_keg_topo_captured_g);
+					topo_end = round_page((vm_offset_t)
+					    &hib_keg_topo_captured_g +
+					    sizeof(hib_keg_topo_captured_g));
+					for (; topo_pg < topo_end;
+					    topo_pg += PAGE_SIZE) {
+						error = hibernate_md_selfcopy_walk(
+						    ha, wvec, p,
+						    kernel_pmap->pm_cr3,
+						    topo_pg, true,
+						    &selfcopied);
+						if (error != 0)
+							break;
+					}
 				}
 			}
 		}

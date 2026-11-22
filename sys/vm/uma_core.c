@@ -5133,6 +5133,8 @@ static u_int uma_hibernate_reinit_plinks_resolved;
  */
 #define	UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER	1000000
 static u_int uma_hibernate_reinit_plinks_runaway;
+static u_int uma_hibernate_reinit_plinks_unfreed;
+
 
 /*
  * the previous
@@ -5158,7 +5160,7 @@ static u_int uma_hibernate_reinit_plinks_runaway;
  */
 static void
 uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
-    struct slabhead *head, uma_keg_t keg, uma_zone_t zone)
+    uintptr_t staged_head, uma_keg_t keg, uma_zone_t zone)
 {
 	uma_slab_t slab;
 	uint8_t *mem;
@@ -5171,7 +5173,24 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 	u_long iter;
 
 	(void)_ha;
-	slab = LIST_FIRST(head);
+	/*
+	 * DSA00 "keg topology" round: slab = LIST_FIRST(head) (the live
+	 * uk_domain[] list-head dereference this line previously performed)
+	 * is REPLACED by the caller-supplied staged_head value -- the
+	 * SAME field's content, but read from the SAVED image during
+	 * hibernate_machdep_prepare() (sys/amd64/amd64/hibernate_machdep.c's
+	 * own hib_keg_topo_head_g[] capture) rather than from live memory,
+	 * which keg protection otherwise forces to hold the RESUME kernel's
+	 * own pre-jump topology. Everything from this point on (the us_link.
+	 * le_next chain walk, the data-page writes) is UNCHANGED: slab
+	 * structs themselves are not separately protected, so they already
+	 * correctly hold the saved image's own content post-copy (confirmed:
+	 * no selfcopy protection exists for individual struct uma_slab
+	 * objects anywhere in this tree), the same reasoning this function's
+	 * own pre-existing header comment already established for the
+	 * us_link.le_next field specifically.
+	 */
+	slab = (uma_slab_t)staged_head;
 	for (iter = 0; slab != NULL; iter++) {
 		if (__predict_false(iter >=
 		    UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER)) {
@@ -5370,6 +5389,118 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
  */
 static u_int uma_hibernate_reinit_plinks_inline_skipped;
 
+/*
+ * DSA00 "keg topology" round: expose the VA of each of a keg's own
+ * three per-domain slab-list HEAD fields (ud_part_slab/ud_free_slab/
+ * ud_full_slab, sys/vm/uma_int.h), indexed by the SAME raw LIST_FOREACH
+ * ordinal uma_hibernate_reinit_plinks() itself walks (no inline/cache
+ * skipping at the indexing level -- that skip stays exactly where it
+ * already lives, in the consumer below, so capture-time and consume-time
+ * ordinals always agree across the two boots without needing to encode
+ * any skip policy here). This is the ONLY struct-layout knowledge the MD
+ * staged-capture code (sys/amd64/amd64/hibernate_machdep.c) needs to read
+ * the SAVED image's own list-head pointers via hibernate_md_staged_read();
+ * everything else (the slab chain itself) is walked by following each
+ * slab's own us_link.le_next field, which is already known (by this
+ * file's own prior-round comment, confirmed by direct reading) to sit at
+ * offset 0 of struct uma_slab -- so no further per-node accessor is
+ * needed, a staged read of the slab's own VA yields the next slab's VA
+ * directly.
+ */
+u_int	uma_hibernate_nkegs_raw(void);
+u_int
+uma_hibernate_nkegs_raw(void)
+{
+	uma_keg_t keg;
+	u_int n;
+
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link)
+		n++;
+	return (n);
+}
+
+void	uma_hibernate_keg_domain_headvas(u_int keg_idx, u_int dom,
+	    vm_offset_t *part_va, vm_offset_t *free_va, vm_offset_t *full_va,
+	    int *is_vtoslab_keg);
+void
+uma_hibernate_keg_domain_headvas(u_int keg_idx, u_int dom,
+    vm_offset_t *part_va, vm_offset_t *free_va, vm_offset_t *full_va,
+    int *is_vtoslab_keg)
+{
+	uma_keg_t keg;
+	struct uma_domain *domp;
+	u_int n;
+
+	*part_va = 0;
+	*free_va = 0;
+	*full_va = 0;
+	*is_vtoslab_keg = 0;
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		if (n == keg_idx) {
+			if ((keg->uk_flags & UMA_ZFLAG_VTOSLAB) == 0 ||
+			    (keg->uk_flags & UMA_ZFLAG_CACHE) != 0)
+				return;
+			if (dom < 0 || dom >= vm_ndomains)
+				return;
+			domp = &keg->uk_domain[dom];
+			*part_va = (vm_offset_t)&domp->ud_part_slab;
+			*free_va = (vm_offset_t)&domp->ud_free_slab;
+			*full_va = (vm_offset_t)&domp->ud_full_slab;
+			*is_vtoslab_keg = 1;
+			return;
+		}
+		n++;
+	}
+}
+
+/*
+ * Returns the keg pointer and its first zone, by the same raw ordinal, for
+ * the consumer below to use for the live writes (pg_m->plinks.uma.{slab,
+ * zone}) and the live, structural uk_ppera field -- none of which need
+ * staged reads, since keg identity and uk_zones are correctly preserved
+ * live (copy_leaf=true keg protection) and are not part of the list-
+ * topology mismatch this round fixes.
+ */
+void	uma_hibernate_keg_zone_at(u_int keg_idx, uma_keg_t *keg_out,
+	    uma_zone_t *zone_out);
+void
+uma_hibernate_keg_zone_at(u_int keg_idx, uma_keg_t *keg_out,
+    uma_zone_t *zone_out)
+{
+	uma_keg_t keg;
+	u_int n;
+
+	*keg_out = NULL;
+	*zone_out = NULL;
+	n = 0;
+	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		if (n == keg_idx) {
+			*keg_out = keg;
+			*zone_out = LIST_FIRST(&keg->uk_zones);
+			return;
+		}
+		n++;
+	}
+}
+
+/*
+ * DSA00 "keg topology" round: staged-capture globals, defined in
+ * sys/amd64/amd64/hibernate_machdep.c (hibernate_machdep_prepare(), MD_
+ * PREPARE time, before the destructive copy), consumed here on the
+ * resume continuation. hib_keg_topo_captured_g being false (capture
+ * never ran, e.g. a kernel built before this round) falls back to the
+ * OLD live-uk_domain[]-read behaviour unchanged, rather than silently
+ * reinitialising nothing -- a conservative, visible degrade, not a
+ * silent capability loss.
+ */
+extern uintptr_t hib_keg_topo_head_g[512][8][3];
+extern u_int hib_keg_topo_captured_n_g;
+extern bool hib_keg_topo_captured_g;
+static u_int uma_hibernate_reinit_plinks_topo_fallback;
+static u_int uma_hibernate_reinit_plinks_topo_oob;
+
 void	uma_hibernate_reinit_plinks(void);
 void
 uma_hibernate_reinit_plinks(void)
@@ -5377,8 +5508,12 @@ uma_hibernate_reinit_plinks(void)
 	uma_keg_t keg;
 	uma_zone_t zone;
 	int dom;
+	u_int raw_idx;
 
+	raw_idx = 0;
 	LIST_FOREACH(keg, &uma_kegs, uk_link) {
+		u_int this_idx = raw_idx++;
+
 		if ((keg->uk_flags & UMA_ZFLAG_VTOSLAB) == 0) {
 			uma_hibernate_reinit_plinks_inline_skipped++;
 			continue;
@@ -5391,14 +5526,46 @@ uma_hibernate_reinit_plinks(void)
 		for (dom = 0; dom < vm_ndomains; dom++) {
 			struct uma_domain *domp = &keg->uk_domain[dom];
 
-			uma_hibernate_reinit_plinks_slablist(NULL,
-			    &domp->ud_part_slab, keg, zone);
-			uma_hibernate_reinit_plinks_slablist(NULL,
-			    &domp->ud_free_slab, keg, zone);
-			uma_hibernate_reinit_plinks_slablist(NULL,
-			    &domp->ud_full_slab, keg, zone);
+			if (hib_keg_topo_captured_g &&
+			    this_idx < hib_keg_topo_captured_n_g &&
+			    dom < 8) {
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    hib_keg_topo_head_g[this_idx][dom][0],
+				    keg, zone);
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    hib_keg_topo_head_g[this_idx][dom][1],
+				    keg, zone);
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    hib_keg_topo_head_g[this_idx][dom][2],
+				    keg, zone);
+			} else {
+				if (!hib_keg_topo_captured_g ||
+				    dom >= 8)
+					uma_hibernate_reinit_plinks_topo_fallback++;
+				else
+					uma_hibernate_reinit_plinks_topo_oob++;
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    (uintptr_t)LIST_FIRST(&domp->ud_part_slab),
+				    keg, zone);
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    (uintptr_t)LIST_FIRST(&domp->ud_free_slab),
+				    keg, zone);
+				uma_hibernate_reinit_plinks_slablist(NULL,
+				    (uintptr_t)LIST_FIRST(&domp->ud_full_slab),
+				    keg, zone);
+			}
 		}
 	}
+	printf("uma_hibernate_reinit_plinks: resolved=%u unresolved=%u "
+	    "runaway=%u unfreed=%u inline_skipped=%u topo_fallback=%u "
+	    "topo_oob=%u\n",
+	    uma_hibernate_reinit_plinks_resolved,
+	    uma_hibernate_reinit_plinks_unresolved,
+	    uma_hibernate_reinit_plinks_runaway,
+	    uma_hibernate_reinit_plinks_unfreed,
+	    uma_hibernate_reinit_plinks_inline_skipped,
+	    uma_hibernate_reinit_plinks_topo_fallback,
+	    uma_hibernate_reinit_plinks_topo_oob);
 }
 
 /*
