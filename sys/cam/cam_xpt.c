@@ -5307,6 +5307,89 @@ xpt_path_mtx(struct cam_path *path)
 	return (&path->device->device_mtx);
 }
 
+/*
+ * DSA00 this-round fix: every struct cam_ed ("existing device" node,
+ * sys/cam/cam_xpt_internal.h) reachable from xsoftc.xpt_busses -> bus->
+ * et_entries -> target->ed_entries -- the SAME destination-set-accounting-
+ * gap class already fixed for periph_drivers[] and individual struct
+ * cam_periph nodes above, one level deeper in the CAM topology.  Captured
+ * this round: cam_periph_release()'s own cam_periph_mtx(periph) ->
+ * xpt_path_mtx(periph->path) chases periph->path->device->device_mtx;
+ * three distinct fault signatures (a GPF with rdi=0xdeadc0dedeadc0de inside
+ * xpt_path_mtx() itself, a witness_checkorder() page fault, and a NULL-
+ * named-spin-mutex panic at cam_periph.c:609) all resolve to the same root
+ * cause once traced through this chain: struct cam_ed is never separately
+ * protected, so when its backing page falls inside the K-10 destination
+ * set, the destructive copy silently overwrites device->device_mtx (and
+ * every other live field: devq_entry, ccbq, asyncs, periphs, etc.) with
+ * the SAVED image's cross-boot content -- a corrupted lock_object whose
+ * own lo_name either reads as a non-string pointer (the GPF inside
+ * strlen()/xpt_path_mtx()) or resolves to a spin-class lock_class by
+ * accident of overwritten bytes (the "(null)"/spin-mutex panic).  This is
+ * the periph_drivers[]/cam_periph precedent, applied to the next node
+ * in the SAME topology those two fixes already walk partway through.
+ * Content must be THIS boot's own live CAM device topology (copy_leaf=
+ * true, same rule as every sibling in this class): the saved image's own
+ * cam_ed objects describe a different boot's device enumeration entirely.
+ *
+ * Enumerated by walking the existing xsoftc.xpt_busses/et_entries/
+ * ed_entries TAILQs under xpt_lock_buses() (the same bus-topology lock
+ * cam_periph_hibernate_periph_selfcopy_range() already uses for the
+ * sibling periph enumerator, sys/cam/cam_periph.c), idx-based like every
+ * other accessor in this class: callers loop idx from 0 while *va_out != 0.
+ */
+u_int	cam_xpt_hibernate_ndevices(void);
+u_int
+cam_xpt_hibernate_ndevices(void)
+{
+	struct cam_eb *bus;
+	struct cam_et *target;
+	struct cam_ed *device;
+	u_int n;
+
+	n = 0;
+	xpt_lock_buses();
+	TAILQ_FOREACH(bus, &xsoftc.xpt_busses, links) {
+		TAILQ_FOREACH(target, &bus->et_entries, links) {
+			TAILQ_FOREACH(device, &target->ed_entries, links)
+				n++;
+		}
+	}
+	xpt_unlock_buses();
+	return (n);
+}
+
+void	cam_xpt_hibernate_device_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+void
+cam_xpt_hibernate_device_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	struct cam_eb *bus;
+	struct cam_et *target;
+	struct cam_ed *device;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	xpt_lock_buses();
+	TAILQ_FOREACH(bus, &xsoftc.xpt_busses, links) {
+		TAILQ_FOREACH(target, &bus->et_entries, links) {
+			TAILQ_FOREACH(device, &target->ed_entries, links) {
+				if (n == idx) {
+					*va_out = (uintptr_t)device;
+					*len_out = sizeof(*device);
+					xpt_unlock_buses();
+					return;
+				}
+				n++;
+			}
+		}
+	}
+	xpt_unlock_buses();
+}
+
 static void
 xpt_done_process(struct ccb_hdr *ccb_h)
 {

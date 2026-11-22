@@ -5540,6 +5540,47 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Individual struct cam_ed ("existing device") nodes
+			 * reachable from xsoftc.xpt_busses -> et_entries ->
+			 * ed_entries (sys/cam/cam_xpt.c) -- the sibling fix
+			 * one level deeper than periph_drivers[]/cam_periph
+			 * above.  copy_leaf=true: this boot's own live CAM
+			 * device topology, including each device's own
+			 * device_mtx (the lock cam_periph_release()'s own
+			 * cam_periph_mtx()/xpt_path_mtx() chain resolves to).
+			 */
+			extern u_int cam_xpt_hibernate_ndevices(void);
+			extern void
+			cam_xpt_hibernate_device_selfcopy_range(
+			    u_int idx, uintptr_t *va_out, size_t *len_out);
+			u_int ced_n, ced_idx;
+
+			ced_n = cam_xpt_hibernate_ndevices();
+			for (ced_idx = 0; ced_idx < ced_n &&
+			    error == 0; ced_idx++) {
+				uintptr_t ced_va;
+				size_t ced_len;
+				vm_offset_t ced_pg, ced_end;
+
+				cam_xpt_hibernate_device_selfcopy_range(
+				    ced_idx, &ced_va, &ced_len);
+				if (ced_va == 0 || ced_len == 0)
+					continue;
+				ced_pg = trunc_page((vm_offset_t)ced_va);
+				ced_end = round_page((vm_offset_t)ced_va +
+				    ced_len);
+				for (; ced_pg < ced_end;
+				    ced_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    ced_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "
