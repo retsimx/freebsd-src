@@ -4061,6 +4061,50 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T02: struct pvclock_vcpu_time_info
+			 * timeinfos[] (sys/dev/kvm_clock/kvm_clock.c) --
+			 * the per-vCPU TSC-scale/shift/timestamp array
+			 * pvclock_read_time_info() spins on (an ABA loop
+			 * on its own `version` field, the IDENTICAL shape
+			 * ths[] above was already fixed for), reached by
+			 * every sbinuptime()/binuptime() call on this
+			 * KVM-clock-backed harness via
+			 * pvclock_tc_get_timecount().  A corrupted version
+			 * field here spins hibernate_park_dispatch()'s own
+			 * deadline poll forever, silently, with no panic
+			 * and no further output -- captured live this
+			 * round via QMP (CPU#1 frozen at an identical RIP
+			 * across samples minutes apart; CPU#0 parked at
+			 * the literal power-on reset vector).  Never
+			 * previously protected: zero prior references
+			 * confirmed by exhaustive grep.  copy_leaf=true,
+			 * same rule as ths[] -- this boot's own
+			 * kvm_clock_attach()-initialized calibration, not
+			 * the saved image's snapshot of a different boot's
+			 * clock hardware.
+			 */
+			extern void kvm_clock_hibernate_selfcopy_range(
+			    uintptr_t *va_out, size_t *len_out);
+			uintptr_t ti_va;
+			size_t ti_len;
+			vm_offset_t ti_pg, ti_end;
+
+			kvm_clock_hibernate_selfcopy_range(&ti_va, &ti_len);
+			if (ti_va != 0 && ti_len != 0) {
+				ti_pg = trunc_page((vm_offset_t)ti_va);
+				ti_end = round_page((vm_offset_t)ti_va +
+				    ti_len);
+				for (; ti_pg < ti_end; ti_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    ti_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
+		if (error == 0) {
+			/*
 			 * CAM peripheral driver structs (ata_da.c's own
 			 * "adadriver", scsi_da.c's "dadriver", etc.) -- the
 			 * NINTH instance of the same destination-set-

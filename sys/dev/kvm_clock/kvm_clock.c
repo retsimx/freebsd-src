@@ -79,6 +79,65 @@ static void	kvm_clock_system_time_enable(struct kvm_clock_softc *sc,
 static void	kvm_clock_system_time_enable_pcpu(void *arg);
 static void	kvm_clock_setup_sysctl(device_t);
 
+/*
+ * K24-T02 this-round fix: struct pvclock_vcpu_time_info timeinfos[] (one
+ * entry per vCPU, kmem_malloc()'d in kvm_clock_attach() below) was never
+ * added to hibernate_machdep.c's own protected-VA set, confirmed by an
+ * exhaustive grep finding zero prior references anywhere in the tree.
+ * pvclock_read_time_info() (sys/x86/x86/pvclock.c) -- the function every
+ * sbinuptime()/binuptime() call on this KVM-clock-backed harness
+ * ultimately reaches via pvclock_tc_get_timecount() -- loops
+ * unconditionally on this exact struct's own `version` field:
+ *     do { version = atomic_load_acq_32(&ti->version); ...
+ *     } while ((ti->version & 1) != 0 || ti->version != version);
+ * This is the IDENTICAL ABA-loop shape tc_hibernate_selfcopy_range()
+ * (sys/kern/kern_tc.c) already protects for the `ths[]` timehands ring --
+ * that fix's own comment documents a captured, reproduced silent hang
+ * (no further output of any kind) at exactly this shape of loop when its
+ * backing page falls inside the K-10 destination set and `version` never
+ * stabilizes at an even, repeated value. `timeinfos[]` is a SEPARATE
+ * kmem_malloc(M_DEVBUF) allocation from `ths[]`, reached only through
+ * this driver's own softc, so the existing `ths[]` fix does not cover it.
+ * Captured this round: a genuine silent hang reproduced live via QMP,
+ * CPU#1 frozen at an identical RIP (inside ns8250_putc()'s own bounded
+ * spin, i.e. downstream of a printf() that itself never returns) across
+ * samples taken minutes apart, with CPU#0 parked at the literal x86
+ * power-on reset vector (CS=F000 EIP=0xFFF0, post-INIT-IPI) -- consistent
+ * with hibernate_park_dispatch()'s own sbinuptime()-based deadline poll
+ * spinning forever on a corrupted version field rather than the AP itself
+ * failing to start.
+ *
+ * Disposition: copy_leaf=true, exactly as tc_hibernate_selfcopy_range()
+ * reasons for ths[] -- timeinfos[] must carry THIS boot's own
+ * kvm_clock_attach()-initialized TSC scale/shift/timestamp calibration
+ * (each entry populated via this boot's own wrmsr() to the hypervisor,
+ * kvm_clock_system_time_enable_pcpu() above), never the saved image's
+ * snapshot of a different boot's calibration. Exposed via a narrow
+ * accessor (this driver has no public header any hibernate_machdep.c
+ * caller already includes), following the same single-instance-via-
+ * devclass pattern kvm_clock_init_smp() above already uses to reach the
+ * one attached kvm_clock device's own softc.
+ */
+void	kvm_clock_hibernate_selfcopy_range(uintptr_t *va_out,
+	    size_t *len_out);
+void
+kvm_clock_hibernate_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+	devclass_t kvm_clock_devclass;
+	struct kvm_clock_softc *sc;
+
+	*va_out = 0;
+	*len_out = 0;
+	kvm_clock_devclass = devclass_find(KVM_CLOCK_DEVNAME);
+	if (kvm_clock_devclass == NULL)
+		return;
+	sc = devclass_get_softc(kvm_clock_devclass, 0);
+	if (sc == NULL || sc->timeinfos == NULL)
+		return;
+	*va_out = (uintptr_t)sc->timeinfos;
+	*len_out = mp_ncpus * sizeof(struct pvclock_vcpu_time_info);
+}
+
 static struct pvclock_wall_clock *
 kvm_clock_get_wallclock(void *arg)
 {
