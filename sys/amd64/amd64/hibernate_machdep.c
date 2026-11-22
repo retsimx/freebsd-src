@@ -5465,6 +5465,42 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				}
 			}
 		}
+		if (error == 0) {
+			/*
+			 * Individual struct uma_bucket objects (per-CPU
+			 * alloc/free/cross buckets and each zone-domain's
+			 * uzd_buckets, sys/vm/uma_core.c).  copy_leaf=true:
+			 * this boot's own live bucket cache state.
+			 */
+			extern u_int uma_hibernate_nbuckets(void);
+			extern void uma_hibernate_bucket_selfcopy_range(
+			    u_int idx, uintptr_t *va_out, size_t *len_out);
+			u_int bkt_n, bkt_idx;
+
+			bkt_n = uma_hibernate_nbuckets();
+			for (bkt_idx = 0; bkt_idx < bkt_n &&
+			    error == 0; bkt_idx++) {
+				uintptr_t bkt_va;
+				size_t bkt_len;
+				vm_offset_t bkt_pg, bkt_end;
+
+				uma_hibernate_bucket_selfcopy_range(bkt_idx,
+				    &bkt_va, &bkt_len);
+				if (bkt_va == 0 || bkt_len == 0)
+					continue;
+				bkt_pg = trunc_page((vm_offset_t)bkt_va);
+				bkt_end = round_page((vm_offset_t)bkt_va +
+				    bkt_len);
+				for (; bkt_pg < bkt_end;
+				    bkt_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    bkt_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "

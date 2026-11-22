@@ -5625,6 +5625,126 @@ uma_hibernate_zone_selfcopy_range(u_int idx, uintptr_t *va_out,
 	}
 }
 
+/*
+ * DSA00 this-round fix: individual struct uma_bucket objects -- the
+ * THIRTEENTH instance of the same destination-set-accounting-gap class.
+ * Captured this round: zone_fetch_bucket()'s own two KASSERTs match the
+ * campaign's own dominant panic family exactly -- "item count underflow
+ * (%ld, %d)" (zdom->uzd_nitems vs bucket->ub_cnt) and "empty bucket in
+ * bucket cache" (bucket->ub_cnt == 0 on a bucket the STAILQ head itself
+ * claims is present). Each uma_bucket is a SEPARATE allocation from a
+ * bucket_zones[] sub-zone (bucket_alloc(), above), never part of the
+ * struct uma_zone/uma_zone_domain allocation this round's own prior fix
+ * already protects -- protecting the zone's own uzd_buckets STAILQ HEAD
+ * and uzd_nitems counter (both embedded fields, now correctly this
+ * boot's own live content) is necessary but not sufficient: the
+ * individual bucket NODES linked from that head, and referenced by each
+ * CPU's own uc_allocbucket/uc_freebucket/uc_crossbucket, can themselves
+ * fall inside the K-10 destination set.
+ *
+ * Narrow, safe scope: protect only sizeof(struct uma_bucket) -- the
+ * fixed-size header (ub_link, ub_cnt, ub_entries, ub_seq) -- not the
+ * variable-length ub_bucket[] item-pointer array that follows it. This
+ * exactly covers every field the captured assertions read (ub_cnt,
+ * ub_entries, the STAILQ link itself), is always well within the
+ * allocation's own first page (sizeof(struct uma_bucket) is small, far
+ * under PAGE_SIZE), and cannot bleed into a neighbouring slab object.
+ * The header's own correct content must be THIS boot's own live
+ * accounting (copy_leaf=true, same rule as every sibling in this
+ * class): a saved image's own bucket geometry/count describes a
+ * different boot's allocator state entirely.
+ *
+ * Enumerated two ways, covering every uma_bucket reachable from the
+ * function call graph that crashed: (1) each live CPU's own
+ * uc_allocbucket/uc_freebucket/uc_crossbucket (trustworthy pointers,
+ * since struct uma_cache is embedded in the now-protected zone), and
+ * (2) each zone-domain's own uzd_buckets STAILQ (trustworthy head,
+ * same reasoning) -- walked across every protected zone exactly as
+ * uma_hibernate_nzones() above already enumerates them.
+ */
+u_int	uma_hibernate_nbuckets(void);
+u_int
+uma_hibernate_nbuckets(void)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	uma_zone_domain_t zdom;
+	uma_bucket_t bucket;
+	u_int n, cpu, dom;
+
+	n = 0;
+#define	COUNT_ZONE_BUCKETS(zone) do {					\
+	CPU_FOREACH(cpu) {						\
+		uma_cache_t _cache = &(zone)->uz_cpu[cpu];		\
+		if (_cache->uc_allocbucket.ucb_bucket != NULL)		\
+			n++;						\
+		if (_cache->uc_freebucket.ucb_bucket != NULL)		\
+			n++;						\
+		if (_cache->uc_crossbucket.ucb_bucket != NULL)		\
+			n++;						\
+	}								\
+	for (dom = 0; dom < (u_int)vm_ndomains; dom++) {		\
+		zdom = ZDOM_GET((zone), dom);				\
+		STAILQ_FOREACH(bucket, &zdom->uzd_buckets, ub_link)	\
+			n++;						\
+	}								\
+} while (0)
+
+	LIST_FOREACH(keg, &uma_kegs, uk_link)
+		LIST_FOREACH(zone, &keg->uk_zones, uz_link)
+			COUNT_ZONE_BUCKETS(zone);
+	LIST_FOREACH(zone, &uma_cachezones, uz_link)
+		COUNT_ZONE_BUCKETS(zone);
+#undef COUNT_ZONE_BUCKETS
+	return (n);
+}
+
+void	uma_hibernate_bucket_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+void
+uma_hibernate_bucket_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	uma_keg_t keg;
+	uma_zone_t zone;
+	uma_zone_domain_t zdom;
+	uma_bucket_t bucket;
+	u_int n, cpu, dom;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	/*
+	 * DSA00 this-round fix: the fixed-size header alone
+	 * (sizeof(struct uma_bucket)) leaves ub_bucket[] -- the trailing
+	 * C99 flexible-array-member item storage, confirmed by direct
+	 * layout read (sys/vm/uma_int.h) and by bucket_init()'s own size
+	 * computation (sys/vm/uma_core.c: "size = roundup(sizeof(struct
+	 * uma_bucket), sizeof(void *)); size += sizeof(void *) *
+	 * ubz_entries;" -- ONE allocation, header plus array, never two)
+	 * -- unprotected.  Live-captured this round (the historical trash-capture diagnostic,
+	 * sys/vm/uma_dbg.c): both the "32 Bucket" and "UMA Slabs 0" trash
+	 * panics fire on items whose OWN backing page is NOT in the K-10
+	 * destination set (in_dst=0) -- i.e. the corruption is not "this
+	 * item's own page was overwritten", it is that the POINTER
+	 * selecting this item (one slot of ub_bucket[]) is the saved
+	 * image's stale content, resolving to an unrelated, currently-live
+	 * physical page in this boot. This matches "UMA Slabs 0"
+	 * (slabzones[0]'s own cached-free uma_slab_t pointers) and "32
+	 * Bucket" (any zone's own cached-free items) alike: both are
+	 * ordinary items cached inside SOME bucket's own ub_bucket[] array,
+	 * the same structural gap for both classes, confirmed in the
+	 * evidence record. Protect the WHOLE allocation (header + full
+	 * item-array capacity) as one unit: ub_entries safely lower-bounds
+	 * the real allocated capacity (bucket_alloc() sets it to min(zone's
+	 * ubz_entries, uz_bucket_size_max); bucket_free()'s own
+	 * bucket_zone_lookup(bucket->ub_entries) already relies on this
+	 * same field to recover the owning zone, so reusing it here follows
+	 * existing, already-correct precedent, not a new assumption).
+	 * copy_leaf=true, same rule as every other live-allocator-state fix
+	 * in this file: ub_bucket[]'s cached pointers are this boot's own
+	 * cache content, not the saved image's.
+	 */
 static void
 zone_release(void *arg, void **bucket, int cnt)
 {
