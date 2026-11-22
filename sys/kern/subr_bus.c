@@ -639,6 +639,94 @@ devclass_find(const char *classname)
 	return (devclass_find_internal(classname, NULL, FALSE));
 }
 
+/*
+ * DSA00 this-round fix: the TENTH instance of the same destination-set-
+ * accounting-gap class as pc_gdt/KPML4phys/ths[]/vm_page_array/idle
+ * kstacks/vm_dom[]/DPCPU/FPU save area/CAM periph_drivers[] above.
+ *
+ * Confirmed by direct disassembly of the live GPF this round targets
+ * (RIP symbolised to bus_generic_resume_child()+0x17, "mov (%rcx,%rdx,8),
+ * %rax" loading ops->cache[device_resume_desc->id & 255] then "call
+ * *0x8(%rax)" through the loaded kobj_method_t's own ->func field; rax
+ * observed holding 0x6564207475706e49, ASCII "Input de" -- device-tree
+ * text, not a code pointer). Every struct kobj_ops (sys/sys/kobj.h) is a
+ * single per-DRIVER-CLASS object, shared by every instance of that class
+ * (kobj_init()/kobj_init_static() both point each instance's own
+ * obj->ops at the SAME cls->ops, confirmed by reading kobj_class_compile_
+ * common()'s own body: "ops->cls = cls; cls->ops = ops;" runs exactly
+ * once per class), malloc(M_KOBJ)'d once at kobj_class_compile() time and
+ * never freed while any instance exists. Its own 256-entry method-dispatch
+ * cache (ops->cache[]) is ordinary resume-kernel bookkeeping, populated
+ * lazily by kobj_lookup_method() as each device's methods are first
+ * invoked THIS boot -- if its backing page falls inside the K-10
+ * destination set, the destructive copy silently overwrites live,
+ * correctly-populated kobj_method_t pointers with the SAVED image's own
+ * cross-boot content, and a subsequent KOBJOPLOOKUP() cache hit loads
+ * garbage into %rax and calls through it -- the exact mechanism already
+ * established for periph_drivers[]/vm_dom[]/DPCPU above. Content must be
+ * THIS boot's own cold-boot cache (copy_leaf=true, same rule as every
+ * sibling in this class), since the cache is pure dispatch-acceleration
+ * state rebuilt lazily from each class's own method table -- never saved-
+ * image content worth restoring.
+ *
+ * Enumerated via the existing devclasses list (not a new registry): every
+ * driverlink_t in every devclass's own driver_list may reference a
+ * compiled kobj_class_t (driver->ops != NULL), so this walk reaches every
+ * attached driver class uniformly, not just the one (ACPI's device_if/
+ * bus_if method table) this round's own crash happened to surface.
+ * idx-based like cam_periph_hibernate_selfcopy_range() above: callers
+ * loop idx from 0 while *va_out != 0, matching that established
+ * convention exactly. bus_topo_lock() is held across the walk (ordinary
+ * mutex, not a fault handler), consistent with devclass_find_internal()'s
+ * own locking expectations elsewhere in this file.
+ */
+u_int
+device_hibernate_nclasses(void)
+{
+	devclass_t dc;
+	driverlink_t dl;
+	u_int n;
+
+	n = 0;
+	bus_topo_lock();
+	TAILQ_FOREACH(dc, &devclasses, link) {
+		TAILQ_FOREACH(dl, &dc->drivers, link) {
+			if (dl->driver != NULL && dl->driver->ops != NULL)
+				n++;
+		}
+	}
+	bus_topo_unlock();
+	return (n);
+}
+
+void
+device_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	devclass_t dc;
+	driverlink_t dl;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	bus_topo_lock();
+	TAILQ_FOREACH(dc, &devclasses, link) {
+		TAILQ_FOREACH(dl, &dc->drivers, link) {
+			if (dl->driver == NULL || dl->driver->ops == NULL)
+				continue;
+			if (n == idx) {
+				*va_out = (uintptr_t)dl->driver->ops;
+				*len_out = sizeof(*dl->driver->ops);
+				bus_topo_unlock();
+				return;
+			}
+			n++;
+		}
+	}
+	bus_topo_unlock();
+}
+
 /**
  * @brief Register that a device driver has been added to a devclass
  *

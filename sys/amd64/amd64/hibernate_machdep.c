@@ -5330,6 +5330,45 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				    kernel_pmap->pm_cr3, ko_pg, true,
 				    &selfcopied);
 		}
+		if (error == 0) {
+			/*
+			 * Device driver method-dispatch tables (struct
+			 * kobj_ops).  sys/bus.h is already included above,
+			 * so device_hibernate_nclasses()/
+			 * device_hibernate_class_selfcopy_range()
+			 * (sys/kern/subr_bus.c) are globally declared; no
+			 * local extern needed.  Each attached driver
+			 * class's own compiled dispatch cache is this
+			 * boot's own devclass_add_driver()/
+			 * kobj_class_compile() output, never the saved
+			 * image's -- copy_leaf=true.
+			 */
+			u_int dc_n, dc_idx;
+
+			dc_n = device_hibernate_nclasses();
+			for (dc_idx = 0; dc_idx < dc_n &&
+			    error == 0; dc_idx++) {
+				uintptr_t dc_va;
+				size_t dc_len;
+				vm_offset_t dc_pg, dc_end;
+
+				device_hibernate_class_selfcopy_range(dc_idx,
+				    &dc_va, &dc_len);
+				if (dc_va == 0 || dc_len == 0)
+					continue;
+				dc_pg = trunc_page((vm_offset_t)dc_va);
+				dc_end = round_page((vm_offset_t)dc_va +
+				    dc_len);
+				for (; dc_pg < dc_end;
+				    dc_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    dc_pg, true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
 		if (error != 0)
 			return (error);
 		printf("hibernate: k23: %u saved-domain page-table page(s) "

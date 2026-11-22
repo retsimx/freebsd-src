@@ -878,6 +878,10 @@ int	bus_get_pass(void);
  */
 void	bus_topo_lock(void);
 void	bus_topo_unlock(void);
+
+u_int	device_hibernate_nclasses(void);
+void	device_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
 struct mtx * bus_topo_mtx(void);
 void	bus_topo_assert(void);
 
