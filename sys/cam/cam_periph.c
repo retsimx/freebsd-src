@@ -596,6 +596,28 @@ cam_periph_release_locked(struct cam_periph *periph)
 	xpt_unlock_buses();
 }
 
+/*
+ * Reinitialise the device mutex resolved by a specific held peripheral.
+ *
+ * The global cam_ed topology walk is necessary for ordinary resume traffic,
+ * but #791 proved that the dump-path hib_cam_periph can resolve to a cam_ed
+ * not reached by that resume-kernel walk.  Its cam_periph_mtx() still had a
+ * stale lock class and triggered "mtx_lock() of spin mutex (null)" at the
+ * final cam_periph_release().  The peripheral reference remains held across
+ * the discontinuity, so its path and device cannot be torn down here.
+ */
+void	cam_periph_hibernate_reinit_mtx(struct cam_periph *periph);
+void
+cam_periph_hibernate_reinit_mtx(struct cam_periph *periph)
+{
+
+	KASSERT(periph != NULL && periph->path != NULL &&
+	    periph->path->device != NULL,
+	    ("%s: invalid held peripheral", __func__));
+	mtx_init(cam_periph_mtx(periph), "CAM device lock", NULL,
+	    MTX_DEF | MTX_NEW);
+}
+
 void
 cam_periph_release(struct cam_periph *periph)
 {
