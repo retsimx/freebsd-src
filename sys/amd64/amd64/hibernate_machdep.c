@@ -752,6 +752,28 @@ hibernate_resume_ap_entry(u_int cpu)
 	 */
 	tdq_curthread_reseed(pc->pc_idlethread);
 	/*
+	 * K24-T00: the AP-side twin of the same fix already applied on
+	 * the BSP path (acpi.c, immediately after its own
+	 * tdq_curthread_reseed(saved_td) call): pc->pc_idlethread->td_lock
+	 * is per-thread saved-image content, restored byte-for-byte by
+	 * the K-10 destructive copy, so it still names whatever lock
+	 * object (if any) the SAVE kernel's own idle thread happened to
+	 * be using at suspend time -- not this boot's own TDQ lock.
+	 * Confirmed by direct reproduction this round: "Assertion mtx ==
+	 * TDQ_LOCKPTR(tdq) failed at sched_ule.c:2474", inside
+	 * sched_ule_switch() -> mi_switch() -> sched_ule_idletd(), on
+	 * pid 11 tid 100003 (the idle thread), the first time this AP's
+	 * own idle thread is scheduled post-resume. Placed here, after
+	 * sched_init_ap() (which this file's own existing comment,
+	 * several lines above, already establishes as the point where
+	 * TDQ_SELF() first becomes valid on this CPU -- the identical
+	 * ordering constraint tdq_curthread_reseed()'s own call site
+	 * required), immediately alongside the existing
+	 * tdq_curthread_reseed() call it is the direct counterpart of.
+	 */
+	extern void td_lock_hibernate_reseed(struct thread *td);
+	td_lock_hibernate_reseed(pc->pc_idlethread);
+	/*
 	 * tdq_runq's own stale,
 	 * saved-image entries -- traversal analysis this round proved
 	 * sched_ap_entry() (immediately below) reaches
