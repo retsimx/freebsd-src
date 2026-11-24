@@ -396,23 +396,28 @@ callout_cpu_hibernate_selfcopy_range(int cpu, uintptr_t *va_out,
 }
 
 /*
- * cc_callwheel[]'s own buckets register currently-armed callouts;
- * every struct callout embedded in a thread or softc OTHER than the
- * two continuing threads (the resumed BSP thread, the AP's own fresh
- * idle thread) is, on this resume path, never going to be legitimately
- * dequeued or fired by its own owning code again -- the same
- * stale-registry exposure already fixed for sleepq_chains/
- * turnstile_chains (sys/kern/subr_sleepqueue.c,
- * sys/kern/subr_turnstile.c).  Re-init this one CPU's own bucket
- * LIST_HEADs and re-mtx_init() its own cc_lock, without touching
- * cc_callwheel's own backing allocation (already correctly placed and
- * sized by this boot's own cold callout_cpu_init()) or any other
- * struct callout_cpu field this function does not own.  This array's
- * own backing pages are not separately self-copy-protected here: an
- * attempt to do so was tested directly and found not to explain or
- * affect the callout_process() corruption this reinit fixes, in
- * either disposition (copy_leaf true or false); this reinit alone was
- * confirmed sufficient.
+ * Reinitialize the boot-instance-specific callout registries after the
+ * destructive hibernate copy.
+ *
+ * cc_callwheel[] and cc_expireq both contain struct callout pointers owned
+ * by the kernel instance that populated them.  Neither registry may survive
+ * into this fresh resume kernel: saved-image callouts name unrelated softcs,
+ * locks, functions, arguments, and threads.  The execution entities and scan
+ * cursors are the same class of transient state.
+ *
+ * Earlier versions reset only cc_callwheel[] and cc_lock.  #805 proved that
+ * incomplete: callout_process() found cc_callwheel empty but cc_expireq
+ * nonempty, entered its softclock wake path, and asserted at
+ * THREAD_LOCK_ASSERT(cc->cc_thread, MA_OWNED).  The queued entries were stale
+ * remnants, so waking the fresh boot's softclock thread for them was invalid.
+ *
+ * Restore every field callout_cpu_init() initializes except:
+ *   - cc_callwheel, whose fresh allocation and address must be retained;
+ *   - cc_thread, whose fresh softclock-thread identity must be retained;
+ *   - cc_ktr_event_name, which is immutable diagnostic text.
+ *
+ * This runs before acpi_s4_resume_bsp() releases APs or restores interrupts,
+ * so no CPU can concurrently inspect these fields.
  */
 void	callout_cpu_hibernate_reinit_chains(int cpu);
 void
@@ -424,8 +429,17 @@ callout_cpu_hibernate_reinit_chains(int cpu)
 	cc = CC_CPU(cpu);
 	if (cc->cc_callwheel == NULL)
 		return;
+
 	for (i = 0; i < callwheelsize; i++)
 		LIST_INIT(&cc->cc_callwheel[i]);
+	TAILQ_INIT(&cc->cc_expireq);
+	cc->cc_next = NULL;
+	cc->cc_firstevent = SBT_MAX;
+	cc->cc_lastscan = sbinuptime();
+	cc->cc_bucket = 0;
+	for (i = 0; i < 2; i++)
+		cc_cce_cleanup(cc, i);
+
 	mtx_init(&cc->cc_lock, "callout", NULL, MTX_SPIN | MTX_NEW);
 }
 
