@@ -3838,7 +3838,7 @@ acpi_hibernate_writer_workspace_alloc(
 	workspace->hww_destination_capacity = run_capacity;
 	workspace->hww_destination_intervals = malloc(destination_bytes, M_TEMP,
 	    M_WAITOK | M_ZERO);
-	workspace->hww_io_capacity = 2 * DEV_BSIZE;
+	workspace->hww_io_capacity = 2 * HIBERNATE_WRITE_CHUNK_MAX;
 	workspace->hww_io_buffer = malloc(workspace->hww_io_capacity, M_TEMP,
 	    M_WAITOK | M_ZERO);
 	workspace->hww_xsave_terminal = terminal;
