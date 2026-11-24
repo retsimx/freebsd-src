@@ -33,6 +33,7 @@
 
 #include <sys/param.h>
 #include <sys/efi.h>
+#include <sys/pcpu.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/linker.h>
@@ -309,7 +310,22 @@ efi_enter(void)
 	if (efi_runtime == NULL)
 		return (ENXIO);
 	td = curthread;
-	curpmap = &td->td_proc->p_vmspace->vm_pmap;
+	/*
+	 * Lock the pmap that efi_arch_enter() will actually use.
+	 *
+	 * Ordinarily PCPU(curpmap) equals td_proc's vmspace pmap.  A hibernate
+	 * continuation is different: resumectx() restores the saved thread while
+	 * retaining the fresh resume boot's live page tables and pc_curpmap.
+	 * The saved process pmap contains a prior boot's pm_cr3 and cannot safely
+	 * be activated.  Locking it here while efi_arch_enter() asserts ownership
+	 * of PCPU(curpmap) caused the first post-resume EFI RTC read to panic with
+	 * "mutex pmap not owned".
+	 *
+	 * EFI changes CR3 relative to PCPU(curpmap), and efi_arch_leave() restores
+	 * that same active pmap before this function's paired unlock.  Use that
+	 * identity consistently for the whole EFI runtime call.
+	 */
+	curpmap = PCPU_GET(curpmap);
 	PMAP_LOCK(curpmap);
 	mtx_lock(&efi_lock);
 	fpu_kern_enter(td, NULL, FPU_KERN_NOCTX);
@@ -337,7 +353,12 @@ efi_leave(void)
 
 	efi_arch_leave();
 
-	curpmap = &curproc->p_vmspace->vm_pmap;
+	/*
+	 * efi_arch_leave() has restored PCPU(curpmap), including the temporary
+	 * NULL substitution used by the PCID/no-INVPCID path.  Unlock the same
+	 * active pmap selected and locked by efi_enter().
+	 */
+	curpmap = PCPU_GET(curpmap);
 	fpu_kern_leave(td, NULL);
 	mtx_unlock(&efi_lock);
 	PMAP_UNLOCK(curpmap);
