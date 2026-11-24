@@ -410,6 +410,31 @@ device_sysctl_fini(device_t dev)
 static struct device_list bus_data_devices;
 static int bus_data_generation = 1;
 
+/*
+ * #815 proved that protecting every live struct kobj_ops is not sufficient:
+ * K-10 can independently restore the first field of a struct _device, making
+ * the object point at the saved kernel's ops table instead of the protected
+ * resume-kernel table.  Preserve the resume boot's exact device-to-ops
+ * association and replay only that first field before any DEVICE_RESUME().
+ *
+ * The registry contained 248 devices in the instrumented campaign.  Keep a
+ * deliberately generous fixed bound so capture needs no allocation in the
+ * hibernate prepare window; overflow is a visible E2BIG refusal.
+ */
+#define HIBERNATE_DEVICE_OPS_SNAPSHOT_MAX 1024
+
+struct hibernate_device_ops_snapshot {
+	device_t dev;
+	kobj_ops_t ops;
+};
+
+static struct {
+	struct hibernate_device_ops_snapshot
+	    entries[HIBERNATE_DEVICE_OPS_SNAPSHOT_MAX];
+	u_int count;
+	bool valid;
+} hibernate_device_ops_snapshot_state;
+
 static kobj_method_t null_methods[] = {
 	KOBJMETHOD_END
 };
@@ -723,6 +748,121 @@ device_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
 			}
 			n++;
 		}
+	}
+	bus_topo_unlock();
+}
+
+/*
+ * #812 closed over the remaining kobj-ops enumeration gap.  The existing
+ * devclass/driverlink walk above protects compiled driver classes registered
+ * in devclasses, but bus_generic_resume_child()+0x17 still loaded
+ * 0xdeadc0dedeadc0de from the dispatch cache of the ops table at
+ * 0xfffff80001486000.  The authoritative set for a DEVICE_* invocation is
+ * not "classes present in devclasses"; it is every ops pointer currently
+ * installed in a live device object.  That set also includes null_class,
+ * root_driver, and any otherwise-unregistered or indirectly compiled class
+ * referenced by an instance.
+ *
+ * Enumerate bus_data_devices, the existing global registry containing every
+ * struct _device.  Duplicate ops pointers are harmless because the MD
+ * self-copy layer already deduplicates by destination-page index.  Protect
+ * the whole struct kobj_ops, including its 256-entry cache, as this boot's
+ * live dispatch state.
+ */
+int
+device_hibernate_ops_snapshot_capture(void)
+{
+	device_t dev;
+	u_int n;
+
+	n = 0;
+	hibernate_device_ops_snapshot_state.valid = false;
+	hibernate_device_ops_snapshot_state.count = 0;
+
+	bus_topo_lock();
+	TAILQ_FOREACH(dev, &bus_data_devices, devlink) {
+		if (((kobj_t)dev)->ops == NULL)
+			continue;
+		if (n >= HIBERNATE_DEVICE_OPS_SNAPSHOT_MAX) {
+			bus_topo_unlock();
+			return (E2BIG);
+		}
+		hibernate_device_ops_snapshot_state.entries[n].dev = dev;
+		hibernate_device_ops_snapshot_state.entries[n].ops = ((kobj_t)dev)->ops;
+		n++;
+	}
+	bus_topo_unlock();
+
+	hibernate_device_ops_snapshot_state.count = n;
+	hibernate_device_ops_snapshot_state.valid = true;
+	return (0);
+}
+
+void
+device_hibernate_ops_snapshot_replay(void)
+{
+	u_int i;
+
+	if (!hibernate_device_ops_snapshot_state.valid)
+		return;
+	for (i = 0; i < hibernate_device_ops_snapshot_state.count; i++) {
+		if (hibernate_device_ops_snapshot_state.entries[i].dev == NULL ||
+		    hibernate_device_ops_snapshot_state.entries[i].ops == NULL)
+			continue;
+		((kobj_t)hibernate_device_ops_snapshot_state.entries[i].dev)->ops =
+		    hibernate_device_ops_snapshot_state.entries[i].ops;
+	}
+}
+
+void
+device_hibernate_ops_snapshot_selfcopy_range(uintptr_t *va_out, size_t *len_out)
+{
+	/*
+	 * All replay state is one C object, so this range is contiguous by
+	 * construction and does not depend on compiler or linker placement of
+	 * independent file-scope objects.
+	 */
+	*va_out = (uintptr_t)&hibernate_device_ops_snapshot_state;
+	*len_out = sizeof(hibernate_device_ops_snapshot_state);
+}
+
+u_int
+device_hibernate_ndevices(void)
+{
+	device_t dev;
+	u_int n;
+
+	n = 0;
+	bus_topo_lock();
+	TAILQ_FOREACH(dev, &bus_data_devices, devlink) {
+		if (((kobj_t)dev)->ops != NULL)
+			n++;
+	}
+	bus_topo_unlock();
+	return (n);
+}
+
+void
+device_hibernate_device_ops_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	device_t dev;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	bus_topo_lock();
+	TAILQ_FOREACH(dev, &bus_data_devices, devlink) {
+		if (((kobj_t)dev)->ops == NULL)
+			continue;
+		if (n == idx) {
+			*va_out = (uintptr_t)((kobj_t)dev)->ops;
+			*len_out = sizeof(*((kobj_t)dev)->ops);
+			bus_topo_unlock();
+			return;
+		}
+		n++;
 	}
 	bus_topo_unlock();
 }

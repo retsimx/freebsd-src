@@ -882,6 +882,13 @@ void	bus_topo_unlock(void);
 u_int	device_hibernate_nclasses(void);
 void	device_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
 	    size_t *len_out);
+int	device_hibernate_ops_snapshot_capture(void);
+void	device_hibernate_ops_snapshot_replay(void);
+void	device_hibernate_ops_snapshot_selfcopy_range(uintptr_t *va_out,
+	    size_t *len_out);
+u_int	device_hibernate_ndevices(void);
+void	device_hibernate_device_ops_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
 struct mtx * bus_topo_mtx(void);
 void	bus_topo_assert(void);
 
