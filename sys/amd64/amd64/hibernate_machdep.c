@@ -2011,17 +2011,40 @@ hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
  * free page was never claimed by any in-use kernel structure, so it
  * cannot legitimately appear there; this makes that assumption an
  * explicit, fail-closed check rather than an implicit one). A
- * pre-existing leaf entry is refused rather than overwritten -- Step 1's
- * capture already proved none should exist for this class of VA. After
- * writing the leaf, the full PTE chain is read back via
- * hibernate_md_walk_matches() and the insertion is undone (EINVAL
- * returned) if it does not resolve to exactly the intended frame and
- * permissions: "proven present with the required permissions", not
- * assumed.
+ * pre-existing leaf entry is refused rather than overwritten by
+ * default -- Step 1's capture proved none should exist for most
+ * callers' class of VA. After writing the leaf, the full PTE chain is
+ * read back via hibernate_md_walk_matches() and the insertion is
+ * undone (EINVAL returned) if it does not resolve to exactly the
+ * intended frame and permissions: "proven present with the required
+ * permissions", not assumed.
+ *
+ * K24-T00 stack disposition fix: the "none should exist" premise is
+ * false for exactly one caller -- the resuming thread's OWN kernel
+ * stack VA (the stack this very restore continuation is executing
+ * on). That VA is necessarily already live-mapped: it is the resume
+ * kernel's own thread0/current-thread kstack allocation, mapped by the
+ * ordinary resume-boot thread-creation path before hibernate resume
+ * ever runs. Empirically confirmed this round (N=12 baseline, runs
+ * 9-10/12): the live leaf frame (0x7fed8000 region) differs from the
+ * image's own saved leaf (0x7ed30000 region) at this VA, so the
+ * default refuse-on-mismatch path (installed=0 unresolved=0 err=22
+ * reason=8) fires and blocks every other lower page of the same
+ * KSTACK_PAGES range from ever being installed, because the per-page
+ * loop aborts on the first fatal error. The resuming thread's stack is
+ * the IMAGE's stack by construction (resumectx() switches %rsp to the
+ * saved pcb_rsp and returns into the saved call frames) -- the live
+ * resume-boot mapping at this VA is a false positive, not a
+ * conflicting real claim, and must be overwritten with the image's
+ * leaf, not refused. force_overwrite is true at exactly that one call
+ * site (the resuming-stack install calls) and false everywhere else
+ * (e.g. other staged threads' own kernel stacks, where a mismatched
+ * pre-existing live leaf remains a genuine conflict and must still
+ * fail closed).
  */
 static int
 hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
-    vm_paddr_t leaf_pa, uint64_t saved_flags)
+    vm_paddr_t leaf_pa, uint64_t saved_flags, bool force_overwrite)
 {
 	pml4_entry_t *pml4e;
 	pdp_entry_t *pdpe;
@@ -2109,7 +2132,17 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 		    (entry & (X86_PG_V | X86_PG_RW | X86_PG_U)) ==
 		    (leaf_flags & (X86_PG_V | X86_PG_RW | X86_PG_U)))
 			return (0);
-		return (EINVAL);
+		/*
+		 * K24-T00 stack disposition fix: a pre-existing, mismatched
+		 * live leaf at this VA is a genuine conflict for ordinary
+		 * callers, but is the EXPECTED case for the resuming
+		 * thread's own kstack VA (see the function's own comment
+		 * above) -- the live resume-boot mapping there is a false
+		 * positive that must be replaced with the image's leaf, not
+		 * refused. Only force_overwrite callers take this path.
+		 */
+		if (!force_overwrite)
+			return (EINVAL);
 	}
 
 	pte[pt_idx] = leaf_pa | leaf_flags;
@@ -3704,9 +3737,20 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				if (walk_ok &&
 				    (saved_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) ==
 				    (X86_PG_V | X86_PG_RW))
+					/*
+					 * K24-T00 stack disposition fix:
+					 * force_overwrite=true -- this VA is
+					 * the RESUMING thread's own kstack,
+					 * necessarily already live-mapped by
+					 * the ordinary resume-boot thread0
+					 * allocation; the image's leaf must
+					 * replace it, not be refused against
+					 * it (see hibernate_md_kva_install()'s
+					 * own comment).
+					 */
 					install_err = hibernate_md_kva_install(ha,
 					    (vm_offset_t)kstack_va, saved_walk.hmw_pa,
-					    saved_walk.hmw_flags);
+					    saved_walk.hmw_flags, true);
 
 				if (walk_ok && install_err == 0) {
 					for (kstack_npages = 1;
@@ -3730,11 +3774,25 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						    (X86_PG_V | X86_PG_RW)) !=
 						    (X86_PG_V | X86_PG_RW))
 							break;
+						/*
+						 * K24-T00 stack disposition
+						 * fix: force_overwrite=true --
+						 * this VA is another page of
+						 * the RESUMING thread's own
+						 * kstack, necessarily already
+						 * live-mapped by the ordinary
+						 * resume-boot thread0
+						 * allocation; the image's leaf
+						 * must replace it, not be
+						 * refused against it (see
+						 * hibernate_md_kva_install()'s
+						 * own comment).
+						 */
 						install_err =
 						    hibernate_md_kva_install(
 						    ha, kstack_page_va,
 						    extra_walk.hmw_pa,
-						    extra_walk.hmw_flags);
+						    extra_walk.hmw_flags, true);
 						if (install_err != 0)
 							break;
 					}
@@ -3847,8 +3905,19 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						error = EINVAL;
 						break;
 					}
+					/*
+					 * K24-T00 stack disposition fix:
+					 * force_overwrite=false -- this is
+					 * some OTHER staged thread's own
+					 * kernel stack, not the resuming
+					 * thread's; a mismatched pre-existing
+					 * live leaf here remains a genuine
+					 * conflict and must still fail closed
+					 * (see hibernate_md_kva_install()'s
+					 * own comment).
+					 */
 					error = hibernate_md_kva_install(ha, va,
-					    walk.hmw_pa, walk.hmw_flags);
+					    walk.hmw_pa, walk.hmw_flags, false);
 					if (error != 0)
 						break;
 					error = hib_selfcopy_pt(ha, wvec, p, va,
