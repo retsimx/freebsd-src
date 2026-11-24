@@ -4721,36 +4721,98 @@ hibernate_image_walk(struct hibernate_attempt *ha, bool do_read,
 			hib_crc_feed(&crc, cursor, xva, iv.hii_length,
 			    img->hi_crc_zero_offset, img->hi_crc_zero_length);
 		} else if (iv.hii_class == HIIC_STORED) {
-			/* PT_LOAD: page-by-page into the source-PA vector. */
-			uint64_t pages, pg;
+			/*
+			 * PT_LOAD: K24-PERF batched read.  The file range
+			 * [cursor, cursor+iv.hii_length) is contiguous, but
+			 * the destination source-PA vector entries
+			 * (st->hs_src.hp_pa[vec]) are an arbitrary scattered
+			 * per-page physical reservation -- hib_pages_map()
+			 * maps exactly one page at a time.  Mirror the
+			 * write side's HIBERNATE_WRITE_CHUNK_MAX batching:
+			 * one hibernate_stage_read() fills a staging buffer
+			 * covering up to HIBERNATE_READ_CHUNK_MAX bytes
+			 * (chunk_pages pages), then each page is memcpy'd
+			 * out to its own pva.  Per-page order, the vec >= P
+			 * bound check, and the poff = cursor +
+			 * pg * HIB_PAGE_SIZE / hib_crc_feed() sequence are
+			 * all unchanged from the prior one-page-per-read
+			 * form; only the provider read granularity changes.
+			 * The buffer is a function-local temporary, never
+			 * part of ha_staging, and is freed before every
+			 * return out of this branch.
+			 */
+			uint64_t pages, pg, chunk_pages, done;
+			uint8_t *rbuf;
 
 			if ((iv.hii_length & (HIB_PAGE_SIZE - 1)) != 0) {
 				return (EINVAL);
 			}
 			pages = iv.hii_length / HIB_PAGE_SIZE;
-			for (pg = 0; pg < pages; pg++) {
-				void *pva;
-				uint64_t poff;
 
-				if (vec >= P) {
-					return (EINVAL);
+			rbuf = NULL;
+			if (do_read) {
+				rbuf = hib_malloc(HIBERNATE_READ_CHUNK_MAX);
+				if (rbuf == NULL) {
+					return (ENOMEM);
 				}
-				pva = hib_pages_map(st->hs_src.hp_pa[vec]);
-				if (pva == NULL) {
-					return (EINVAL);
+			}
+
+			chunk_pages = HIBERNATE_READ_CHUNK_MAX / HIB_PAGE_SIZE;
+			for (done = 0; done < pages; done += chunk_pages) {
+				uint64_t take, pg_in_chunk;
+
+				take = pages - done;
+				if (take > chunk_pages) {
+					take = chunk_pages;
 				}
-				poff = cursor + pg * HIB_PAGE_SIZE;
+
 				if (do_read) {
-					error = hibernate_stage_read(ha, poff,
-					    pva, HIB_PAGE_SIZE);
+					error = hibernate_stage_read(ha,
+					    cursor + done * HIB_PAGE_SIZE,
+					    rbuf,
+					    (size_t)(take * HIB_PAGE_SIZE));
 					if (error != 0) {
+						hib_free(rbuf);
 						return (error);
 					}
 				}
-				hib_crc_feed(&crc, poff, pva, HIB_PAGE_SIZE,
-				    img->hi_crc_zero_offset,
-				    img->hi_crc_zero_length);
-				vec++;
+
+				for (pg_in_chunk = 0; pg_in_chunk < take;
+				    pg_in_chunk++) {
+					void *pva;
+					uint64_t poff;
+
+					pg = done + pg_in_chunk;
+					if (vec >= P) {
+						if (do_read) {
+							hib_free(rbuf);
+						}
+						return (EINVAL);
+					}
+					pva = hib_pages_map(
+					    st->hs_src.hp_pa[vec]);
+					if (pva == NULL) {
+						if (do_read) {
+							hib_free(rbuf);
+						}
+						return (EINVAL);
+					}
+					poff = cursor + pg * HIB_PAGE_SIZE;
+					if (do_read) {
+						__builtin_memcpy(pva,
+						    rbuf + pg_in_chunk *
+						    HIB_PAGE_SIZE,
+						    HIB_PAGE_SIZE);
+					}
+					hib_crc_feed(&crc, poff, pva,
+					    HIB_PAGE_SIZE,
+					    img->hi_crc_zero_offset,
+					    img->hi_crc_zero_length);
+					vec++;
+				}
+			}
+			if (do_read) {
+				hib_free(rbuf);
 			}
 		} else {
 			/* Payload ZERO_GAP: routed through the bounce page. */
@@ -5325,6 +5387,27 @@ hibernate_k24t04_raw_marker(int c)
 		continue;
 	outb(HIBMRK_COM1_DATA, '\n');
 }
+
+/*
+ * K24-T00 TEMP: decimal companion for the existing lock-free raw marker.
+ * Keep this formatter local to kern_hibernate.c; hibernate_machdep.c's
+ * identically shaped helper is static to its own translation unit.
+ */
+static void
+hibernate_k24t00_raw_uint(uint64_t value)
+{
+	char digits[20];
+	int n;
+
+	n = 0;
+	do {
+		digits[n++] = '0' + value % 10;
+		value /= 10;
+	} while (value != 0 && n < nitems(digits));
+	while (n > 0)
+		hibernate_k24t04_raw_marker(digits[--n]);
+}
+
 
 static int
 hibernate_park_dispatch(struct hibernate_attempt *ha, cpuset_t acknowledged)
@@ -6072,7 +6155,25 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 		goto cleanup;
 
 	stage = HIB_RESUME_READ_PAYLOAD;
-	error = hibernate_payload_read(ha, &crc);
+	{
+		/*
+		 * K24-PERF TEMP: bracket the payload-read phase with the
+		 * existing lock-free raw marker so this round's batched-read
+		 * change can be timed without printf on the resume path.
+		 * 'R' + start sbinuptime ticks, 'r' + end sbinuptime ticks
+		 * (both as decimal via the existing hibernate_k24t00_raw_uint
+		 * helper); elapsed seconds = (end-start) / 2^32.
+		 */
+		sbintime_t k24perf_start, k24perf_end;
+
+		k24perf_start = sbinuptime();
+		hibernate_k24t04_raw_marker('R');
+		hibernate_k24t00_raw_uint((uint64_t)k24perf_start);
+		error = hibernate_payload_read(ha, &crc);
+		k24perf_end = sbinuptime();
+		hibernate_k24t04_raw_marker('r');
+		hibernate_k24t00_raw_uint((uint64_t)k24perf_end);
+	}
 	hibernate_resume_stage_record(stage);
 	if (error != 0)
 		goto cleanup;

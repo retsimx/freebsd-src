@@ -154,6 +154,16 @@ extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
  */
 #define HIBERNATE_WRITE_CHUNK_MAX     65536
 
+/*
+ * K24-PERF: resume-side payload read staging buffer size.  Mirrors
+ * HIBERNATE_WRITE_CHUNK_MAX: a pure read-batching granularity for
+ * hibernate_stage_read() calls in hibernate_image_walk()'s PT_LOAD
+ * branch, heap-allocated (hib_malloc()) per walk, never on the resume
+ * kproc's kernel stack.  Never encoded on disk; no ABI/HCB_VERSION
+ * implication.
+ */
+#define HIBERNATE_READ_CHUNK_MAX      65536
+
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
