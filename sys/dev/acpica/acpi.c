@@ -5078,6 +5078,31 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		extern void tdq_curthread_reseed(struct thread *td);
 		tdq_curthread_reseed(saved_td);
 		/*
+		 * K24-T00: saved_td->td_lock is per-thread saved-
+		 * image content (restored byte-for-byte by the K-10
+		 * copy), so it still names whatever lock object the
+		 * SAVE kernel's own thread happened to be using at
+		 * suspend time, not this boot's own TDQ lock. The
+		 * very next code on this path that asserts thread-
+		 * lock ownership against curthread (== saved_td,
+		 * just above) is DEVICE_RESUME(root_bus)'s own
+		 * interrupt-handler-barrier walk, several lines
+		 * below via backout: -- confirmed directly this
+		 * round ("mutex  not owned" inside
+		 * sched_setpreempt(), reached via pci_resume() ->
+		 * intr_event_resume_handler() ->
+		 * intr_handler_barrier() ->
+		 * intr_event_schedule_thread() -> sched_ule_add()).
+		 * Reseed here, immediately after
+		 * tdq_curthread_reseed() (which already proves
+		 * PCPU(sched)/TDQ_SELF() valid on this BSP), the
+		 * exact BSP-side twin of sched_ule_ap_entry()'s own
+		 * existing AP-side fix (sched_init_ap(),
+		 * sys/amd64/amd64/hibernate_machdep.c).
+		 */
+		extern void td_lock_hibernate_reseed(struct thread *td);
+		td_lock_hibernate_reseed(saved_td);
+		/*
 		 * the BSP's own tdq_runq
 		 * ALSO needs reinitializing -- round 3's own analysis
 		 * correctly found the AP's own direct-entry traversal

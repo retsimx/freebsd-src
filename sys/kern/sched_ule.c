@@ -438,6 +438,34 @@ tdq_runq_hibernate_reinit(void)
 #define	TDQ_UNLOCK(t)		mtx_unlock_spin(TDQ_LOCKPTR((t)))
 #define	TDQ_LOCKPTR(t)		((struct mtx *)(&(t)->tdq_lock))
 
+/*
+ * K24-T00: reseed a resumed thread's own td_lock to this boot's own TDQ
+ * lock, the BSP-side twin of sched_ule_ap_entry()'s existing AP-side fix
+ * (sched_init_ap(), several lines above in this same file): td_lock is
+ * per-thread saved-image content, restored byte-for-byte by the K-10
+ * destructive copy, so it still points at whatever lock object (if any)
+ * the SAVE kernel's own thread happened to be using at suspend time --
+ * not this boot's own TDQ_LOCKPTR(TDQ_SELF()). Confirmed directly this
+ * round: THREAD_LOCK_ASSERT(curthread, MA_OWNED) inside
+ * sched_setpreempt(), reached via DEVICE_RESUME(root_bus)'s interrupt-
+ * handler-barrier resume walk (pci_resume() -> intr_event_resume_handler()
+ * -> intr_handler_barrier() -> intr_event_schedule_thread() ->
+ * sched_ule_add() -> sched_setpreempt()), panics with "mutex  not owned"
+ * the first time this resume continuation's own curthread (PCPU_SET(
+ * curthread, saved_td), sys/dev/acpica/acpi.c) is locked/asserted,
+ * because saved_td->td_lock still names the save-time lock object, not
+ * this boot's own TDQ lock. The caller must invoke this only after
+ * PCPU(sched) is already valid on this CPU (true for the BSP's own
+ * EJUSTRETURN continuation, which never reinitializes PCPU(sched) and so
+ * keeps this boot's own cold-boot value throughout).
+ */
+void	td_lock_hibernate_reseed(struct thread *td);
+void
+td_lock_hibernate_reseed(struct thread *td)
+{
+	td->td_lock = TDQ_LOCKPTR(TDQ_SELF());
+}
+
 static void sched_setpreempt(int);
 static void sched_priority(struct thread *);
 static void sched_thread_priority(struct thread *, u_char);
