@@ -5394,6 +5394,73 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 				callout_cpu_hibernate_reinit_chains(reinit_cpu);
 				spinlock_exit();
 			}
+			/*
+			 * K24-T00: uniform idle-thread td_lock
+			 * reseed, every CPU, single shared call
+			 * site -- the BSP (cpuid 0) was previously
+			 * reseeded by NEITHER existing call
+			 * (td_lock_hibernate_reseed(saved_td) above
+			 * only covers the resuming thread;
+			 * hibernate_resume_ap_entry()'s own reseed
+			 * is never invoked for the BSP, only for
+			 * actual APs during park-release).
+			 * Confirmed needed: "Assertion mtx ==
+			 * TDQ_LOCKPTR(tdq) failed at
+			 * sched_ule.c:2474" inside
+			 * sched_ule_switch() -> mi_switch() ->
+			 * sched_ule_idletd(), pid 11 tid 100003,
+			 * cpuid = 0.
+			 *
+			 * Safe here, for every CPU including the
+			 * BSP, because this loop runs strictly
+			 * after callout_cpu_hibernate_reinit_chains()
+			 * above has already walked every CPU's own
+			 * per-CPU state in this same BSP-driven
+			 * pass -- by this same construction, every
+			 * CPU's own TDQ_CPU(cpu) (DPCPU-backed) is
+			 * already a valid, live per-CPU structure:
+			 * APs reach that validity via
+			 * hibernate_resume_ap_entry()'s own
+			 * sched_init_ap() call (which this file's
+			 * own existing comment, several lines
+			 * above, already establishes as the
+			 * ordering precondition
+			 * tdq_curthread_reseed()'s own call site
+			 * required), and the BSP's own TDQ has been
+			 * live since ordinary cold boot and was
+			 * never torn down by anything on this
+			 * resume path. The AP-specific reseed inside
+			 * hibernate_resume_ap_entry() is kept (not
+			 * redundant): it runs much earlier, on each
+			 * AP's own entry stub, strictly before that
+			 * AP's own sched_ap_entry() ->
+			 * sched_throw(NULL) first-CPU-entry assert
+			 * (KASSERT(curthread->td_md.md_spinlock_count
+			 * == 1, ...), already documented in this same
+			 * function) can fire -- this later,
+			 * BSP-driven loop runs only once ALL CPUs
+			 * have already passed that point, so removing
+			 * the earlier AP-side call would reintroduce
+			 * exactly the ordering failure that call was
+			 * added to fix.
+			 */
+			{
+				int idle_reseed_cpu;
+				extern void td_lock_hibernate_reseed_cpu(
+				    struct thread *td, u_int cpu);
+
+				CPU_FOREACH(idle_reseed_cpu) {
+					struct pcpu *reseed_pc;
+
+					reseed_pc = pcpu_find(
+					    idle_reseed_cpu);
+					if (reseed_pc == NULL)
+						continue;
+					td_lock_hibernate_reseed_cpu(
+					    reseed_pc->pc_idlethread,
+					    idle_reseed_cpu);
+				}
+			}
 		}
 		/*
 		 * clear HIB_STAGE_RESERVED before unwinding on this

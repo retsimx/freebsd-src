@@ -466,6 +466,30 @@ td_lock_hibernate_reseed(struct thread *td)
 	td->td_lock = TDQ_LOCKPTR(TDQ_SELF());
 }
 
+/*
+ * K24-T00: remote-CPU twin of td_lock_hibernate_reseed() above, for the
+ * uniform per-CPU idle-thread reseed loop (sys/dev/acpica/acpi.c, the
+ * CPU_FOREACH block alongside callout_cpu_hibernate_reinit_chains()).
+ * TDQ_CPU(cpu) (DPCPU_ID_PTR) resolves any CPU's own tdq remotely, the
+ * same primitive this file's own sched_balance()/tdq_notify() etc.
+ * already use to touch a non-current CPU's tdq from the BSP -- not new
+ * machinery. Confirmed needed: the BSP's own idle thread (cpuid 0) was
+ * reseeded by NEITHER of the two existing call sites
+ * (td_lock_hibernate_reseed(saved_td) in acpi.c only covers the resuming
+ * thread, not the idle thread; hibernate_resume_ap_entry()'s own
+ * td_lock_hibernate_reseed(pc->pc_idlethread) call is never invoked for
+ * the BSP, only for actual APs during park-release) -- reproduced
+ * directly this round: "Assertion mtx == TDQ_LOCKPTR(tdq) failed at
+ * sched_ule.c:2474" inside sched_ule_switch() -> mi_switch() ->
+ * sched_ule_idletd(), pid 11 tid 100003, cpuid = 0.
+ */
+void	td_lock_hibernate_reseed_cpu(struct thread *td, u_int cpu);
+void
+td_lock_hibernate_reseed_cpu(struct thread *td, u_int cpu)
+{
+	td->td_lock = TDQ_LOCKPTR(TDQ_CPU(cpu));
+}
+
 static void sched_setpreempt(int);
 static void sched_priority(struct thread *);
 static void sched_thread_priority(struct thread *, u_char);
