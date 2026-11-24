@@ -107,6 +107,111 @@ static struct mtx rman_mtx; /* mutex to protect rman_head */
 MTX_SYSINIT(rman_mtx, &rman_mtx, "rman head", MTX_DEF);
 
 /*
+ * Active resource mappings are resume-kernel state.  Although the rman
+ * topology and resource_i allocations are self-copy protected below, retain
+ * an independent, narrow record of the public mapping fields consumed
+ * directly by bus_space accessors.  #816 reached hpet_resume() with a valid
+ * sc->mem_res but with r_bushandle replaced by 0xffffffff815dbff0; adding the
+ * HPET_CONFIG offset produced 0xffffffff815dc000 (cap_connect_rights), the
+ * exact nofault write address.  Replay these fields before any resumed device
+ * method can issue a bus_read_*() or bus_write_*().
+ *
+ * Capture uses fixed storage because hibernate prepare cannot allocate.
+ * Overflow refuses the image rather than leaving any active mapping
+ * unrecorded.
+ */
+#define HIBERNATE_RMAN_MAPPING_SNAPSHOT_MAX 4096
+
+struct hibernate_rman_mapping_snapshot {
+	struct resource *resource;
+	struct resource_map map;
+};
+
+static struct {
+	struct hibernate_rman_mapping_snapshot
+	    entries[HIBERNATE_RMAN_MAPPING_SNAPSHOT_MAX];
+	u_int count;
+	bool valid;
+} hibernate_rman_mapping_snapshot_state;
+
+static int
+rman_hibernate_mapping_snapshot_add(struct resource_i *r, u_int *countp)
+{
+	struct hibernate_rman_mapping_snapshot *entry;
+
+	if ((r->r_flags & (RF_ALLOCATED | RF_ACTIVE | RF_UNMAPPED)) !=
+	    (RF_ALLOCATED | RF_ACTIVE))
+		return (0);
+	if (*countp >= HIBERNATE_RMAN_MAPPING_SNAPSHOT_MAX)
+		return (E2BIG);
+	entry = &hibernate_rman_mapping_snapshot_state.entries[*countp];
+	entry->resource = &r->r_r;
+	rman_get_mapping(entry->resource, &entry->map);
+	(*countp)++;
+	return (0);
+}
+
+int
+rman_hibernate_mapping_snapshot_capture(void)
+{
+	struct resource_i *r, *shr;
+	struct rman *rm;
+	u_int count;
+	int error;
+
+	hibernate_rman_mapping_snapshot_state.valid = false;
+	hibernate_rman_mapping_snapshot_state.count = 0;
+	count = 0;
+	error = 0;
+
+	TAILQ_FOREACH(rm, &rman_head, rm_link) {
+		TAILQ_FOREACH(r, &rm->rm_list, r_link) {
+			error = rman_hibernate_mapping_snapshot_add(r, &count);
+			if (error != 0)
+				return (error);
+			if (r->r_sharehead == NULL)
+				continue;
+			LIST_FOREACH(shr, r->r_sharehead, r_sharelink) {
+				if (shr == r)
+					continue;
+				error = rman_hibernate_mapping_snapshot_add(shr,
+				    &count);
+				if (error != 0)
+					return (error);
+			}
+		}
+	}
+
+	hibernate_rman_mapping_snapshot_state.count = count;
+	hibernate_rman_mapping_snapshot_state.valid = true;
+	return (0);
+}
+
+void
+rman_hibernate_mapping_snapshot_replay(void)
+{
+	struct hibernate_rman_mapping_snapshot *entry;
+	u_int i;
+
+	if (!hibernate_rman_mapping_snapshot_state.valid)
+		return;
+	for (i = 0; i < hibernate_rman_mapping_snapshot_state.count; i++) {
+		entry = &hibernate_rman_mapping_snapshot_state.entries[i];
+		if (entry->resource == NULL)
+			continue;
+		rman_set_mapping(entry->resource, &entry->map);
+	}
+}
+
+void
+rman_hibernate_mapping_snapshot_selfcopy_range(uintptr_t *va_out,
+    size_t *len_out)
+{
+	*va_out = (uintptr_t)&hibernate_rman_mapping_snapshot_state;
+	*len_out = sizeof(hibernate_rman_mapping_snapshot_state);
+}
+
+/*
  * rman_head/rman_mtx
  * -- the static registry every struct rman (irq_rman, drq_rman,
  * port_rman, mem_rman, and every bus-specific rman created via
