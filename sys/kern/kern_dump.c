@@ -585,6 +585,7 @@ struct hibernate_provider_stream {
 	uint64_t hps_crc_block_file_offset;
 	struct hibernate_marker *hps_pending;
 	bool hps_crc_block_valid;
+	size_t hps_crc_block_len;
 };
 
 static int
@@ -615,12 +616,64 @@ hibernate_provider_write_block(struct hibernate_provider_stream *stream)
 		    stream->hps_block_size);
 		stream->hps_crc_block_file_offset =
 		    stream->hps_block_file_offset;
+		stream->hps_crc_block_len = stream->hps_block_size;
 		stream->hps_crc_block_valid = true;
 	}
 
 	stream->hps_block_file_offset += stream->hps_block_size;
 	stream->hps_block_used = 0;
 	bzero(workspace->hww_io_buffer, stream->hps_block_size);
+	return (0);
+}
+
+/*
+ * K24-PERF: flush the single trailing residue, if any, that is shorter
+ * than hps_block_size.  This is the only place a partial-length
+ * dump_write() is permitted; hibernate_provider_write_block() still
+ * fails closed (EINVAL) on any other partial block.  The residue's
+ * length is always an exact multiple of di->blocksize (hi_image_length
+ * and every chunk size are both maintained as multiples of it), so no
+ * padding bytes are ever written and the on-disk format is unchanged.
+ * Called exactly once, after the stream's logical content is fully
+ * produced and before hibernate_provider_stream_image() validates the
+ * total byte count.
+ */
+static int
+hibernate_provider_flush_final(struct hibernate_provider_stream *stream)
+{
+	struct hibernate_writer_workspace *workspace;
+	uint64_t provider_offset;
+	int error;
+
+	workspace = stream->hps_workspace;
+	if (stream->hps_block_used == 0)
+		return (0);
+	if (stream->hps_block_used % stream->hps_dumper->blocksize != 0)
+		return (EINVAL);
+	if (__builtin_add_overflow(stream->hps_image_offset,
+		stream->hps_block_file_offset, &provider_offset) ||
+	    provider_offset > OFF_MAX)
+		return (EOVERFLOW);
+
+	error = dump_write(stream->hps_dumper, workspace->hww_io_buffer,
+	    (off_t)provider_offset, stream->hps_block_used);
+	if (error != 0)
+		return (error);
+
+	if (workspace->hww_plan.hwp_image.hi_crc_zero_offset >=
+	    stream->hps_block_file_offset &&
+	    workspace->hww_plan.hwp_image.hi_crc_zero_offset <
+	    stream->hps_block_file_offset + stream->hps_block_used) {
+		memcpy(stream->hps_crc_block, workspace->hww_io_buffer,
+		    stream->hps_block_used);
+		stream->hps_crc_block_file_offset =
+		    stream->hps_block_file_offset;
+		stream->hps_crc_block_len = stream->hps_block_used;
+		stream->hps_crc_block_valid = true;
+	}
+
+	stream->hps_block_file_offset += stream->hps_block_used;
+	stream->hps_block_used = 0;
 	return (0);
 }
 
@@ -757,7 +810,7 @@ hibernate_provider_rewrite_crc(void *arg, uint64_t crc_offset,
 	if (stream == NULL || !stream->hps_crc_block_valid ||
 	    crc_offset < stream->hps_crc_block_file_offset ||
 	    crc_offset + sizeof(final_crc) >
-	    stream->hps_crc_block_file_offset + stream->hps_block_size)
+	    stream->hps_crc_block_file_offset + stream->hps_crc_block_len)
 		return (EINVAL);
 
 	workspace = stream->hps_workspace;
@@ -773,7 +826,7 @@ hibernate_provider_rewrite_crc(void *arg, uint64_t crc_offset,
 	    provider_offset > OFF_MAX)
 		return (EOVERFLOW);
 	return (dump_write(stream->hps_dumper, stream->hps_crc_block,
-	    (off_t)provider_offset, stream->hps_block_size));
+	    (off_t)provider_offset, stream->hps_crc_block_len));
 }
 
 static int
@@ -786,6 +839,9 @@ hibernate_provider_stream_image(void *arg)
 	error = hibernate_writer_plan_stream(&stream->hps_workspace->hww_plan,
 	    hibernate_provider_write_stored, hibernate_provider_write_zero,
 	    hibernate_provider_rewrite_crc, stream);
+	if (error != 0)
+		return (error);
+	error = hibernate_provider_flush_final(stream);
 	if (error != 0)
 		return (error);
 	if (stream->hps_block_used != 0)
@@ -966,14 +1022,50 @@ dump_for_hibernate(const struct hibernate_save_cb *hcb,
 	if (image_end > provider_end)
 		return (ENOSPC);
 
-	bzero(&stream, sizeof(stream));
-	stream.hps_attempt = attempt;
-	stream.hps_workspace = workspace;
-	stream.hps_dumper = di;
-	stream.hps_image_offset = image_offset;
-	stream.hps_block_size = di->blocksize;
-	stream.hps_crc_block = workspace->hww_io_buffer + di->blocksize;
-	stream.hps_pending = &pending;
+	/*
+	 * K24-PERF: pick the write-batching chunk size for this attempt.
+	 * hibernate_provider_stream_image() flushes any final,
+	 * shorter-than-hps_block_size residue explicitly via
+	 * hibernate_provider_flush_final(), so the chunk no longer needs to
+	 * evenly divide the image length -- the full
+	 * HIBERNATE_WRITE_CHUNK_MAX is used unconditionally, subject only
+	 * to the maxiosize/staging-buffer caps below.  A partial block
+	 * anywhere other than that single end-of-stream flush remains a
+	 * hard error in hibernate_provider_write_block().  No on-disk
+	 * format change results: every byte written is still real image
+	 * data, never padding -- the final residue is always an exact
+	 * multiple of di->blocksize, because both hi_image_length and the
+	 * chosen chunk are maintained as multiples of it.
+	 * Use the largest power-of-two multiple of di->blocksize that is
+	 * (a) at most HIBERNATE_WRITE_CHUNK_MAX, (b) at most
+	 * di->maxiosize (the SIM's own transfer limit), and (c) at most
+	 * half of the allocated staging buffer (the other half backs the
+	 * CRC-rewrite snapshot, hps_crc_block).
+	 */
+	{
+		uint64_t chunk, iocap_half;
+
+		chunk = HIBERNATE_WRITE_CHUNK_MAX;
+		if (di->maxiosize != 0 && chunk > di->maxiosize)
+			chunk = di->maxiosize;
+		iocap_half = workspace->hww_io_capacity / 2;
+		if (chunk > iocap_half)
+			chunk = iocap_half;
+		/* Round down to a power of two. */
+		while ((chunk & (chunk - 1)) != 0)
+			chunk &= chunk - 1;
+		if (chunk < di->blocksize)
+			chunk = di->blocksize;
+
+		bzero(&stream, sizeof(stream));
+		stream.hps_attempt = attempt;
+		stream.hps_workspace = workspace;
+		stream.hps_dumper = di;
+		stream.hps_image_offset = image_offset;
+		stream.hps_block_size = (size_t)chunk;
+		stream.hps_crc_block = workspace->hww_io_buffer + chunk;
+		stream.hps_pending = &pending;
+	}
 	bzero(workspace->hww_io_buffer, workspace->hww_io_capacity);
 
 	bzero(&pending, sizeof(pending));

@@ -145,6 +145,15 @@ void hibernate_handoff_consume(void);
 extern void (*hibernate_test_handoff_failure_fn)(const char *, uintmax_t);
 #endif
 
+/*
+ * K24-PERF: save-side write staging buffer size.  This is a pure write-
+ * batching granularity for dump_write() calls against the ABI 1 image
+ * provider; it is never encoded on disk and carries no ABI/HCB_VERSION
+ * implication.  Clamped at runtime (dump_for_hibernate()) to a multiple of
+ * di->blocksize that also respects di->maxiosize.
+ */
+#define HIBERNATE_WRITE_CHUNK_MAX     65536
+
 #define HCB_VERSION		      1
 #define HIBERNATE_META_BUF_MAX	      65536
 #define HIBERNATE_METADATA_SIZE	      UINT64_C(65536)
