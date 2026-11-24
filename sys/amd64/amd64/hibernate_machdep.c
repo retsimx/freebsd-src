@@ -5477,9 +5477,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				extern u_int uma_hibernate_nkegs_raw(void);
 				extern void uma_hibernate_keg_domain_headvas(
 				    u_int keg_idx, u_int dom,
-				    vm_offset_t *part_va, vm_offset_t *free_va,
-				    vm_offset_t *full_va,
-				    int *is_vtoslab_keg);
+				    vm_offset_t * part_va,
+				    vm_offset_t * free_va,
+				    vm_offset_t * full_va, int *is_vtoslab_keg);
 				u_int topo_nkegs, topo_ki;
 				int topo_dom;
 
@@ -5490,7 +5490,8 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				    topo_ki++) {
 					for (topo_dom = 0;
 					    topo_dom < vm_ndomains &&
-					    topo_dom < MAXMEMDOM; topo_dom++) {
+					    topo_dom < MAXMEMDOM;
+					    topo_dom++) {
 						vm_offset_t pva, fva, uva;
 						int is_vtoslab;
 						uintptr_t hv;
@@ -5506,23 +5507,23 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						terr = hibernate_md_staged_read(
 						    ha, wvec, p, pva, &hv,
 						    sizeof(hv));
-						hib_keg_topo_head_g[topo_ki]
-						    [topo_dom][0] =
-						    (terr == 0) ? hv : 0;
+						hib_keg_topo_head_g
+						    [topo_ki][topo_dom][0] =
+							(terr == 0) ? hv : 0;
 
 						terr = hibernate_md_staged_read(
 						    ha, wvec, p, fva, &hv,
 						    sizeof(hv));
-						hib_keg_topo_head_g[topo_ki]
-						    [topo_dom][1] =
-						    (terr == 0) ? hv : 0;
+						hib_keg_topo_head_g
+						    [topo_ki][topo_dom][1] =
+							(terr == 0) ? hv : 0;
 
 						terr = hibernate_md_staged_read(
 						    ha, wvec, p, uva, &hv,
 						    sizeof(hv));
-						hib_keg_topo_head_g[topo_ki]
-						    [topo_dom][2] =
-						    (terr == 0) ? hv : 0;
+						hib_keg_topo_head_g
+						    [topo_ki][topo_dom][2] =
+							(terr == 0) ? hv : 0;
 					}
 				}
 				hib_keg_topo_captured_n_g = topo_nkegs;
@@ -5565,11 +5566,12 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					    sizeof(hib_keg_topo_head_g));
 					for (; topo_pg < topo_end;
 					    topo_pg += PAGE_SIZE) {
-						error = hibernate_md_selfcopy_walk(
-						    ha, wvec, p,
-						    kernel_pmap->pm_cr3,
-						    topo_pg, true,
-						    &selfcopied);
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							topo_pg, true,
+							&selfcopied);
 						if (error != 0)
 							break;
 					}
@@ -5577,18 +5579,19 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				if (error == 0) {
 					vm_offset_t topo_pg, topo_end;
 
-					topo_pg = trunc_page((vm_offset_t)
-					    &hib_keg_topo_captured_n_g);
-					topo_end = round_page((vm_offset_t)
-					    &hib_keg_topo_captured_n_g +
+					topo_pg = trunc_page((
+					    vm_offset_t)&hib_keg_topo_captured_n_g);
+					topo_end = round_page(
+					    (vm_offset_t)&hib_keg_topo_captured_n_g +
 					    sizeof(hib_keg_topo_captured_n_g));
 					for (; topo_pg < topo_end;
 					    topo_pg += PAGE_SIZE) {
-						error = hibernate_md_selfcopy_walk(
-						    ha, wvec, p,
-						    kernel_pmap->pm_cr3,
-						    topo_pg, true,
-						    &selfcopied);
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							topo_pg, true,
+							&selfcopied);
 						if (error != 0)
 							break;
 					}
@@ -5596,18 +5599,19 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				if (error == 0) {
 					vm_offset_t topo_pg, topo_end;
 
-					topo_pg = trunc_page((vm_offset_t)
-					    &hib_keg_topo_captured_g);
-					topo_end = round_page((vm_offset_t)
-					    &hib_keg_topo_captured_g +
+					topo_pg = trunc_page((
+					    vm_offset_t)&hib_keg_topo_captured_g);
+					topo_end = round_page(
+					    (vm_offset_t)&hib_keg_topo_captured_g +
 					    sizeof(hib_keg_topo_captured_g));
 					for (; topo_pg < topo_end;
 					    topo_pg += PAGE_SIZE) {
-						error = hibernate_md_selfcopy_walk(
-						    ha, wvec, p,
-						    kernel_pmap->pm_cr3,
-						    topo_pg, true,
-						    &selfcopied);
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							topo_pg, true,
+							&selfcopied);
 						if (error != 0)
 							break;
 					}

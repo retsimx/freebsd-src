@@ -5160,7 +5160,7 @@ static u_int uma_hibernate_reinit_plinks_unfreed;
  */
 static void
 uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
-    uintptr_t staged_head, uma_keg_t keg, uma_zone_t zone)
+    uintptr_t staged_head, uma_keg_t keg, uma_zone_t zone, uma_domain_t domp)
 {
 	uma_slab_t slab;
 	uint8_t *mem;
@@ -5192,8 +5192,8 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 	 */
 	slab = (uma_slab_t)staged_head;
 	for (iter = 0; slab != NULL; iter++) {
-		if (__predict_false(iter >=
-		    UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER)) {
+		if (__predict_false(
+			iter >= UMA_HIBERNATE_REINIT_PLINKS_MAX_ITER)) {
 			uma_hibernate_reinit_plinks_runaway++;
 			break;
 		}
@@ -5355,12 +5355,23 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 			 * removing the order check, adding the missing
 			 * precondition it should have had from the start.
 			 */
-			if (pg_m->order != VM_NFREEORDER &&
-			    vm_phys_paddr_to_seg(pg_pa) != NULL) {
+			/*
+			 * No m->order pre-gate.  Only the head page of a
+			 * buddy block carries order != VM_NFREEORDER; an
+			 * interior page of a larger free block reads
+			 * VM_NFREEORDER and was wrongly left free (ahci kobj
+			 * ops page reallocated as sysctl descr strings -> #GP
+			 * in bus_generic_resume_child). vm_phys_unfree_page()
+			 * itself locates the containing block and returns false
+			 * for a page not on any free list. The vm_phys_seg gate
+			 * (pg_pa=0 #GP) is kept.
+			 */
+			if (vm_phys_paddr_to_seg(pg_pa) != NULL) {
 				int pg_domain = vm_phys_domain(pg_pa);
 
 				vm_domain_free_lock(VM_DOMAIN(pg_domain));
-				(void)vm_phys_unfree_page(pg_pa);
+				if (vm_phys_unfree_page(pg_pa))
+					uma_hibernate_reinit_plinks_unfreed++;
 				vm_domain_free_unlock(VM_DOMAIN(pg_domain));
 			}
 			pg_m->plinks.uma.slab = slab;
@@ -5368,7 +5379,43 @@ uma_hibernate_reinit_plinks_slablist(const struct hibernate_attempt *_ha,
 		}
 
 		next_field_ptr = (uma_slab_t *)PHYS_TO_DMAP(next_field_pa);
-		slab = *next_field_ptr;
+		/*
+		 * Save the restored chain successor before rewriting us_link.
+		 * The protected live keg retained this boot's uk_domain[] heads,
+		 * while each unprotected slab object now contains saved-image
+		 * state.  Rebuild one internally consistent live topology from
+		 * those restored slab objects, classifying by the same invariant
+		 * every ordinary UMA transition uses:
+		 *
+		 *   us_freecount == 0             -> full
+		 *   us_freecount == uk_ipers      -> free
+		 *   otherwise                     -> partial
+		 *
+		 * The caller clears all three heads and counters before walking
+		 * the staged chains.  Capturing next here first makes relinking
+		 * safe even though us_link is the field that carried that chain.
+		 */
+		{
+			uma_slab_t next;
+
+			next = *next_field_ptr;
+			if (slab->us_domain != (u_int)(domp - keg->uk_domain) ||
+			    slab->us_freecount > keg->uk_ipers) {
+				uma_hibernate_reinit_plinks_unresolved++;
+				break;
+			}
+			if (slab->us_freecount == 0) {
+				LIST_INSERT_HEAD(&domp->ud_full_slab, slab, us_link);
+			} else if (slab->us_freecount == keg->uk_ipers) {
+				LIST_INSERT_HEAD(&domp->ud_free_slab, slab, us_link);
+				domp->ud_free_slabs++;
+			} else {
+				LIST_INSERT_HEAD(&domp->ud_part_slab, slab, us_link);
+			}
+			domp->ud_pages += keg->uk_ppera;
+			domp->ud_free_items += slab->us_freecount;
+			slab = next;
+		}
 	}
 }
 
@@ -5525,40 +5572,56 @@ uma_hibernate_reinit_plinks(void)
 			continue;
 		for (dom = 0; dom < vm_ndomains; dom++) {
 			struct uma_domain *domp = &keg->uk_domain[dom];
+			uintptr_t part_head, free_head, full_head;
 
+			/*
+			 * Preserve the three source heads before clearing the protected
+			 * live domain.  Normally they come from the staged capture; the
+			 * fallback retains the prior live-head behaviour without losing
+			 * its heads during reinitialisation.
+			 */
 			if (hib_keg_topo_captured_g &&
-			    this_idx < hib_keg_topo_captured_n_g &&
-			    dom < 8) {
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    hib_keg_topo_head_g[this_idx][dom][0],
-				    keg, zone);
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    hib_keg_topo_head_g[this_idx][dom][1],
-				    keg, zone);
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    hib_keg_topo_head_g[this_idx][dom][2],
-				    keg, zone);
+			    this_idx < hib_keg_topo_captured_n_g && dom < 8) {
+				part_head = hib_keg_topo_head_g[this_idx][dom][0];
+				free_head = hib_keg_topo_head_g[this_idx][dom][1];
+				full_head = hib_keg_topo_head_g[this_idx][dom][2];
 			} else {
-				if (!hib_keg_topo_captured_g ||
-				    dom >= 8)
+				if (!hib_keg_topo_captured_g || dom >= 8)
 					uma_hibernate_reinit_plinks_topo_fallback++;
 				else
 					uma_hibernate_reinit_plinks_topo_oob++;
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    (uintptr_t)LIST_FIRST(&domp->ud_part_slab),
-				    keg, zone);
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    (uintptr_t)LIST_FIRST(&domp->ud_free_slab),
-				    keg, zone);
-				uma_hibernate_reinit_plinks_slablist(NULL,
-				    (uintptr_t)LIST_FIRST(&domp->ud_full_slab),
-				    keg, zone);
+				part_head =
+				    (uintptr_t)LIST_FIRST(&domp->ud_part_slab);
+				free_head =
+				    (uintptr_t)LIST_FIRST(&domp->ud_free_slab);
+				full_head =
+				    (uintptr_t)LIST_FIRST(&domp->ud_full_slab);
 			}
+
+			/*
+			 * The live keg object is intentionally protected, but its slab
+			 * objects are restored.  Rebuild the heads and all counters from
+			 * the restored slab state instead of retaining the contradictory
+			 * cold-boot list classification seen in #814.
+			 */
+			LIST_INIT(&domp->ud_part_slab);
+			LIST_INIT(&domp->ud_free_slab);
+			LIST_INIT(&domp->ud_full_slab);
+			domp->ud_pages = 0;
+			domp->ud_free_items = 0;
+			domp->ud_free_slabs = 0;
+
+			uma_hibernate_reinit_plinks_slablist(NULL, part_head, keg,
+			    zone, domp);
+			uma_hibernate_reinit_plinks_slablist(NULL, free_head, keg,
+			    zone, domp);
+			uma_hibernate_reinit_plinks_slablist(NULL, full_head, keg,
+			    zone, domp);
 		}
 	}
 	printf("uma_hibernate_reinit_plinks: resolved=%u unresolved=%u "
-	    "runaway=%u unfreed=%u inline_skipped=%u topo_fallback=%u "
-	    "topo_oob=%u\n",
+	       "runaway=%u unfreed=%u inline_skipped=%u topo_fallback=%u "
+	       "topo_oob=%u\n",
 	    uma_hibernate_reinit_plinks_resolved,
 	    uma_hibernate_reinit_plinks_unresolved,
 	    uma_hibernate_reinit_plinks_runaway,
