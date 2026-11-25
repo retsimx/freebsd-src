@@ -3028,6 +3028,22 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 	u_long hash, i;
 	u_int chains_entered, n, swept_nonnull;
 	int error;
+	/*
+	 * K24-T00 round 2: chain-walk failure counting. Every staged
+	 * read in the main enumeration loop below can fail (an
+	 * unresolvable page in the staged image), and until now each
+	 * failure was handled with a silent "break" that abandons the
+	 * REST of the current chain (proc-link failure) or the rest of
+	 * the current process's threads (thread-link failure) -- the
+	 * loop then simply moves on to the next bucket/process as if
+	 * nothing were lost. A real image thread sitting past a broken
+	 * link is therefore never staged, never installed, yet still
+	 * schedulable once APs are released. Count both failure
+	 * kinds and their first error code here, unconditionally, so a
+	 * single printf below can report the totals every run.
+	 */
+	u_int k24t00_chain_fail_count, k24t00_thread_fail_count;
+	int k24t00_chain_fail_err, k24t00_thread_fail_err;
 
 	table = pidhashtbl;
 	hash = pidhash;
@@ -3051,6 +3067,10 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 
 	n = 0;
 	chains_entered = 0;
+	k24t00_chain_fail_count = 0;
+	k24t00_thread_fail_count = 0;
+	k24t00_chain_fail_err = 0;
+	k24t00_thread_fail_err = 0;
 	for (i = 0; i <= hash; i++) {
 		struct proc staged_proc;
 		u_int iter_guard;
@@ -3072,8 +3092,20 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 			error = hibernate_md_staged_read(ha, wvec, p,
 			    (vm_offset_t)proc_cursor, &staged_proc,
 			    sizeof(staged_proc));
-			if (error != 0)
+			if (error != 0) {
+				/*
+				 * K24-T00 round 2: this read is what
+				 * would have yielded LIST_NEXT(&staged_
+				 * proc, p_hash) -- its failure means the
+				 * REST of this bucket's chain (unknown
+				 * length) is abandoned, unvisited, by the
+				 * break below.
+				 */
+				k24t00_chain_fail_count++;
+				if (k24t00_chain_fail_count == 1)
+					k24t00_chain_fail_err = error;
 				break;
+			}
 
 			proc_ok = staged_proc.p_state != PRS_NEW &&
 			    staged_proc.p_state >= SIDL &&
@@ -3106,8 +3138,24 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 				error = hibernate_md_staged_read(ha, wvec, p,
 				    (vm_offset_t)thread_cursor,
 				    &staged_thread, sizeof(staged_thread));
-				if (error != 0)
+				if (error != 0) {
+					/*
+					 * K24-T00 round 2: this read is
+					 * what would have yielded TAILQ_
+					 * NEXT(&staged_thread, td_plist)
+					 * -- its failure means the REST
+					 * of this process's own thread
+					 * list (unknown length) is
+					 * abandoned, unvisited, by the
+					 * break below; the chain walk
+					 * itself continues to the next
+					 * process.
+					 */
+					k24t00_thread_fail_count++;
+					if (k24t00_thread_fail_count == 1)
+						k24t00_thread_fail_err = error;
 					break;
+				}
 
 				kva = trunc_page(
 				    (vm_offset_t)staged_thread.td_kstack);
@@ -3128,6 +3176,32 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 			}
 			proc_cursor = LIST_NEXT(&staged_proc, p_hash);
 		}
+	}
+
+	printf("hibernate: k24t00: chain-walk failures: "
+	    "chain_link_fail=%u chain_link_err=%d "
+	    "thread_link_fail=%u thread_link_err=%d\n",
+	    k24t00_chain_fail_count, k24t00_chain_fail_err,
+	    k24t00_thread_fail_count, k24t00_thread_fail_err);
+
+	/*
+	 * K24-T00 round 2: fail-closed. A chain-link or thread-link
+	 * read failure means the enumeration silently stopped short of
+	 * the staged image's true thread set -- some real thread may
+	 * never have been staged or installed, yet remains schedulable
+	 * once APs are released. Refuse rather than proceed with a
+	 * known-partial enumeration; the caller
+	 * (hibernate_machdep_prepare()) already treats any nonzero
+	 * return here as refuse-and-cold-boot (see
+	 * sys/kern/kern_hibernate.c's "if (error != 0) goto cleanup;"
+	 * immediately after its own call to
+	 * hibernate_machdep_prepare()), so this is a plain extension of
+	 * behaviour that already exists for every other error path in
+	 * this same function, not new machinery.
+	 */
+	if (k24t00_chain_fail_count > 0 || k24t00_thread_fail_count > 0) {
+		error = EIO;
+		goto out;
 	}
 
 	if (swept_nonnull != chains_entered) {
