@@ -2826,18 +2826,113 @@ hib_saved_domain_leaf_valid(const struct hibernate_attempt *ha,
 	return ((entry & X86_PG_V) != 0);
 }
 
+/*
+ * K24-T00 round 11: the load-bearing fix. hibernate_md_staged_read()'s
+ * PRIMARY resolution path (hib_md_safe_resolve() against
+ * kernel_pmap->pm_cr3, i.e. THIS resume boot's own LIVE page tables)
+ * answers "what is VA mapped to in the CURRENTLY RUNNING kernel", not
+ * "what was VA mapped to in the SAVED image". For boot-invariant
+ * regions (kernel text/.data/.bss, whose page tables are rebuilt
+ * identically by every boot of the same kernel binary) the two
+ * questions happen to have the same answer, which is exactly why
+ * every check on those regions came back clean across ten prior
+ * rounds. For anything from a UMA zone (struct proc, struct thread,
+ * and every other dynamically-allocated kernel object) the two boots
+ * assign DIFFERENT physical pages to the SAME virtual address -- the
+ * live walk then either fails to resolve, or worse, resolves to a
+ * live PA that happens to ALSO be a current destination-set member
+ * (coincidental, not causal), silently returning whatever unrelated
+ * content that live page holds instead of the image's own page for
+ * that VA. Round 10 proved devd's struct proc is written to a STORED
+ * interval with real content at save time; this is the mechanism that
+ * then serves zeros for it at resume time regardless.
+ *
+ * hibernate_md_staged_resolve_via_saved_tables() performs the SAME
+ * walk hib_saved_domain_leaf_valid() (immediately above) already
+ * proved correct and in production use for the kstack self-copy
+ * fail-closed path -- rooted at hi_pcb.hp_cr3, the SAVED kernel's own
+ * CR3 captured into the image's PCB at save time -- but returns the
+ * resolved PHYSICAL ADDRESS instead of a bare validity bool, which is
+ * what a read primitive needs. Each intermediate table page is read
+ * through the destination-set+wvec mechanism when that page is ITSELF
+ * a destination-set member (meaning the destructive copy has already
+ * overwritten its live content with image content, so only wvec[]
+ * holds the true saved bytes), or directly via PHYS_TO_DMAP() when it
+ * is not (a page outside the destination set was never touched by the
+ * copy, so its live content is still byte-identical to what the image
+ * held -- the identical reasoning hib_saved_domain_leaf_valid()'s own
+ * comment already documents for exactly this situation). This covers
+ * EVERY VA the kernel's own saved address space maps, both
+ * boot-invariant and dynamic, because hi_pcb.hp_cr3 is the root of the
+ * ENTIRE saved kernel map, not a partial or region-limited view.
+ */
+static int
+hibernate_md_staged_resolve_via_saved_tables(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va, vm_paddr_t *pa_out)
+{
+	vm_paddr_t table_pa;
+	uint64_t entry, idx;
+	u_int index;
+	int err;
+
+	table_pa = ha->ha_image.hi_pcb.hp_cr3 & PG_FRAME;
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (ENOENT);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (ENOENT);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_PDP_FRAME) | (va & PDPMASK)) &
+		    PG_FRAME;
+		return (0);
+	}
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (ENOENT);
+	if ((entry & PG_PS) != 0) {
+		*pa_out = ((entry & PG_PS_FRAME) | (va & PDRMASK)) & PG_FRAME;
+		return (0);
+	}
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	err = hibernate_md_dst_page_index(ha, table_pa, &idx);
+	entry = (err == 0 && idx < p) ?
+	    ((const uint64_t *)PHYS_TO_DMAP(wvec[idx]))[index] :
+	    ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (ENOENT);
+	*pa_out = (entry & PG_FRAME) | (va & PAGE_MASK);
+	return (0);
+}
+
 static int
 hibernate_md_staged_read(const struct hibernate_attempt *ha,
-    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va, void *buf,
-    size_t len)
+    const vm_paddr_t *wvec, uint64_t p, vm_offset_t va, void *buf, size_t len)
 {
-	struct hibernate_md_walk walk;
 	uint8_t *dst;
 	vm_offset_t cur, page_va;
 	size_t remaining, page_off, chunk;
-	vm_paddr_t live_pa;
+	vm_paddr_t staged_pa;
 	uint64_t dst_idx;
-	bool resolved;
+	int err;
 
 	dst = buf;
 	cur = va;
@@ -2846,26 +2941,66 @@ hibernate_md_staged_read(const struct hibernate_attempt *ha,
 		page_va = trunc_page(cur);
 		page_off = (size_t)(cur - page_va);
 		chunk = MIN(PAGE_SIZE - page_off, remaining);
-		resolved = false;
 
-		if (hib_md_safe_resolve(kernel_pmap->pm_cr3, page_va,
-		    &live_pa) &&
-		    hibernate_md_dst_page_index(ha, trunc_page(live_pa),
-		    &dst_idx) == 0 && dst_idx < p) {
-			memcpy(dst, (const uint8_t *)
-			    PHYS_TO_DMAP(wvec[dst_idx]) + page_off, chunk);
-			resolved = true;
+		/*
+		 * K24-T00 round 11: the load-bearing fix (see the
+		 * extensive comment on hib_saved_domain_leaf_valid()/
+		 * hibernate_md_staged_resolve_via_saved_tables() above).
+		 * The two PRIOR resolution paths here both rooted their
+		 * walk at kernel_pmap->pm_cr3 -- THIS resume boot's own
+		 * LIVE page tables -- which only agrees with the SAVED
+		 * image's own mapping for boot-invariant VAs (kernel
+		 * text/.data/.bss). For any VA from a UMA zone (struct
+		 * proc, struct thread, and everything else dynamically
+		 * allocated), the two boots assign different physical
+		 * pages to the same VA; the live walk then either fails
+		 * (false ENOENT, masking a page that IS present in the
+		 * image) or -- the worse case, confirmed directly this
+		 * round for devd's own struct proc -- resolves to a live
+		 * PA that is ALSO a destination-set member by pure
+		 * coincidence, silently returning that unrelated page's
+		 * content (zeros, or someone else's data) instead of the
+		 * image's own page for this VA.
+		 *
+		 * hibernate_md_staged_resolve_via_saved_tables() walks
+		 * from hi_pcb.hp_cr3 -- the SAVED kernel's own CR3,
+		 * captured into the image's PCB at save time -- which is
+		 * the root of the saved kernel's ENTIRE address space, so
+		 * this single path correctly covers both boot-invariant
+		 * and dynamically-allocated VAs; no separate live-walk
+		 * fallback is needed or kept, because the live walk is
+		 * not "sometimes correct, sometimes wrong" -- it answers
+		 * a different question (this boot's mapping) than the one
+		 * this function exists to answer (the saved image's own
+		 * mapping), and no VA class is exempt from that
+		 * distinction merely by chance occasionally agreeing.
+		 */
+		err = hibernate_md_staged_resolve_via_saved_tables(ha, wvec,
+		    p, page_va, &staged_pa);
+		if (err != 0)
+			return (err);
+		if (hibernate_md_dst_page_index(ha, trunc_page(staged_pa),
+			&dst_idx) == 0 && dst_idx < p) {
+			memcpy(dst,
+			    (const uint8_t *)PHYS_TO_DMAP(wvec[dst_idx]) +
+				page_off,
+			    chunk);
+		} else {
+			/*
+			 * staged_pa is NOT a destination-set member: this
+			 * page was never a target of the destructive copy,
+			 * so its CURRENT live content at that physical
+			 * address is still byte-identical to what the
+			 * image held at save time -- the identical
+			 * reasoning hib_saved_domain_leaf_valid()'s own
+			 * comment already documents for its own
+			 * intermediate table pages.
+			 */
+			memcpy(dst,
+			    (const uint8_t *)PHYS_TO_DMAP(staged_pa) +
+				page_off,
+			    chunk);
 		}
-		if (!resolved &&
-		    hibernate_md_staged_leaf_for_live_slot(ha, wvec, p,
-		    page_va, &walk) &&
-		    (walk.hmw_flags & X86_PG_V) != 0) {
-			memcpy(dst, (const uint8_t *)PHYS_TO_DMAP(walk.hmw_pa) +
-			    page_off, chunk);
-			resolved = true;
-		}
-		if (!resolved)
-			return (ENOENT);
 
 		dst += chunk;
 		cur += chunk;
