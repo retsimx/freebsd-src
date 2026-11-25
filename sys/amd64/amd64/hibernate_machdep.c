@@ -1107,6 +1107,17 @@ _Static_assert(sizeof(struct hibernate_md_run) ==
  * BYTES slack component (see hibernate_md_arena_layout_compute()'s
  * own stash_pa placement, below) -- no arena resize is needed.
  */
+/*
+ * K24-T31: fixed byte offset, from stash_pa, for the double-buffer
+ * mirror copy of every stash entry. 32 KiB lands comfortably inside
+ * the arena's own 64 KiB HIBERNATE_ARENA_BOUNDED_SLACK_BYTES region
+ * (same confirmed-in_run=0 region the primary stash itself occupies),
+ * on a different physical page from the primary copy for any
+ * realistic entry count this bench produces (a few hundred entries at
+ * 56 bytes each is well under 32 KiB), while leaving enough headroom
+ * after it for the mirror's own entries before the slack region ends.
+ */
+#define K24T31_MIRROR_OFFSET ((vm_paddr_t)0x8000)
 #define K24T00_KSTACK_STASH_MAX (256 * KSTACK_PAGES)	/* 256 matches
 	    HIB_STAGED_MAX_THREADS, #defined later in this file (see
 	    HIB_STAGED_PCB_PAGE_MAX immediately above for the same
@@ -1243,9 +1254,27 @@ struct hibernate_md_arena_layout {
  * of has_descriptor_storage; the aux-descriptor sub-range that follows it
  * is K-9 headroom this file does not use).
  */
+/*
+ * K24-T31: bounds-only variant. hibernate_md_arena_layout_compute()
+ * below uses only ha->ha_arena_start/ha_arena_size from the attempt
+ * struct -- confirmed by inspection, nothing else in *ha is read here.
+ * Those two fields are themselves just a copy of this boot's own
+ * g_hibernate_early_arena.hea_start/hea_size (hibernate_arena_claim(),
+ * kern_hibernate.c), values the RESUMING kernel re-derives independently
+ * and correctly from the firmware memory map on its own cold boot --
+ * confirmed by this project's own design doc ("Save and restore boots
+ * derive the identical arena tuple deterministically from the firmware
+ * memory map", resume-protocol.md "Arena"). Post-copy accessors
+ * (k24t00_kstack_stash_ptr(), its mirror) have no live struct
+ * hibernate_attempt to read on the resume continuation -- that pointer
+ * is published only by the SAVE boot's own coordinator and is never
+ * valid on a cold-booted resume continuation -- so they must call this
+ * bounds-only form directly with g_hibernate_early_arena's own fields,
+ * never the ha-taking wrapper below.
+ */
 static int
-hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
-    struct hibernate_md_arena_layout *out)
+hibernate_md_arena_layout_compute_from_bounds(vm_paddr_t arena_start,
+    vm_size_t arena_size, struct hibernate_md_arena_layout *out)
 {
 	struct hibernate_arena_sizing sizing;
 	vm_paddr_t off;
@@ -1254,10 +1283,10 @@ hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
 	error = hibernate_arena_required(&sizing);
 	if (error != 0)
 		return (error);
-	if (sizing.has_required != ha->ha_arena_size)
+	if (sizing.has_required != arena_size)
 		return (EINVAL);
 
-	off = ha->ha_arena_start;
+	off = arena_start;
 	out->header_pa = off;
 	off += HIBERNATE_ARENA_HEADER_BYTES;
 	out->trampoline_pa = off;
@@ -1283,10 +1312,10 @@ hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
 	 * can never drift from whatever hibernate_arena_required() (the
 	 * one function both save and restore boots call identically)
 	 * actually decided. What remains after this point, up to
-	 * ha_arena_size, is exactly HIBERNATE_ARENA_BOUNDED_SLACK_BYTES
+	 * arena_size, is exactly HIBERNATE_ARENA_BOUNDED_SLACK_BYTES
 	 * (64 KiB) -- more than K24T00_KSTACK_STASH_MAX entries require.
 	 */
-	off = ha->ha_arena_start + HIBERNATE_ARENA_HEADER_BYTES +
+	off = arena_start + HIBERNATE_ARENA_HEADER_BYTES +
 	    HIBERNATE_ARENA_TRAMPOLINE_BYTES + HIBERNATE_ARENA_STACK_BYTES +
 	    HIBERNATE_ARENA_PARK_STACK_BYTES + sizing.has_private_page_tables +
 	    sizing.has_identity_map_pages + HIBERNATE_ARENA_HANDOFF_BYTES +
@@ -1294,6 +1323,14 @@ hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
 	out->stash_pa = off;
 	out->stash_max = K24T00_KSTACK_STASH_MAX;
 	return (0);
+}
+
+static int
+hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
+    struct hibernate_md_arena_layout *out)
+{
+	return (hibernate_md_arena_layout_compute_from_bounds(
+	    ha->ha_arena_start, ha->ha_arena_size, out));
 }
 
 /*
@@ -2726,17 +2763,67 @@ struct k24t00_kstack_stash_entry *k24t00_kstack_stash_ptr(void);
 struct k24t00_kstack_stash_entry *
 k24t00_kstack_stash_ptr(void)
 {
-	extern struct hibernate_attempt *k24t00_hibernate_current_attempt(void);
+	extern bool k24t00_hibernate_early_arena_bounds(vm_paddr_t *,
+	    vm_size_t *);
 	struct hibernate_md_arena_layout layout;
-	struct hibernate_attempt *ha;
+	vm_paddr_t arena_start;
+	vm_size_t arena_size;
 
-	ha = k24t00_hibernate_current_attempt();
-	if (ha == NULL)
+	/*
+	 * K24-T31: derive from THIS boot's own early-boot arena
+	 * reservation (g_hibernate_early_arena), not from
+	 * hibernate_current_attempt -- that pointer is published only
+	 * by the save-side coordinator and is confirmed NULL on the
+	 * resume continuation, which never runs that coordinator (it is
+	 * a fresh cold boot, not "the save boot after a copy clobbered
+	 * one page"). hibernate_md_arena_layout_compute()'s own ha-
+	 * taking form only ever read ha->ha_arena_start/ha_arena_size
+	 * -- both just a copy of g_hibernate_early_arena's own fields --
+	 * so this bounds-only call is both sufficient and correct on
+	 * every boot. Fails closed and loud if the early arena was
+	 * never validly populated this boot.
+	 */
+	if (!k24t00_hibernate_early_arena_bounds(&arena_start,
+	    &arena_size))
 		return (NULL);
-	if (hibernate_md_arena_layout_compute(ha, &layout) != 0)
+	if (hibernate_md_arena_layout_compute_from_bounds(arena_start,
+	    arena_size, &layout) != 0)
 		return (NULL);
 	return ((struct k24t00_kstack_stash_entry *)
 	    PHYS_TO_DMAP(layout.stash_pa));
+}
+
+/*
+ * K24-T31: cross-file accessor for acpi.c's post-copy double-buffer
+ * comparison. Returns the mirror copy's own base pointer, at the
+ * fixed K24T31_MIRROR_OFFSET from the primary stash's own stash_pa
+ * (see that constant's own declaration comment) -- same arena, same
+ * confirmed-in_run=0 region, different page.
+ */
+struct k24t00_kstack_stash_entry *k24t00_kstack_stash_mirror_ptr(void);
+struct k24t00_kstack_stash_entry *
+k24t00_kstack_stash_mirror_ptr(void)
+{
+	extern bool k24t00_hibernate_early_arena_bounds(vm_paddr_t *,
+	    vm_size_t *);
+	struct hibernate_md_arena_layout layout;
+	vm_paddr_t arena_start, mirror_pa;
+	vm_size_t arena_size;
+
+	/*
+	 * K24-T31: same early-arena derivation as k24t00_kstack_stash_
+	 * ptr() immediately above -- see its own comment for the full
+	 * account.
+	 */
+	if (!k24t00_hibernate_early_arena_bounds(&arena_start,
+	    &arena_size))
+		return (NULL);
+	if (hibernate_md_arena_layout_compute_from_bounds(arena_start,
+	    arena_size, &layout) != 0)
+		return (NULL);
+	mirror_pa = layout.stash_pa + K24T31_MIRROR_OFFSET;
+	return ((struct k24t00_kstack_stash_entry *)
+	    PHYS_TO_DMAP(mirror_pa));
 }
 
 /*

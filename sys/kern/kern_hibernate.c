@@ -170,6 +170,35 @@ static struct hibernate_early_arena g_hibernate_early_arena;
 static struct hibernate_attempt *g_hibernate_arena_owner;
 
 /*
+ * K24-T31: cross-file accessor for the post-copy stash accessors
+ * (sys/amd64/amd64/hibernate_machdep.c: k24t00_kstack_stash_ptr(),
+ * k24t00_kstack_stash_mirror_ptr()). g_hibernate_early_arena is THIS
+ * boot's own early-boot arena reservation -- populated once per boot,
+ * at hibernate_arena_derive()/hibernate_arena_reserve() time
+ * (sys/amd64/amd64/machdep.c), deterministically from the firmware
+ * memory map, identically on the save boot and on a cold-booted resume
+ * continuation (confirmed by this project's own design doc, "Arena").
+ * Unlike hibernate_current_attempt (published only by the save-side
+ * coordinator, never valid on a resume continuation that never ran
+ * that coordinator), this global is correctly populated on EVERY boot
+ * by the time any post-copy code could run, requiring no self-copy
+ * protection and no dependency on any struct hibernate_attempt at all.
+ * Returns false (leaving start/size unset) if hea_valid is false --
+ * callers must fail closed on that, not compute from zeros.
+ */
+bool k24t00_hibernate_early_arena_bounds(vm_paddr_t *start,
+    vm_size_t *size);
+bool
+k24t00_hibernate_early_arena_bounds(vm_paddr_t *start, vm_size_t *size)
+{
+	if (!g_hibernate_early_arena.hea_valid)
+		return (false);
+	*start = g_hibernate_early_arena.hea_start;
+	*size = g_hibernate_early_arena.hea_size;
+	return (true);
+}
+
+/*
  * Fixed saved-kernel destination for the scalar handoff record.  The
  * terminal assembly copies the encoded record here by value before entering
  * hibernate_restore_kernel.
