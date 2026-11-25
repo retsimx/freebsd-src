@@ -4411,6 +4411,22 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 					    k24t00_kva_install_last_entry();
 				}
 				/*
+	 * K24-T00 round 29: stop every thread recorded in the pre-copy
+	 * exclusion list before the verifier below runs. Round 28
+	 * confirmed these threads' missing kstack page(s) are a genuine
+	 * zero entry in the saved image's own tables -- no install can
+	 * ever place them. Strictly here: after the destructive copy
+	 * (so the arena-backed list itself is readable) and strictly
+	 * before acpi_s4_resume_scheduler_aps() (PARK_RELEASE), same
+	 * single-BSP-actor, no-sleepable-lock constraint as every other
+	 * block in this function.
+	 */
+	{
+		extern u_int k24t00_exclude_stop_threads(void);
+		extern u_int k24t00_exclude_n;
+		u_int stopped;
+
+		stopped = k24t00_exclude_stop_threads();
 	acpi_s4_resume_scheduler_aps(sc, susp_cpus);
 	acpi_s4_resume_interrupts(intr_state);
 	acpi_s4_resume_clocks(sc);

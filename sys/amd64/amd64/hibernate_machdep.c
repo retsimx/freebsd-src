@@ -1162,6 +1162,45 @@ u_int k24t00_kstack_stash_n;
 	    k24t00_kstack_stash_entry) + PAGE_SIZE - 1) / PAGE_SIZE)
 
 /*
+ * K24-T00 round 29: pre-copy -> post-copy unsupported-thread exclusion
+ * list. A thread with at least one kstack page the saved image's own
+ * tables genuinely do not contain (round 28's confirmed verdict: a
+ * zero terminal PTE, not a walker bug) can never be made runnable
+ * post-copy -- there is no mapping to install for it. Recorded here,
+ * pre-copy, in the same arena-backed, copy-excluded stash region as
+ * k24t00_kstack_stash_n above, so the list survives the destructive
+ * copy; consumed post-copy in acpi.c to stop exactly these threads
+ * before acpi_s4_resume_scheduler_aps(), and by the verifier to
+ * exclude them from the fail-closed miss count. One entry per
+ * THREAD (not per page), since the action taken (stop the thread) is
+ * thread-granular regardless of how many of its pages are missing.
+ */
+#define K24T00_EXCLUDE_MAX 64
+struct k24t00_exclude_entry {
+	struct thread *td;
+	pid_t pid;
+	char comm[MAXCOMLEN + 1];
+	u_int missing_pages;
+};
+/*
+ * K24-T00 round 29 fix: plain static array (self-copy-protected
+ * below, after the final write), not an arena sub-region. The arena-
+ * backed placement (an offset inside HIBERNATE_ARENA_BOUNDED_SLACK_
+ * BYTES, immediately past the stash table) produced garbage reads
+ * post-copy (corrupted pid/comm/va bytes resembling unrelated code),
+ * indicating a layout/offset error this round's scope does not
+ * justify debugging further -- K24T00_EXCLUDE_MAX (64) entries is
+ * trivially small, and every sibling "populate pre-copy, read post-
+ * copy" list in this file that is NOT the kstack stash itself
+ * (k24t00_accepted_first[], k24t00_rej_proc_first[], etc.) already
+ * uses exactly this plain-static-array + self-copy-protect pattern,
+ * not the arena. Following the existing, already-proven convention
+ * instead of repeating the new one that just failed.
+ */
+struct k24t00_exclude_entry k24t00_exclude_list[K24T00_EXCLUDE_MAX];
+u_int k24t00_exclude_n;
+
+
 struct hibernate_md_arena_layout {
 	vm_paddr_t header_pa; /* 256 B: struct hibernate_arena_header. */
 	vm_paddr_t
@@ -2282,8 +2321,55 @@ hib_md_safe_resolve(vm_paddr_t root_pa, vm_offset_t va, vm_paddr_t *pa_out)
 	return (true);
 }
 
+u_int k24t00_kv_excluded_threads;
+static bool k24t00_live_pte_read(vm_offset_t va, uint64_t *pte_out);
+/*
+ * K24-T00 round 31: present-but-not-writable counter. Round 30's live
+ * DDB capture proved a distinct failure mode from "missing":
+ * fpu_activate_sw()'s write into pcb_save faulted "supervisor write
+ * data, protection violation" on a page hib_md_safe_resolve() already
+ * reports present. Tracked separately from `missing` so the two
+ * failure classes are never conflated in the summary line.
+ */
 u_int k24t00_kv_readonly;
 
+struct k24t00_exclude_entry *k24t00_exclude_ptr(void);
+
+static bool
+k24t00_td_is_excluded(struct thread *td)
+{
+	struct k24t00_exclude_entry *list;
+	u_int i, n;
+
+	list = k24t00_exclude_ptr();
+	if (list == NULL)
+		return (false);
+	/*
+	 * K24-T00 round 29 fix: bound by K24T00_EXCLUDE_MAX
+	 * unconditionally. k24t00_exclude_n is self-copy-protected only
+	 * AFTER the populate pass's own per-thread loop runs to
+	 * completion (hibernate_machdep_prepare()); a degenerate run
+	 * where that loop is skipped or aborts early leaves this count
+	 * holding the SAVED image's stale content for this address,
+	 * which can be arbitrarily large -- an unbounded loop here then
+	 * reads past the 64-entry k24t00_exclude_list[] array on every
+	 * single call (this function runs once per live thread, so the
+	 * out-of-bounds read is essentially guaranteed to fault). The
+	 * array's own fixed capacity is the one value this function can
+	 * always trust regardless of k24t00_exclude_n's own validity.
+	 */
+	n = k24t00_exclude_n;
+	if (n > K24T00_EXCLUDE_MAX)
+		n = K24T00_EXCLUDE_MAX;
+	for (i = 0; i < n; i++) {
+		if (list[i].td == td)
+			return (true);
+	}
+	return (false);
+}
+
+u_int	hibernate_k24t00_kstack_verify(void);
+u_int
 static bool
 hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
     const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
@@ -2651,6 +2737,96 @@ k24t00_kstack_stash_ptr(void)
 		return (NULL);
 	return ((struct k24t00_kstack_stash_entry *)
 	    PHYS_TO_DMAP(layout.stash_pa));
+}
+
+/*
+ * K24-T00 round 29: cross-file accessor for acpi.c's post-copy
+ * exclusion-stop pass. k24t00_exclude_list is a plain, self-copy-
+ * protected static array (see its own declaration comment), so this
+ * accessor is a trivial address-of, not an arena-layout lookup.
+ */
+struct k24t00_exclude_entry *k24t00_exclude_ptr(void);
+struct k24t00_exclude_entry *
+k24t00_exclude_ptr(void)
+{
+	return (k24t00_exclude_list);
+}
+
+/*
+ * K24-T00 round 29: post-copy consumer. For each recorded excluded
+ * thread, stop it using the kernel's own existing, already-proven
+ * thread_suspend_one() -- the identical primitive thread_single()
+ * itself calls to stop a thread it does not want released -- instead
+ * of inventing new state-manipulation logic. Requires only the two
+ * spin locks thread_suspend_one() itself asserts (PROC_SLOCK, thread
+ * lock), never a sleepable lock, matching this call site's own single-
+ * actor, APs-still-parked constraint (identical reasoning already
+ * documented at this function's call site in acpi.c). curthread is
+ * always skipped: it is this resume continuation itself and must
+ * complete the restore. A thread already suspended, exited, or not
+ * yet schedulable (TDS_INACTIVE, e.g. not fully constructed) is left
+ * alone -- thread_suspend_one() itself only handles a thread that can
+ * actually be suspended; forcing it onto every possible td_state would
+ * be inventing cases this task does not ask for.
+ */
+u_int	k24t00_exclude_stop_threads(void);
+u_int
+k24t00_exclude_stop_threads(void)
+{
+	struct k24t00_exclude_entry *list;
+	struct thread *self;
+	u_int i, n, stopped;
+
+	list = k24t00_exclude_ptr();
+	if (list == NULL)
+		return (0);
+	self = curthread;
+	stopped = 0;
+	/*
+	 * K24-T00 round 29 fix: bound by K24T00_EXCLUDE_MAX
+	 * unconditionally -- same reasoning as k24t00_td_is_excluded()'s
+	 * own identical fix (a stale, unprotected k24t00_exclude_n can
+	 * exceed the array's real 64-entry capacity).
+	 */
+	n = k24t00_exclude_n;
+	if (n > K24T00_EXCLUDE_MAX)
+		n = K24T00_EXCLUDE_MAX;
+	for (i = 0; i < n; i++) {
+		struct thread *td;
+		struct proc *p;
+
+		td = list[i].td;
+		if (td == NULL || td == self)
+			continue;
+		p = td->td_proc;
+		if (p == NULL)
+			continue;
+		PROC_SLOCK(p);
+		thread_lock(td);
+		/*
+		 * K24-T00 round 29 fix: thread_suspend_one() itself
+		 * suspends a thread from ANY schedulable state -- it is
+		 * not limited to RUNQ/CAN_RUN/RUNNING (see thread_
+		 * single()'s own unconditional call to it for every
+		 * other thread in a process, sys/kern/kern_thread.c).
+		 * The original, narrower condition here incorrectly
+		 * skipped a thread already TD_IS_INHIBITED (e.g.
+		 * TDI_SLEEPING, the common state for a blocked daemon
+		 * like devd/syslogd/sh) as if it were already handled --
+		 * it was not, which is why the first live run recorded
+		 * 13 candidates but stopped 0. The only state that must
+		 * be excluded is TD_IS_SUSPENDED itself
+		 * (thread_suspend_one() KASSERTs against double-
+		 * suspending).
+		 */
+		if (!TD_IS_SUSPENDED(td)) {
+			thread_suspend_one(td);
+			stopped++;
+		}
+		thread_unlock(td);
+		PROC_SUNLOCK(p);
+	}
+	return (stopped);
 }
 
 /*
@@ -3722,6 +3898,7 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 	k24t00_chain_fail_err = 0;
 	k24t00_thread_fail_err = 0;
 	k24t00_kstack_stash_n = 0;
+	k24t00_exclude_n = 0;
 	for (i = 0; i <= hash; i++) {
 		struct proc staged_proc;
 		u_int iter_guard;
@@ -5547,6 +5724,41 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					}
 				}
 				/*
+				if (thread_has_uncovered) {
+					threads_with_uncovered++;
+					/*
+					 * K24-T00 round 29: record this
+					 * thread in the arena-backed
+					 * exclusion list -- round 28
+					 * confirmed its missing page(s) are
+					 * a genuine zero terminal PTE in
+					 * the saved image's own tables, not
+					 * a resolvable gap. No install can
+					 * ever place these pages; this
+					 * thread must not be released
+					 * post-copy.
+					 */
+					if (k24t00_exclude_n <
+					    K24T00_EXCLUDE_MAX) {
+						struct k24t00_exclude_entry
+						    *xe;
+
+						xe = &k24t00_exclude_list[
+						    k24t00_exclude_n];
+						xe->td = (struct thread *)
+						    threads[i].td_va;
+						xe->pid = threads[i].pid;
+						memcpy(xe->comm,
+						    threads[i].comm,
+						    sizeof(xe->comm) - 1);
+						xe->comm[
+						    sizeof(xe->comm) - 1] =
+						    '\0';
+						xe->missing_pages =
+						    thread_missing_pages;
+						k24t00_exclude_n++;
+					}
+				}
 			 * K24-T00 round 24: self-copy-protect
 			 * k24t00_kstack_stash_n immediately after the last
 			 * write to it, exactly like k24t00_staged_pcb_
@@ -5573,8 +5785,54 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					if (error != 0)
 						break;
 				}
-				if (error != 0)
-					break;
+			}
+			/*
+			 * K24-T00 round 29: self-copy-protect
+			 * k24t00_exclude_n the same way, immediately
+			 * after the last write to it -- same reasoning as
+			 * k24t00_kstack_stash_n above: this count's correct
+			 * content is this boot's own just-populated value.
+			 */
+			if (error == 0) {
+				vm_offset_t xn_pg, xn_end;
+				u_int xn_selfcopied = 0;
+
+				xn_pg = trunc_page(
+				    (vm_offset_t)&k24t00_exclude_n);
+				xn_end = round_page(
+				    (vm_offset_t)&k24t00_exclude_n +
+				    sizeof(k24t00_exclude_n));
+				for (; xn_pg < xn_end; xn_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    xn_pg, true, &xn_selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+			/*
+			 * K24-T00 round 29: self-copy-protect the exclusion
+			 * list array itself, same reasoning as
+			 * k24t00_exclude_n immediately above -- this boot's
+			 * own just-populated entries, not the saved image's
+			 * stale content for this same address range.
+			 */
+			if (error == 0) {
+				vm_offset_t xl_pg, xl_end;
+				u_int xl_selfcopied = 0;
+
+				xl_pg = trunc_page(
+				    (vm_offset_t)&k24t00_exclude_list);
+				xl_end = round_page(
+				    (vm_offset_t)&k24t00_exclude_list +
+				    sizeof(k24t00_exclude_list));
+				for (; xl_pg < xl_end; xl_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    xl_pg, true, &xl_selfcopied);
+					if (error != 0)
+						break;
+				}
 			}
 			free(threads, M_TEMP);
 		}
