@@ -4310,6 +4310,107 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 	device_printf(sc->acpi_dev, "Resumed from hibernate image\n");
 	acpi_s4_resume_bsp_cpu();
 	acpi_s4_resume_lapic();
+	/*
+	 * K24-T00: decode the post-copy PTE probe sample set (3 VAs:
+	 * BSP's own control stack, syslogd's kstack, devd's kstack --
+	 * populated pre-copy in hibernate_machdep_prepare(), self-copy
+	 * protected so they survive with this boot's own captured
+	 * values). Must run strictly here: the destructive copy has
+	 * already completed (this entire function only runs on the
+	 * resumed continuation), and strictly before
+	 * acpi_s4_resume_scheduler_aps() below, which signals
+	 * PARK_RELEASE -- no AP can race this read.
+	 */
+	/*
+	 * K24-T00 round 19: post-copy stash install. Must run strictly
+	 * here -- after the destructive copy (confirmed: this function
+	 * only runs on the resumed continuation) and before
+	 * acpi_s4_resume_scheduler_aps() (PARK_RELEASE) -- for the exact
+	 * same reason hibernate_k24t00_kstack_verify() immediately below
+	 * must: APs are still parked, this BSP is the sole actor, no
+	 * lock is needed. Round 17/18 proved the pre-copy install
+	 * (previously done inside hibernate_machdep_prepare(), now
+	 * replaced with a stash-population call -- see that function's
+	 * own K24-T00 round 19 comment) wrote into a page-table tree
+	 * the restored kernel does not actually adopt (kernel_pmap's own
+	 * root page is not itself an image destination-set member).
+	 * This pass installs from the STASH -- (VA, leaf PA, flags)
+	 * triples resolved pre-copy from the IMAGE's own saved tables,
+	 * unaffected by which live tree existed at resolve time -- into
+	 * whatever page tables are actually in force right now, post-
+	 * copy, which cannot be clobbered again because the destructive
+	 * copy has already finished.
+	 */
+	{
+		extern u_int k24t00_kstack_stash_n;
+		extern struct k24t00_kstack_stash_entry {
+			vm_offset_t va;
+			vm_paddr_t leaf_pa;
+			uint64_t flags;
+			pid_t pid;
+			char comm[MAXCOMLEN + 1];
+			u_int page_index;
+		} *k24t00_kstack_stash_ptr(void);
+		extern int hibernate_md_kva_install_pub(vm_offset_t va,
+		    vm_paddr_t leaf_pa, uint64_t flags, bool force_overwrite);
+		struct k24t00_kstack_stash_entry *stash;
+		u_int si, install_fail, fail_reported;
+
+		extern u_int k24t00_kva_install_last_reason(void);
+		extern uint64_t k24t00_kva_install_last_entry(void);
+		bool first_fail_recorded;
+		u_int first_fail_reason;
+		vm_offset_t first_fail_va;
+		uint64_t first_fail_entry;
+
+		stash = k24t00_kstack_stash_ptr();
+		install_fail = 0;
+		fail_reported = 0;
+		first_fail_recorded = false;
+		first_fail_reason = 0;
+		first_fail_va = 0;
+		first_fail_entry = 0;
+		for (si = 0; si < k24t00_kstack_stash_n; si++) {
+			int ierr;
+
+			/*
+			 * K24-T00 round 23: force_overwrite=true. This is
+			 * the post-copy stash install -- it runs here,
+			 * strictly after the destructive copy and strictly
+			 * before acpi_s4_resume_scheduler_aps() (PARK_
+			 * RELEASE), with APs still parked and this BSP the
+			 * sole actor (see this block's own comment above).
+			 * A live leaf already occupying stash[si].va at
+			 * this exact instant is, by construction, this
+			 * boot's own leftover mapping for a VA that belongs
+			 * to an IMAGE thread -- not a genuine competing
+			 * claim the way a mismatched leaf would be for any
+			 * ordinary (non-stash) caller of this function.
+			 * The stash's own leaf_pa/flags are resolved
+			 * pre-copy from the image's saved tables (see this
+			 * block's own comment above), so they are
+			 * authoritative here; the old live leaf must be
+			 * replaced, not treated as a conflict to refuse on.
+			 * This is exactly the disposition
+			 * hibernate_md_kva_install()'s own force_overwrite
+			 * parameter documents and the resuming-stack install
+			 * call site already relies on for the identical
+			 * reason -- this is its direct sibling, not a new
+			 * policy.
+			 */
+			ierr = hibernate_md_kva_install_pub(stash[si].va,
+			    stash[si].leaf_pa, stash[si].flags, true);
+			if (ierr != 0) {
+				install_fail++;
+				if (!first_fail_recorded) {
+					first_fail_recorded = true;
+					first_fail_reason =
+					    k24t00_kva_install_last_reason();
+					first_fail_va = stash[si].va;
+					first_fail_entry =
+					    k24t00_kva_install_last_entry();
+				}
+				/*
 	acpi_s4_resume_scheduler_aps(sc, susp_cpus);
 	acpi_s4_resume_interrupts(intr_state);
 	acpi_s4_resume_clocks(sc);

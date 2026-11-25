@@ -124,6 +124,196 @@ u_int hib_keg_topo_captured_n_g;
 bool hib_keg_topo_captured_g;
 
 /*
+ * K24-T00 thread provenance: every staged thread's own td_pcb page
+ * number (vm_offset_t >> PAGE_SHIFT), captured pre-copy in
+ * hibernate_machdep_prepare() from the SAME enumeration pass that
+ * already walks pidhashtbl (hibernate_md_enumerate_staged_threads()),
+ * deduplicated. Bounded by HIB_STAGED_MAX_THREADS (256) -- the same
+ * cap the enumeration itself already uses, so this array can never be
+ * smaller than the set it is built from. Self-copy-protected
+ * (copy_leaf=true) immediately after being populated, for the same
+ * reason as hib_keg_topo_head_g above: the correct content is THIS
+ * boot's own just-captured values (the image's thread set as this
+ * resume continuation enumerated it), never the saved image's stale
+ * content for these same global addresses.
+ *
+ * hibernate_k24t00_pcb_is_staged() is the sole reader, called from the
+ * switch-time marker site (cpu_switch.S) with the PCB page number
+ * already being loaded for done_load_dr's existing marker -- answering
+ * exactly one question: is the thread about to be switched to one this
+ * boot's own enumeration accepted as part of the image, or not.
+ */
+#define HIB_STAGED_PCB_PAGE_MAX 256	/* Matches HIB_STAGED_MAX_THREADS. */
+u_long k24t00_staged_pcb_page_g[HIB_STAGED_PCB_PAGE_MAX];
+u_int k24t00_staged_pcb_page_n_g;
+
+int hibernate_k24t00_pcb_is_staged(u_long pcb_page_number);
+int
+hibernate_k24t00_pcb_is_staged(u_long pcb_page_number)
+{
+	u_int i;
+
+	for (i = 0; i < k24t00_staged_pcb_page_n_g; i++) {
+		if (k24t00_staged_pcb_page_g[i] == pcb_page_number)
+			return (1);
+	}
+	return (0);
+}
+
+/*
+ * K24-T00: the switch-time 'c' marker (cpu_switch.S) already compares
+ * %cr3 against PCPU(KCR3)/PCPU(UCR3), but a prior round proved both
+ * read the "PTI disabled" sentinel (~0) on the faulting AP -- those
+ * fields were never populated on this CPU, so the comparison proved
+ * nothing about where %cr3 actually points. The one root known to be
+ * correctly configured is kernel_pmap->pm_cr3 itself; this accessor
+ * hands the marker site its page number (not the raw value, to match
+ * the page-number-only values the marker already emits for %cr3),
+ * called exactly once per burst so the marker's own cost stays
+ * bounded.
+ */
+u_long hibernate_k24t00_kern_pmap_cr3_page(void);
+u_long
+hibernate_k24t00_kern_pmap_cr3_page(void)
+{
+	return (kernel_pmap->pm_cr3 >> 12);
+}
+
+/*
+ * K24-T00 round 4: CR3 was proven correct and the verifier proved the
+ * target kstack page present, yet the write at "movq %rax,(%rsp)"
+ * still not-present-faults. The next instruction after that write is
+ * "movq %gs:0x0,%rdi" (PCPU(CURTHREAD)) -- a GS-relative read. This
+ * kernel loads the ACTIVE gs base directly via
+ * wrmsr(MSR_GSBASE,(u_int64_t)pc) for every CPU (see mp_machdep.c's
+ * init_secondary() and machdep.c's initializecpu() call sites); there
+ * is no intervening swapgs between done_load_dr and this read, so
+ * rdmsr(MSR_GSBASE) here returns exactly the base %gs:0x0 would use.
+ * Three bounded accessors, each called once per burst:
+ *   - this AP's own active GS-base page number;
+ *   - whether that GS-base VA resolves through kernel_pmap (reuses
+ *     hib_md_safe_resolve(), the same walker the kstack verifier
+ *     itself already relies on -- not a new resolution mechanism);
+ *   - the BSP's own GS-base page number, for contrast: since GSBASE is
+ *     set to the PCPU pointer itself on every CPU (including the
+ *     BSP), cpuid_to_pcpu[0] IS that value -- no cross-CPU MSR read
+ *     needed, none is possible without an IPI anyway.
+ */
+u_long hibernate_k24t00_gsbase_page(void);
+u_long
+hibernate_k24t00_gsbase_page(void)
+{
+	return (rdmsr(MSR_GSBASE) >> 12);
+}
+
+static bool hib_md_safe_resolve(vm_paddr_t root_pa, vm_offset_t va,
+    vm_paddr_t *pa_out);
+
+int hibernate_k24t00_gsbase_present(void);
+int
+hibernate_k24t00_gsbase_present(void)
+{
+	vm_paddr_t pa;
+
+	return (hib_md_safe_resolve(kernel_pmap->pm_cr3,
+	    (vm_offset_t)rdmsr(MSR_GSBASE), &pa) ? 1 : 0);
+}
+
+u_long hibernate_k24t00_bsp_gsbase_page(void);
+u_long
+hibernate_k24t00_bsp_gsbase_page(void)
+{
+	return ((u_long)cpuid_to_pcpu[0] >> 12);
+}
+
+/*
+ * K24-T00 round 3: independent pid/tid staged-set lookups, built from
+ * the SAME enumeration pass (threads[]/nthreads in hibernate_machdep_
+ * prepare(), below) but keyed differently (pid, tid) instead of PCB
+ * page number. This is the decisive cross-check the task asks for: if
+ * a thread's pid/tid show up here as staged while
+ * hibernate_k24t00_pcb_is_staged() says its PCB page is NOT staged,
+ * the two lookups were built from the identical source list but
+ * disagree -- proving the bug is in the PCB-page bookkeeping
+ * specifically (an off-by-one, wrong page shift, or divergent
+ * dedup/bounds logic), not in the enumeration or in whether the
+ * thread is genuinely part of the image.
+ */
+/*
+ * K24-T00 round 3: sized with HIB_STAGED_PCB_PAGE_MAX, not
+ * HIB_STAGED_MAX_THREADS directly -- the latter is #defined later in
+ * this file (hibernate_md_enumerate_staged_threads()'s own region),
+ * after this point; HIB_STAGED_PCB_PAGE_MAX is already in scope here
+ * and is documented above as matching it (both are 256).
+ */
+pid_t k24t00_staged_pid_g[HIB_STAGED_PCB_PAGE_MAX];
+u_int k24t00_staged_pid_n_g;
+lwpid_t k24t00_staged_tid_g[HIB_STAGED_PCB_PAGE_MAX];
+u_int k24t00_staged_tid_n_g;
+lwpid_t k24t00_staged_tid_max_g;
+
+int hibernate_k24t00_pid_is_staged(pid_t pid);
+int
+hibernate_k24t00_pid_is_staged(pid_t pid)
+{
+	u_int i;
+
+	for (i = 0; i < k24t00_staged_pid_n_g; i++) {
+		if (k24t00_staged_pid_g[i] == pid)
+			return (1);
+	}
+	return (0);
+}
+
+int hibernate_k24t00_tid_is_staged(lwpid_t tid);
+int
+hibernate_k24t00_tid_is_staged(lwpid_t tid)
+{
+	u_int i;
+
+	for (i = 0; i < k24t00_staged_tid_n_g; i++) {
+		if (k24t00_staged_tid_g[i] == tid)
+			return (1);
+	}
+	return (0);
+}
+
+/*
+ * K24-T00: post-copy PTE probe sample set. Captured pre-copy, during
+ * hibernate_machdep_prepare() (this file, below) -- slot 0 is the BSP's
+ * own continuation stack VA (the known-good control: if this one reads
+ * wrong post-copy, something is broken everywhere, not just for
+ * ordinary threads); slots 1/2 are two ordinary staged threads'
+ * (syslogd/devd) kstack VAs, the same two pids already targeted by the
+ * existing per-thread instrumentation above. Published to these
+ * file-scope globals, self-copy-protected below exactly like
+ * hib_guard_image_value_g/hib_keg_topo_head_g above, so the resume
+ * continuation can read them AFTER the destructive copy to decide what
+ * each sampled VA's live page table actually contains at that point --
+ * a question never asked post-copy before this round.
+ */
+vm_offset_t k24t00_probe_va_g[3];
+vm_paddr_t k24t00_probe_expected_pa_g[3];
+bool k24t00_probe_set_g[3];
+pid_t k24t00_probe_pid_g[3];
+
+/*
+ * K24-T00: switch-time CR3/stack marker budget. A plain global, not
+ * self-copy-protected and not relied upon to survive the destructive
+ * copy with any particular pre-copy value -- it is reinitialised
+ * fresh, post-copy, in hibernate_resume_ap_entry() below (the same
+ * "dynamic state must be reinitialised, not trusted across the
+ * discontinuity" discipline already applied to tdq_runq/td_lock/
+ * tdq_curthread in this same function), so its content before that
+ * reinit is irrelevant. Shared between the cpu_switch.S marker site
+ * and the pmap_activate_sw() skip/load marker site (sys/amd64/amd64/
+ * pmap.c) purely to bound total emission volume across both; each
+ * site's own gate (cpuid != 0) already restricts emission to the
+ * sole AP on this mp_ncpus==2 harness.
+ */
+volatile u_int k24t00_swmark_budget_g;
+
+/*
  * Setup transient 1:1 mapping of low 4 GiB in kernel_pmap
  * mirroring mp_machdep.c:355-399.
  *
@@ -888,6 +1078,80 @@ _Static_assert(sizeof(struct hibernate_md_run) ==
  * struct hibernate_arena_sizing fields it already returns and reapplies the
  * same, already-landed component order to locate each sub-object.
  */
+/*
+ * K24-T00 round 19: pre-copy -> post-copy kstack-mapping stash. Each
+ * entry is exactly 24 bytes (va:8, leaf_pa:8, flags:8); the arena's
+ * own HIBERNATE_ARENA_BOUNDED_SLACK_BYTES (64 KiB) comfortably holds
+ * K24T00_KSTACK_STASH_MAX * 24 bytes for any reasonable
+ * HIB_STAGED_MAX_THREADS-bounded thread count. Moved here (ahead of
+ * struct hibernate_md_arena_layout, which references
+ * K24T00_KSTACK_STASH_MAX in its own stash_max field) after the first
+ * build attempt this round caught the original, later placement as a
+ * genuine use-before-declaration error.
+ */
+/*
+ * K24-T00 round 24: capacity sized to the real worst case, not an
+ * arbitrary round number. Every one of up to HIB_STAGED_MAX_THREADS
+ * (256) staged threads can need up to KSTACK_PAGES (4 on this
+ * platform's non-FreeBSD_bdhwpadding configuration; see
+ * sys/amd64/include/param.h) stash entries -- one per kstack page,
+ * per this loop's own comment a few hundred lines below ("One entry
+ * per PAGE, not per thread"). 256 was silently truncating: 87 live
+ * threads at up to 4 pages each can require up to 348 entries, well
+ * past the old 256-entry cap, and entries past the cap were simply
+ * never written (the populate loop's own existing bounds check
+ * already guards the write, so nothing overflowed memory -- the
+ * threads whose pages didn't fit were the ones kstack_verify kept
+ * reporting missing). 1024 * 24 bytes/entry = 24576 bytes, well
+ * within the arena's existing 64 KiB HIBERNATE_ARENA_BOUNDED_SLACK_
+ * BYTES slack component (see hibernate_md_arena_layout_compute()'s
+ * own stash_pa placement, below) -- no arena resize is needed.
+ */
+#define K24T00_KSTACK_STASH_MAX (256 * KSTACK_PAGES)	/* 256 matches
+	    HIB_STAGED_MAX_THREADS, #defined later in this file (see
+	    HIB_STAGED_PCB_PAGE_MAX immediately above for the same
+	    existing forward-reference-by-literal convention); a
+	    _Static_assert immediately after HIB_STAGED_MAX_THREADS's
+	    own definition, below, catches any future drift. */
+struct k24t00_kstack_stash_entry {
+	vm_offset_t va;
+	vm_paddr_t leaf_pa;
+	uint64_t flags;
+	/*
+	 * K24-T00 round 25: diagnostic-only fields, added to trace the
+	 * 13 deterministic reason-1 (misaligned va/leaf_pa) install
+	 * failures back to their originating thread and source field,
+	 * per this round's own task. Populated at the same populate-
+	 * pass write site as va/leaf_pa/flags above, from the identical
+	 * threads[i]/pg values already in scope there -- no new
+	 * resolution path, no new install logic.
+	 */
+	pid_t pid;
+	char comm[MAXCOMLEN + 1];
+	u_int page_index;
+	/*
+ * K24-T00 round 24: k24t00_kstack_stash_n was never self-copy-
+ * protected, unlike every sibling "populated pre-copy, read post-
+ * copy" global in this file (k24t00_staged_pcb_page_g, k24t00_
+ * staged_pid_g, k24t00_staged_tid_g, hib_keg_topo_head_g,
+ * hib_guard_image_value_g). This address is inside kernel_pmap's
+ * ordinary BSS, i.e. a destination-set member: without protection
+ * the K-10 destructive copy overwrites it with the SAVED image's own
+ * stale content for this same address, not the value this boot's own
+ * populate pass just wrote. The post-copy install loop (acpi.c) reads
+ * this count directly as its own loop bound; a stale, larger count
+ * exposes stash slots past the real end of this boot's own writes --
+ * the deterministic garbage entries (fixed VA, same every run)
+ * reason-1 failures are exactly that signature. Protected the
+ * identical way as k24t00_staged_pcb_page_g, immediately after the
+ * final write, below.
+ */
+u_int k24t00_kstack_stash_n;
+#define K24T00_KSTACK_STASH_MAX_PAGES \
+	((K24T00_KSTACK_STASH_MAX * (u_int)sizeof(struct \
+	    k24t00_kstack_stash_entry) + PAGE_SIZE - 1) / PAGE_SIZE)
+
+/*
 struct hibernate_md_arena_layout {
 	vm_paddr_t header_pa; /* 256 B: struct hibernate_arena_header. */
 	vm_paddr_t
@@ -901,9 +1165,24 @@ struct hibernate_md_arena_layout {
 	 * PML4/PDPT/PD backing pages (RESUME path only; K23-T13).
 	 */
 	vm_paddr_t identity_map_pa;
-	vm_paddr_t handoff_pa;	  /* 4096 B: encoded handoff record. */
-	vm_paddr_t run_table_pa;  /* Coalesced destination run table. */
-	uint64_t run_table_max;	  /* HIBERNATE_ARENA_COPY_RUN_MAX. */
+	vm_paddr_t handoff_pa;	 /* 4096 B: encoded handoff record. */
+	vm_paddr_t run_table_pa; /* Coalesced destination run table. */
+	uint64_t run_table_max;	 /* HIBERNATE_ARENA_COPY_RUN_MAX. */
+	/*
+	 * K24-T00 round 19: kstack-mapping stash table. Placed inside
+	 * HIBERNATE_ARENA_BOUNDED_SLACK_BYTES (64 KiB), the existing,
+	 * already-sized slack component hibernate_arena_required() adds
+	 * AFTER has_alignment_allowance -- this placement adds NO new
+	 * sized component to the arena sum (sizing.has_required is
+	 * unchanged), only a new address WITHIN an already-reserved,
+	 * already-copy-excluded region. Computed directly from the same
+	 * `sizing` struct hibernate_arena_required() already returns
+	 * (has_descriptor_storage, has_alignment_allowance), not
+	 * re-derived or guessed, so it cannot drift from the real layout
+	 * either boot computes.
+	 */
+	vm_paddr_t stash_pa;	 /* K24T00_KSTACK_STASH_MAX entries. */
+	uint64_t stash_max;	 /* K24T00_KSTACK_STASH_MAX. */
 };
 
 /*
@@ -946,6 +1225,25 @@ hibernate_md_arena_layout_compute(const struct hibernate_attempt *ha,
 	off += HIBERNATE_ARENA_HANDOFF_BYTES;
 	out->run_table_pa = off;
 	out->run_table_max = HIBERNATE_ARENA_COPY_RUN_MAX;
+	/*
+	 * K24-T00 round 19: the stash sits past has_descriptor_storage
+	 * (which covers the copy-run range run_table_pa already starts
+	 * at, plus the aux-descriptor sub-range immediately after it)
+	 * and past has_alignment_allowance -- both already computed by
+	 * hibernate_arena_required() into `sizing` above, so this offset
+	 * can never drift from whatever hibernate_arena_required() (the
+	 * one function both save and restore boots call identically)
+	 * actually decided. What remains after this point, up to
+	 * ha_arena_size, is exactly HIBERNATE_ARENA_BOUNDED_SLACK_BYTES
+	 * (64 KiB) -- more than K24T00_KSTACK_STASH_MAX entries require.
+	 */
+	off = ha->ha_arena_start + HIBERNATE_ARENA_HEADER_BYTES +
+	    HIBERNATE_ARENA_TRAMPOLINE_BYTES + HIBERNATE_ARENA_STACK_BYTES +
+	    HIBERNATE_ARENA_PARK_STACK_BYTES + sizing.has_private_page_tables +
+	    sizing.has_identity_map_pages + HIBERNATE_ARENA_HANDOFF_BYTES +
+	    sizing.has_descriptor_storage + sizing.has_alignment_allowance;
+	out->stash_pa = off;
+	out->stash_max = K24T00_KSTACK_STASH_MAX;
 	return (0);
 }
 
@@ -2050,20 +2348,58 @@ hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
  * ever runs. Empirically confirmed this round (N=12 baseline, runs
  * 9-10/12): the live leaf frame (0x7fed8000 region) differs from the
  * image's own saved leaf (0x7ed30000 region) at this VA, so the
- * default refuse-on-mismatch path (installed=0 unresolved=0 err=22
- * reason=8) fires and blocks every other lower page of the same
- * KSTACK_PAGES range from ever being installed, because the per-page
- * loop aborts on the first fatal error. The resuming thread's stack is
- * the IMAGE's stack by construction (resumectx() switches %rsp to the
- * saved pcb_rsp and returns into the saved call frames) -- the live
- * resume-boot mapping at this VA is a false positive, not a
- * conflicting real claim, and must be overwritten with the image's
- * leaf, not refused. force_overwrite is true at exactly that one call
- * site (the resuming-stack install calls) and false everywhere else
- * (e.g. other staged threads' own kernel stacks, where a mismatched
- * pre-existing live leaf remains a genuine conflict and must still
- * fail closed).
+ * default refuse-on-mismatch path (reason=8) fires and blocks every
+ * other lower page of the same KSTACK_PAGES range from ever being
+ * installed, because the per-page loop aborts on the first fatal
+ * error. The resuming thread's stack is the IMAGE's stack by
+ * construction (resumectx() switches %rsp to the saved pcb_rsp and
+ * returns into the saved call frames) -- the live resume-boot mapping
+ * at this VA is a false positive, not a conflicting real claim, and
+ * must be overwritten with the image's leaf, not refused. force_overwrite
+ * is true at exactly that one call site (the resuming-stack install
+ * loop) and false everywhere else (e.g. other staged threads' own
+ * kernel stacks, where a mismatched pre-existing live leaf remains a
+ * genuine conflict and must still fail closed).
  */
+static u_int hib_kva_install_reason;
+static vm_offset_t hib_kva_install_va;
+static vm_paddr_t hib_kva_install_leaf_pa;
+static uint64_t hib_kva_install_entry;
+static uint64_t hib_kva_install_leaf_flags;
+static vm_paddr_t hib_kva_install_table_pa;
+
+/*
+ * K24-T00 round 19: cross-file accessors so acpi.c's post-copy stash
+ * install pass can report WHY an install failed (hib_kva_install_reason
+ * is a HIB_KVA_FAIL reason code 1-8, set by hibernate_md_kva_install()
+ * itself on every failing return) without this file needing to expose
+ * its full static diagnostic surface.
+ */
+u_int k24t00_kva_install_last_reason(void);
+u_int
+k24t00_kva_install_last_reason(void)
+{
+	return (hib_kva_install_reason);
+}
+
+uint64_t k24t00_kva_install_last_entry(void);
+uint64_t
+k24t00_kva_install_last_entry(void)
+{
+	return (hib_kva_install_entry);
+}
+
+#define HIB_KVA_FAIL(_reason, _entry, _table_pa)         \
+	do {                                             \
+		hib_kva_install_reason = (_reason);      \
+		hib_kva_install_va = va;                 \
+		hib_kva_install_leaf_pa = leaf_pa;       \
+		hib_kva_install_entry = (_entry);        \
+		hib_kva_install_leaf_flags = leaf_flags; \
+		hib_kva_install_table_pa = (_table_pa);  \
+		return (EINVAL);                         \
+	} while (0)
+
 static int
 hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
     vm_paddr_t leaf_pa, uint64_t saved_flags, bool force_overwrite)
@@ -2077,8 +2413,17 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 	uint64_t entry, leaf_flags;
 	u_int pml4_idx, pdpt_idx, pd_idx, pt_idx;
 
+	leaf_flags = X86_PG_V | X86_PG_A | X86_PG_M |
+	    (saved_flags & (X86_PG_RW | X86_PG_U | X86_PG_NX));
+	hib_kva_install_reason = 0;
+	hib_kva_install_va = va;
+	hib_kva_install_leaf_pa = leaf_pa;
+	hib_kva_install_entry = 0;
+	hib_kva_install_leaf_flags = leaf_flags;
+	hib_kva_install_table_pa = 0;
+
 	if ((va & PAGE_MASK) != 0 || (leaf_pa & PAGE_MASK) != 0)
-		return (EINVAL);
+		HIB_KVA_FAIL(1, 0, 0);
 
 	pml4_idx = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
 	pml4e = kernel_pmap->pm_pmltop;
@@ -2089,13 +2434,13 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 			return (ENOMEM);
 		table_pa = VM_PAGE_TO_PHYS(m_pdp);
 		if (hib_pa_in_dst_md(ha, table_pa))
-			return (EINVAL);
+			HIB_KVA_FAIL(2, entry, table_pa);
 		pml4e[pml4_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
 		    X86_PG_M;
 		entry = pml4e[pml4_idx];
 	}
 	if ((entry & PG_PS) != 0)
-		return (EINVAL);
+		HIB_KVA_FAIL(3, entry, entry & PG_FRAME);
 	pdpe = (pdp_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
 
 	pdpt_idx = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
@@ -2106,13 +2451,13 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 			return (ENOMEM);
 		table_pa = VM_PAGE_TO_PHYS(m_pd);
 		if (hib_pa_in_dst_md(ha, table_pa))
-			return (EINVAL);
+			HIB_KVA_FAIL(4, entry, table_pa);
 		pdpe[pdpt_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
 		    X86_PG_M;
 		entry = pdpe[pdpt_idx];
 	}
 	if ((entry & PG_PS) != 0)
-		return (EINVAL);
+		HIB_KVA_FAIL(5, entry, entry & PG_FRAME);
 	pde = (pd_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
 
 	pd_idx = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
@@ -2123,13 +2468,96 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 			return (ENOMEM);
 		table_pa = VM_PAGE_TO_PHYS(m_pt);
 		if (hib_pa_in_dst_md(ha, table_pa))
-			return (EINVAL);
+			HIB_KVA_FAIL(6, entry, table_pa);
 		pde[pd_idx] = table_pa | X86_PG_V | X86_PG_RW | X86_PG_A |
 		    X86_PG_M;
 		entry = pde[pd_idx];
 	}
-	if ((entry & PG_PS) != 0)
-		return (EINVAL);
+	if ((entry & PG_PS) != 0) {
+		/*
+		 * K24-T00 round 22: superpage split. Post-copy install
+		 * pass; APs are still parked (acpi_s4_resume_scheduler_
+		 * aps() has not run) and the BSP is the only CPU able to
+		 * touch kernel_pmap right now -- no lock is taken here,
+		 * identical to every other direct kernel_pmap mutation
+		 * already performed by this function (the PML4/PDPT/PD
+		 * allocate-on-demand branches above take none either).
+		 * A live 2 MiB PD-level superpage covering this VA is
+		 * the exact "failed_reason=7" case the post-copy stash
+		 * install pass hit 256/256 times this round: the image's
+		 * own 4 KiB leaf cannot be placed underneath a live
+		 * superpage without first demoting it to an ordinary PT.
+		 * This mirrors the kernel's own pmap_demote_pde() in
+		 * effect (same PT-page-per-512-PTEs reproduction of the
+		 * superpage's mapping), but is written out manually here
+		 * rather than calling it: pmap_demote_pde() assumes
+		 * ordinary locking and VM-subsystem state this no-return
+		 * resume continuation does not guarantee, whereas this
+		 * function already has its own narrower, already-proven
+		 * allocator (pmap_page_alloc_below_4g()) and destination-
+		 * set disjointness check (hib_pa_in_dst_md()) for exactly
+		 * this situation.
+		 */
+		vm_page_t m_split;
+		vm_paddr_t split_pa, split_base_pa;
+		pt_entry_t *split_pte;
+		uint64_t split_pte_flags, split_pde_flags;
+		u_int si;
+
+		split_base_pa = entry & PG_PS_FRAME;
+		m_split = pmap_page_alloc_below_4g(true);
+		if (m_split == NULL)
+			return (ENOMEM);
+		split_pa = VM_PAGE_TO_PHYS(m_split);
+		if (hib_pa_in_dst_md(ha, split_pa))
+			HIB_KVA_FAIL(10, entry, split_pa);
+		split_pte = (pt_entry_t *)PHYS_TO_DMAP(split_pa);
+		/*
+		 * Reproduce the existing 2 MiB mapping exactly: same
+		 * physical base, stepping by 4 KiB, same flags. V/RW/U/
+		 * A/M/NX are preserved from the superpage's own PDE (the
+		 * template the task asks for); PG_PS itself is excluded
+		 * -- it has no meaning at the PT level and would corrupt
+		 * the PAT bit position there (PDE bit 12 vs PTE bit 7)
+		 * if left set.
+		 */
+		split_pte_flags = entry &
+		    (X86_PG_V | X86_PG_RW | X86_PG_U | X86_PG_A |
+			X86_PG_M | X86_PG_NX);
+		for (si = 0; si < NPTEPG; si++) {
+			split_pte[si] = (split_base_pa +
+			    (vm_paddr_t)si * PAGE_SIZE) | split_pte_flags;
+		}
+		/*
+		 * Replace the PD entry with the new PT page's own PTE,
+		 * preserving the PD entry's own flag bits (everything
+		 * outside the frame, minus PG_PS itself -- PG_PS is what
+		 * made this a leaf; the replacement is a table pointer).
+		 */
+		split_pde_flags = (entry & ~PG_PS_FRAME) & ~(uint64_t)PG_PS;
+		pde[pd_idx] = split_pa | split_pde_flags | X86_PG_V;
+
+		/*
+		 * Invalidate the affected range before retrying the
+		 * install: a huge-page TLB entry can cover any address
+		 * within the whole 2 MiB region, not just va, so the
+		 * existing full kernel_pmap invalidate idiom this same
+		 * function already uses below (after the real leaf
+		 * install, and on its own rollback path) is reused here
+		 * rather than inventing a narrower, riskier one.
+		 */
+		if ((read_rflags() & PSL_I) != 0)
+			pmap_invalidate_all(kernel_pmap);
+		else
+			invltlb_glob();
+
+		/*
+		 * Retry: re-read the now-demoted PD entry and fall
+		 * through exactly as the ordinary "PT just allocated"
+		 * case above does.
+		 */
+		entry = pde[pd_idx];
+	}
 	pte = (pt_entry_t *)PHYS_TO_DMAP(entry & PG_FRAME);
 
 	pt_idx = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
@@ -2164,7 +2592,7 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 		 * refused. Only force_overwrite callers take this path.
 		 */
 		if (!force_overwrite)
-			return (EINVAL);
+			HIB_KVA_FAIL(8, entry, entry & PG_FRAME);
 	}
 
 	pte[pt_idx] = leaf_pa | leaf_flags;
@@ -2181,11 +2609,60 @@ hibernate_md_kva_install(const struct hibernate_attempt *ha, vm_offset_t va,
 			pmap_invalidate_all(kernel_pmap);
 		else
 			invltlb_glob();
-		return (EINVAL);
+		HIB_KVA_FAIL(9, failed_entry, failed_entry & PG_FRAME);
 	}
 
 	return (0);
 }
+/*
+ * K24-T00 round 19: cross-file accessor for acpi.c's post-copy install
+ * pass. The stash itself lives in the arena at a PA computed by
+ * hibernate_md_arena_layout_compute() (not a plain static array), so
+ * acpi.c cannot reach it without first recomputing the layout -- this
+ * wrapper does that once, using the live hibernate_current_attempt
+ * (the same global hibernate_page_is_destination() itself already
+ * reads, proven safe post-copy by every prior round's own use of it
+ * at this identical call site).
+ */
+struct k24t00_kstack_stash_entry *k24t00_kstack_stash_ptr(void);
+struct k24t00_kstack_stash_entry *
+k24t00_kstack_stash_ptr(void)
+{
+	extern struct hibernate_attempt *k24t00_hibernate_current_attempt(void);
+	struct hibernate_md_arena_layout layout;
+	struct hibernate_attempt *ha;
+
+	ha = k24t00_hibernate_current_attempt();
+	if (ha == NULL)
+		return (NULL);
+	if (hibernate_md_arena_layout_compute(ha, &layout) != 0)
+		return (NULL);
+	return ((struct k24t00_kstack_stash_entry *)
+	    PHYS_TO_DMAP(layout.stash_pa));
+}
+
+/*
+ * K24-T00 round 19: thin public wrapper around the existing, already-
+ * proven hibernate_md_kva_install() (static to this file) so acpi.c's
+ * post-copy install pass can call it without this file needing to
+ * expose its full static surface. ha is likewise taken from
+ * hibernate_current_attempt -- hibernate_md_kva_install() itself only
+ * uses ha for hib_pa_in_dst_md()'s own destination-set check on freshly
+ * allocated table pages, read-only, identical semantics to every
+ * existing pre-copy caller.
+ */
+int hibernate_md_kva_install_pub(vm_offset_t va, vm_paddr_t leaf_pa,
+    uint64_t flags, bool force_overwrite);
+int
+hibernate_md_kva_install_pub(vm_offset_t va, vm_paddr_t leaf_pa,
+    uint64_t flags, bool force_overwrite)
+{
+	extern struct hibernate_attempt *k24t00_hibernate_current_attempt(void);
+
+	return (hibernate_md_kva_install(k24t00_hibernate_current_attempt(),
+	    va, leaf_pa, flags, force_overwrite));
+}
+#undef HIB_KVA_FAIL
 
 /*
  * K23-T13: walk va under root_pa and self-copy every page-table page
@@ -3009,8 +3486,11 @@ hibernate_md_staged_read(const struct hibernate_attempt *ha,
 	return (0);
 }
 
-#define	HIB_STAGED_MAX_THREADS	256
-#define	HIB_STAGED_ITER_GUARD	4096
+#define HIB_STAGED_MAX_THREADS 256
+_Static_assert(HIB_STAGED_MAX_THREADS == 256,
+    "K24T00_KSTACK_STASH_MAX's own literal 256 (near this file's top, "
+    "forward-reference-by-literal) must track HIB_STAGED_MAX_THREADS");
+#define HIB_STAGED_ITER_GUARD  4096
 
 struct hib_staged_thread {
 	vm_offset_t	kstack_va;
@@ -3044,6 +3524,78 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 	 */
 	u_int k24t00_chain_fail_count, k24t00_thread_fail_count;
 	int k24t00_chain_fail_err, k24t00_thread_fail_err;
+	/*
+	 * K24-T00 round 5: proc_ok/thread-validity gate rejection
+	 * counting. Both gates silently `continue` past a proc/thread
+	 * that read successfully but failed a CONTENT condition -- no
+	 * counter, no print, unlike the round-2 chain-link read
+	 * failures. Count each distinct reason separately so a
+	 * dominant single cause (vs. scattered noise) is visible, and
+	 * capture the first few rejections' identifying detail (pid,
+	 * p_state, raw p_comm bytes for proc-level; pid, kva, pages for
+	 * thread-level) without printing per-rejection spam.
+	 */
+	u_int k24t00_rej_prs_new, k24t00_rej_state_lo, k24t00_rej_state_hi;
+	u_int k24t00_rej_pid_range, k24t00_rej_no_nul;
+	u_int k24t00_rej_kva_range, k24t00_rej_kva_align;
+	u_int k24t00_rej_pages_range;
+#define K24T00_REJ_FIRST_MAX 8
+	struct {
+		pid_t pid;
+		int p_state;
+		char comm[MAXCOMLEN + 1];
+	} k24t00_rej_proc_first[K24T00_REJ_FIRST_MAX];
+	u_int k24t00_rej_proc_first_n;
+	struct {
+		pid_t pid;
+		vm_offset_t kva;
+		u_int pages;
+	} k24t00_rej_thread_first[K24T00_REJ_FIRST_MAX];
+	u_int k24t00_rej_thread_first_n;
+	/*
+	 * K24-T00 round 7: user-process exclusion hunt. procs_visited
+	 * counts every proc_cursor read that SUCCEEDED (error == 0),
+	 * i.e. every proc the p_hash walk actually reached, regardless
+	 * of whether the content gate then accepted or rejected it --
+	 * this is the number that answers "does the walk visit user
+	 * procs at all", independent of acceptance. procs_accepted is
+	 * the existing `n` counter's own proc-level analogue (n counts
+	 * ACCEPTED THREADS, not accepted procs, so a separate count is
+	 * needed). sslp_* track SSLEEP/SRUN (ordinary user-process
+	 * states) specifically, split by accept/reject, because those
+	 * are exactly the states a normal user process is almost always
+	 * found in -- a kernel proc is essentially never SSLEEP/SRUN in
+	 * the sense of having userland to sleep/run in, though SRUN/
+	 * SSLEEP cover kernel threads' procs too (e.g. "kernel" proc0's
+	 * own threads can be SRUN) so this is suggestive, not proof, by
+	 * itself -- the first-15-accepted pid/comm/threadcount list
+	 * below is the authoritative evidence.
+	 */
+	u_int k24t00_procs_visited, k24t00_procs_accepted;
+	u_int k24t00_sslp_accepted, k24t00_sslp_rejected;
+/*
+	 * K24-T00 round 7b: raised from 15 to 40 -- the first clean
+	 * run showed procs_accepted=16 with only the first 15
+	 * (all low, sequential, kernel-internal pids 0-14) visible,
+	 * hiding whether the 16th accepted proc was devd/syslogd.
+	 * Bounded by HIB_STAGED_MAX_THREADS (256) in principle, but
+	 * 40 is ample: no run so far has accepted more than ~16.
+	 */
+#define K24T00_ACCEPTED_FIRST_MAX 40
+	struct {
+		pid_t pid;
+		char comm[MAXCOMLEN + 1];
+		u_int nthreads;
+	} k24t00_accepted_first[K24T00_ACCEPTED_FIRST_MAX];
+	u_int k24t00_accepted_first_n;
+	/*
+	 * K24-T00 round 8: one-shot deep-resolution diagnostic. Fires
+	 * exactly once for the FIRST rejected proc (zero content,
+	 * read succeeded) and once for the FIRST accepted proc, so the
+	 * two resolution paths are visible side by side for comparison.
+	 */
+	bool k24t00_deep_rej_done, k24t00_deep_acc_done;
+	int error;
 
 	table = pidhashtbl;
 	hash = pidhash;
@@ -3071,6 +3623,7 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 	k24t00_thread_fail_count = 0;
 	k24t00_chain_fail_err = 0;
 	k24t00_thread_fail_err = 0;
+	k24t00_kstack_stash_n = 0;
 	for (i = 0; i <= hash; i++) {
 		struct proc staged_proc;
 		u_int iter_guard;
@@ -3880,6 +4433,44 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			    (vm_offset_t)kstack_va >= VM_MAX_KERNEL_ADDRESS)
 				return (EINVAL);
 
+			/*
+			 * Derive the exact bounds from the standard kstack
+			 * arena's allocator geometry.
+			 * vm_thread_alloc_kstack_kva() aligns each standard
+			 * allocation to KSTACK_PAGES + KSTACK_GUARD_PAGES pages
+			 * relative to VM_MIN_KERNEL_ADDRESS.
+			 * vm_thread_stack_create() then leaves the first page
+			 * unmapped as the guard and publishes td_kstack at the
+			 * following page.  pcb_rsp is an interior stack
+			 * address, so its containing aligned slot uniquely
+			 * determines:
+			 *
+			 *   slot  = guard page
+			 *   base  = slot + KSTACK_GUARD_PAGES
+			 *   end   = base + KSTACK_PAGES
+			 *
+			 * The prior staged-process enumeration was not
+			 * authoritative here: HIB_STAGED_MAX_THREADS caps it at
+			 * 256 entries, and this probe consumed the image before
+			 * emitting I/U because the hibernating thread was
+			 * omitted.  Allocation geometry has no process-list or
+			 * enumeration dependency and matches vm_glue.c's
+			 * enforced KASSERT.
+			 */
+			kstack_stride = ptoa(KSTACK_PAGES + KSTACK_GUARD_PAGES);
+			kstack_slot = VM_MIN_KERNEL_ADDRESS +
+			    (((vm_offset_t)staged_pcb->pcb_rsp -
+				 VM_MIN_KERNEL_ADDRESS) /
+				kstack_stride) *
+				kstack_stride;
+			kstack_base = kstack_slot + ptoa(KSTACK_GUARD_PAGES);
+			kstack_end = kstack_base + ptoa(KSTACK_PAGES);
+			if (kstack_base < kstack_slot ||
+			    kstack_end < kstack_base ||
+			    (vm_offset_t)staged_pcb->pcb_rsp < kstack_base ||
+			    (vm_offset_t)staged_pcb->pcb_rsp >= kstack_end)
+				return (EINVAL);
+
 			k24t00_kstack_va = kstack_va;
 			/*
 			 * do NOT source hib_staged_
@@ -3965,9 +4556,40 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				walk_ok = hibernate_md_staged_leaf_for_live_slot(ha,
 				    wvec, p, (vm_offset_t)kstack_va, &saved_walk);
 				install_err = 0;
-				if (walk_ok &&
-				    (saved_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) ==
-				    (X86_PG_V | X86_PG_RW))
+				bzero(stack_resolved, sizeof(stack_resolved));
+
+				/*
+				 * Resolve every stack leaf before installing
+				 * any of them. hibernate_md_kva_install()
+				 * mutates the live terminal chain used by
+				 * hibernate_md_staged_leaf_for_live_slot() to
+				 * locate staged PT pages, so resolving and
+				 * installing one page at a time makes later
+				 * pages in the same allocation appear absent.
+				 * Snapshotting all leaves first keeps discovery
+				 * in the original live/staged topology and
+				 * installation in a separate phase.
+				 */
+				for (pg = 0; pg < KSTACK_PAGES; pg++) {
+					stack_va = kstack_base +
+					    (vm_offset_t)pg * PAGE_SIZE;
+					if (!hibernate_md_staged_leaf_for_live_slot(
+						ha, wvec, p, stack_va,
+						&stack_walks[pg]) ||
+					    (stack_walks[pg].hmw_flags &
+						(X86_PG_V | X86_PG_RW)) !=
+						(X86_PG_V | X86_PG_RW)) {
+						unresolved++;
+						continue;
+					}
+					stack_resolved[pg] = true;
+				}
+
+				for (pg = 0; pg < KSTACK_PAGES; pg++) {
+					if (!stack_resolved[pg])
+						continue;
+					stack_va = kstack_base +
+					    (vm_offset_t)pg * PAGE_SIZE;
 					/*
 					 * K24-T00 stack disposition fix:
 					 * force_overwrite=true -- this VA is
@@ -3979,61 +4601,71 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					 * it (see hibernate_md_kva_install()'s
 					 * own comment).
 					 */
-					install_err = hibernate_md_kva_install(ha,
-					    (vm_offset_t)kstack_va, saved_walk.hmw_pa,
-					    saved_walk.hmw_flags, true);
-
-				if (walk_ok && install_err == 0) {
-					for (kstack_npages = 1;
-					    kstack_npages < KSTACK_PAGES;
-					    kstack_npages++) {
-						struct hibernate_md_walk
-						    extra_walk;
-						bool extra_ok;
-
-						kstack_page_va =
-						    (vm_offset_t)kstack_va -
-						    (vm_offset_t)kstack_npages *
-						    PAGE_SIZE;
-						extra_ok =
-						    hibernate_md_staged_leaf_for_live_slot(
-						    ha, wvec, p,
-						    kstack_page_va,
-						    &extra_walk);
-						if (!extra_ok ||
-						    (extra_walk.hmw_flags &
-						    (X86_PG_V | X86_PG_RW)) !=
-						    (X86_PG_V | X86_PG_RW))
-							break;
-						/*
-						 * K24-T00 stack disposition
-						 * fix: force_overwrite=true --
-						 * this VA is another page of
-						 * the RESUMING thread's own
-						 * kstack, necessarily already
-						 * live-mapped by the ordinary
-						 * resume-boot thread0
-						 * allocation; the image's leaf
-						 * must replace it, not be
-						 * refused against it (see
-						 * hibernate_md_kva_install()'s
-						 * own comment).
-						 */
+					install_err = hibernate_md_kva_install(
+					    ha, stack_va,
+					    stack_walks[pg].hmw_pa,
+					    stack_walks[pg].hmw_flags, true);
+					if (install_err == 0)
 						install_err =
-						    hibernate_md_kva_install(
-						    ha, kstack_page_va,
-						    extra_walk.hmw_pa,
-						    extra_walk.hmw_flags, true);
-						if (install_err != 0)
-							break;
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							stack_va, false,
+							&selfcopied);
+					if (install_err != 0)
+						break;
+					installed++;
+					if (stack_va == (vm_offset_t)kstack_va) {
+						rsp_page_ready = true;
+						/*
+						 * K24-T00: probe slot 0, the
+						 * BSP's own control. Record
+						 * the exact VA/expected PA
+						 * this install just wrote,
+						 * for the post-copy decode.
+						 */
+						k24t00_probe_va_g[0] =
+						    stack_va;
+						k24t00_probe_expected_pa_g[0] =
+						    stack_walks[pg].hmw_pa;
+						k24t00_probe_set_g[0] = true;
 					}
 				}
 
-				if (!walk_ok)
-					return (EINVAL);
-				if ((saved_walk.hmw_flags & (X86_PG_V | X86_PG_RW)) !=
-				    (X86_PG_V | X86_PG_RW))
-					return (EINVAL);
+				/*
+				 * The page containing pcb_rsp is mandatory.
+				 * Other absent pages are permitted as untouched
+				 * sparse stack pages.
+				 */
+				if (install_err == 0 && !rsp_page_ready)
+					install_err = EINVAL;
+
+				hibernate_k24t04_raw_marker('I');
+				hibernate_k24t04_raw_uint(installed);
+				hibernate_k24t04_raw_marker('U');
+				hibernate_k24t04_raw_uint(unresolved);
+				if (install_err != 0) {
+					hibernate_k24t04_raw_marker('J');
+					hibernate_k24t04_raw_uint(install_err);
+					hibernate_k24t04_raw_marker('Y');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_reason);
+					hibernate_k24t04_raw_marker('V');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_va);
+					hibernate_k24t04_raw_marker('L');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_leaf_pa);
+					hibernate_k24t04_raw_marker('P');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_entry);
+					hibernate_k24t04_raw_marker('F');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_leaf_flags);
+					hibernate_k24t04_raw_marker('A');
+					hibernate_k24t04_raw_uint(
+					    hib_kva_install_table_pa);
+				}
 				error = install_err;
 			}
 		}
@@ -4042,16 +4674,358 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			u_int i, nthreads, selfcopied;
 
 			threads = malloc(sizeof(*threads) *
-			    HIB_STAGED_MAX_THREADS, M_TEMP, M_NOWAIT);
+				HIB_STAGED_MAX_THREADS,
+			    M_TEMP, M_NOWAIT);
 			if (threads == NULL)
 				return (ENOMEM);
 
-			error = hibernate_md_enumerate_staged_threads(ha,
-			    wvec, p, threads, HIB_STAGED_MAX_THREADS,
-			    &nthreads);
+			error = hibernate_md_enumerate_staged_threads(ha, wvec,
+			    p, threads, HIB_STAGED_MAX_THREADS, &nthreads);
 			if (error != 0) {
 				free(threads, M_TEMP);
 				return (error);
+			}
+
+			/*
+			 * K24-T00 round 24: fail closed, pre-copy, if this
+			 * boot's own real requirement ever exceeds the
+			 * stash's capacity -- refusing here is cheap (no
+			 * destructive copy has run yet); discovering a
+			 * silent truncation post-copy, as a kstack_verify
+			 * miss or a done_load_dr fault, is not. One stash
+			 * entry per kstack PAGE (matching the populate
+			 * loop's own granularity, below), summed across
+			 * every enumerated thread.
+			 */
+			{
+				u_int cap_i;
+				uint64_t required_pages;
+
+				required_pages = 0;
+				for (cap_i = 0; cap_i < nthreads; cap_i++) {
+					required_pages +=
+					    threads[cap_i].kstack_pages;
+				}
+				printf("hibernate: k24t00: kstack stash "
+				    "capacity: capacity=%u nthreads=%u "
+				    "required_pages=%ju\n",
+				    (u_int)K24T00_KSTACK_STASH_MAX, nthreads,
+				    (uintmax_t)required_pages);
+				if (required_pages >
+				    (uint64_t)K24T00_KSTACK_STASH_MAX) {
+					printf("hibernate: k24t00: kstack "
+					    "stash capacity exceeded: "
+					    "required_pages=%ju > "
+					    "capacity=%u -- refusing resume\n",
+					    (uintmax_t)required_pages,
+					    (u_int)K24T00_KSTACK_STASH_MAX);
+					free(threads, M_TEMP);
+					return (ENOSPC);
+				}
+			}
+
+			/*
+			 * K24-T00 thread provenance: build the staged-PCB-
+			 * page set from this SAME enumeration pass, deduped,
+			 * bounded by HIB_STAGED_PCB_PAGE_MAX. Printed as one
+			 * auditable summary line (count + first few page
+			 * numbers) -- safe here, pre-copy, same window as
+			 * every other printf in this function.
+			 */
+			{
+				u_int sp_i, sp_j, sp_n, sp_dropped;
+				u_long sp_key;
+				bool sp_dup;
+
+				sp_n = 0;
+				sp_dropped = 0;
+				for (sp_i = 0; sp_i < nthreads; sp_i++) {
+					if (threads[sp_i].pcb_va == 0)
+						continue;
+					sp_key = (u_long)(threads[sp_i].pcb_va
+					    >> PAGE_SHIFT);
+					sp_dup = false;
+					for (sp_j = 0; sp_j < sp_n; sp_j++) {
+						if (k24t00_staged_pcb_page_g[
+							sp_j] == sp_key) {
+							sp_dup = true;
+							break;
+						}
+					}
+					if (sp_dup)
+						continue;
+					if (sp_n >= HIB_STAGED_PCB_PAGE_MAX) {
+						sp_dropped++;
+						continue;
+					}
+					k24t00_staged_pcb_page_g[sp_n++] =
+					    sp_key;
+				}
+				k24t00_staged_pcb_page_n_g = sp_n;
+
+				printf("hibernate: k24t00: staged pcb pages: "
+				    "count=%u first=%#lx,%#lx,%#lx,%#lx\n",
+				    sp_n,
+				    sp_n > 0 ? k24t00_staged_pcb_page_g[0] : 0,
+				    sp_n > 1 ? k24t00_staged_pcb_page_g[1] : 0,
+				    sp_n > 2 ? k24t00_staged_pcb_page_g[2] : 0,
+				    sp_n > 3 ? k24t00_staged_pcb_page_g[3] : 0);
+
+				/*
+				 * K24-T00 round 3: independent pid/tid
+				 * staged sets, built from this SAME
+				 * enumeration pass (threads[0..nthreads)),
+				 * but via plain, direct assignment (no
+				 * page-shift, no dedup-by-page-number) --
+				 * a structurally simpler, independently-
+				 * computed answer to "is this thread part
+				 * of the staged set" than the PCB-page
+				 * path above. nthreads is already bounded
+				 * by HIB_STAGED_MAX_THREADS (the array
+				 * size), so no separate capacity check is
+				 * needed here (unlike the PCB-page set,
+				 * which dedupes and can therefore legitimately
+				 * hold fewer entries than nthreads).
+				 */
+				k24t00_staged_pid_n_g = nthreads;
+				k24t00_staged_tid_n_g = nthreads;
+				k24t00_staged_tid_max_g = 0;
+				for (sp_i = 0; sp_i < nthreads; sp_i++) {
+					k24t00_staged_pid_g[sp_i] =
+					    threads[sp_i].pid;
+					k24t00_staged_tid_g[sp_i] =
+					    threads[sp_i].tid;
+					if (threads[sp_i].tid >
+					    k24t00_staged_tid_max_g)
+						k24t00_staged_tid_max_g =
+						    threads[sp_i].tid;
+				}
+				printf("hibernate: k24t00: staged pid/tid "
+				    "sets: count=%u tid_max=%u\n",
+				    nthreads, (u_int)k24t00_staged_tid_max_g);
+				/*
+				 * K24-T00 Q1 (array truncation): capacity is
+				 * HIB_STAGED_PCB_PAGE_MAX (256), bounded by
+				 * nthreads (itself bounded by
+				 * HIB_STAGED_MAX_THREADS, also 256) -- unique
+				 * pages can never exceed nthreads, so
+				 * dropped is structurally 0 unless the two
+				 * bounds are ever de-synced. Printed every
+				 * run as direct evidence, not an assumption.
+				 */
+				printf("hibernate: k24t00: staged pcb page "
+				    "capacity: capacity=%u nthreads=%u "
+				    "unique=%u dropped=%u\n",
+				    (u_int)HIB_STAGED_PCB_PAGE_MAX, nthreads,
+				    sp_n, sp_dropped);
+
+				/*
+				 * Self-copy-protect immediately after the
+				 * final write above, exactly like
+				 * hib_keg_topo_head_g: this array's correct
+				 * content is THIS boot's own just-captured
+				 * enumeration, never the saved image's stale
+				 * content for these same global addresses.
+				 */
+				if (error == 0) {
+					vm_offset_t sp_pg, sp_end;
+					u_int sp_selfcopied = 0;
+
+					sp_pg = trunc_page((vm_offset_t)
+					    &k24t00_staged_pcb_page_g);
+					sp_end = round_page((vm_offset_t)
+					    &k24t00_staged_pcb_page_g +
+					    sizeof(k24t00_staged_pcb_page_g));
+					for (; sp_pg < sp_end;
+					    sp_pg += PAGE_SIZE) {
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							sp_pg, true,
+							&sp_selfcopied);
+						if (error != 0)
+							break;
+					}
+				}
+				/*
+				 * K24-T00 round 3: self-copy-protect the
+				 * new pid/tid staged sets the identical way
+				 * -- written pre-copy here, read post-copy
+				 * from the fault path (trap.c), exactly
+				 * the same lifetime as k24t00_staged_pcb_
+				 * page_g immediately above.
+				 */
+				if (error == 0) {
+					vm_offset_t sp_pg, sp_end;
+					u_int sp_selfcopied = 0;
+
+					sp_pg = trunc_page((vm_offset_t)
+					    &k24t00_staged_pid_g);
+					sp_end = round_page((vm_offset_t)
+					    &k24t00_staged_pid_g +
+					    sizeof(k24t00_staged_pid_g));
+					for (; sp_pg < sp_end;
+					    sp_pg += PAGE_SIZE) {
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							sp_pg, true,
+							&sp_selfcopied);
+						if (error != 0)
+							break;
+					}
+				}
+				if (error == 0) {
+					vm_offset_t sp_pg, sp_end;
+					u_int sp_selfcopied = 0;
+
+					sp_pg = trunc_page((vm_offset_t)
+					    &k24t00_staged_tid_g);
+					sp_end = round_page((vm_offset_t)
+					    &k24t00_staged_tid_g +
+					    sizeof(k24t00_staged_tid_g));
+					for (; sp_pg < sp_end;
+					    sp_pg += PAGE_SIZE) {
+						error =
+						    hibernate_md_selfcopy_walk(
+							ha, wvec, p,
+							kernel_pmap->pm_cr3,
+							sp_pg, true,
+							&sp_selfcopied);
+						if (error != 0)
+							break;
+					}
+				}
+			}
+
+			if (error != 0) {
+				free(threads, M_TEMP);
+				return (error);
+			}
+
+			/*
+			 * K24-T00 non-image threads: compare THIS boot's own
+			 * live thread set (allproc/td_hash, walked exactly
+			 * like the existing live FPU walk a few hundred
+			 * lines below: allproc_lock then PROC_LOCK) against
+			 * the staged-PCB-page set just captured above. Any
+			 * live thread whose own PCB page is NOT in that set
+			 * is a thread the image's own enumeration never saw
+			 * -- after the destructive copy, the image's page
+			 * tables do not map that thread's kernel stack, which
+			 * is exactly the not-present fault already captured
+			 * (K24T00: first kernel pfault, sys/amd64/amd64/
+			 * trap.c) for pid 601 "devd". Read-only, pre-copy,
+			 * same safety window as every other printf in this
+			 * function (not yet past hibernate_machdep_enter()).
+			 *
+			 * curthread is excluded unconditionally: it is this
+			 * resume continuation's own thread, running this
+			 * exact function, by construction never a member of
+			 * the staged (saved-image) set and not a candidate
+			 * for exclusion -- it must survive to complete the
+			 * restore.
+			 */
+			{
+				struct proc *ni_pp;
+				struct thread *ni_td;
+				struct thread *ni_self;
+				u_int ni_total, ni_staged, ni_nonimage;
+				u_int ni_runnable, ni_reported;
+				u_long ni_pcb_page;
+
+				ni_self = curthread;
+				ni_total = 0;
+				ni_staged = 0;
+				ni_nonimage = 0;
+				ni_runnable = 0;
+				ni_reported = 0;
+
+				sx_slock(&allproc_lock);
+				FOREACH_PROC_IN_SYSTEM(ni_pp) {
+					PROC_LOCK(ni_pp);
+					FOREACH_THREAD_IN_PROC(ni_pp, ni_td) {
+						bool ni_is_staged;
+						bool ni_is_runnable;
+
+						if (ni_td == ni_self)
+							continue;
+						ni_total++;
+						if (ni_td->td_pcb == NULL)
+							continue;
+						ni_pcb_page = (u_long)
+						    ni_td->td_pcb >>
+						    PAGE_SHIFT;
+						ni_is_staged =
+						    hibernate_k24t00_pcb_is_staged(
+							ni_pcb_page) != 0;
+						if (ni_is_staged) {
+							ni_staged++;
+							continue;
+						}
+						ni_nonimage++;
+						/*
+						 * Runnable-or-will-become-
+						 * runnable-without-an-image-
+						 * event: TDS_RUNQ/TDS_CAN_RUN/
+						 * TDS_RUNNING are runnable now;
+						 * TDI_SLEEPING/TDI_LOCK/TDI_IWAIT
+						 * all resolve via an event this
+						 * boot's own live kernel
+						 * delivers (a timeout, a lock
+						 * release, an interrupt) and
+						 * are NOT gated on anything
+						 * from the image's own world --
+						 * so only genuine
+						 * TDI_SUSPENDED (this boot's
+						 * own suspend machinery, e.g.
+						 * single-threading) is excluded
+						 * from "will become runnable".
+						 */
+						ni_is_runnable =
+						    TD_ON_RUNQ(ni_td) ||
+						    TD_CAN_RUN(ni_td) ||
+						    TD_IS_RUNNING(ni_td) ||
+						    TD_IS_SLEEPING(ni_td) ||
+						    TD_ON_LOCK(ni_td) ||
+						    TD_AWAITING_INTR(ni_td);
+						if (ni_is_runnable) {
+							ni_runnable++;
+							if (ni_reported < 8) {
+								printf(
+								    "hibernate: k24t00: non-image runnable: "
+								    "pid=%d comm=%s tid=%d state=%s pcb_page=%#lx\n",
+								    (int)
+									ni_pp->p_pid,
+								    ni_pp->p_comm,
+								    (int)
+									ni_td->td_tid,
+								    TD_IS_SLEEPING(
+									ni_td) ?
+									"sleep" :
+									TD_ON_LOCK(
+									    ni_td) ?
+									"lock" :
+									TD_AWAITING_INTR(
+									    ni_td) ?
+									"iwait" :
+									"runnable",
+								    ni_pcb_page);
+								ni_reported++;
+							}
+						}
+					}
+					PROC_UNLOCK(ni_pp);
+				}
+				sx_sunlock(&allproc_lock);
+
+				printf("hibernate: k24t00: non-image census: "
+				    "live=%u staged=%u nonimage=%u "
+				    "nonimage_runnable=%u\n",
+				    ni_total, ni_staged, ni_nonimage,
+				    ni_runnable);
 			}
 
 			selfcopied = 0;
@@ -4137,22 +5111,118 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						break;
 					}
 					/*
-					 * K24-T00 stack disposition fix:
-					 * force_overwrite=false -- this is
-					 * some OTHER staged thread's own
-					 * kernel stack, not the resuming
-					 * thread's; a mismatched pre-existing
-					 * live leaf here remains a genuine
-					 * conflict and must still fail closed
-					 * (see hibernate_md_kva_install()'s
-					 * own comment).
+					 * K24-T00 round 19: stash this
+					 * thread's resolved staged leaf
+					 * (va, walk.hmw_pa, walk.hmw_flags)
+					 * into the arena's copy-excluded
+					 * stash region BEFORE the destructive
+					 * copy runs, so a POST-copy pass can
+					 * install it into whatever page
+					 * tables are actually in force at
+					 * that point (round 17/18's own
+					 * finding: pre-copy, kernel_pmap's
+					 * own root is not itself an image
+					 * destination-set member, so
+					 * installing into the LIVE tree here
+					 * writes into a tree the restored
+					 * kernel does not adopt). One entry
+					 * per PAGE, not per thread, since
+					 * each page's own leaf PA/flags are
+					 * independent and the post-copy pass
+					 * needs exactly this granularity to
+					 * install correctly.
 					 */
-					error = hibernate_md_kva_install(ha, va,
-					    walk.hmw_pa, walk.hmw_flags, false);
-					if (error != 0)
+					if (k24t00_kstack_stash_n <
+					    K24T00_KSTACK_STASH_MAX) {
+						struct k24t00_kstack_stash_entry
+						    *se;
+
+						se = (struct
+						    k24t00_kstack_stash_entry *)
+						    PHYS_TO_DMAP(
+							layout.stash_pa) +
+						    k24t00_kstack_stash_n;
+						se->va = va;
+						se->leaf_pa = walk.hmw_pa;
+						se->flags = walk.hmw_flags;
+						k24t00_kstack_stash_n++;
+					 * K24-T00 round 15 RESULT: the test
+					 * above (disabling this install for
+					 * staged threads) was REVERTED.
+					 * Round 15's N=12 campaign showed
+					 * kstack_verify firing MORE often
+					 * (6/12) with the install disabled
+					 * than with it active (4/12) -- the
+					 * install is doing useful work for
+					 * some threads even though it does
+					 * not fix syslogd's/logger's own
+					 * gap. The gap itself was proven
+					 * save-side (round 16): the image's
+					 * own post-copy tables lack the
+					 * mapping regardless of this
+					 * install, so this install is
+					 * restored to its original
+					 * unconditional form rather than
+					 * kept disabled as a non-fix that
+					 * measurably worsened the failure
+					 * rate.
+					 *
+					 * K24-T00 round 19: this pre-copy
+					 * install into the LIVE tree is now
+					 * SUPERSEDED by the post-copy
+					 * install from the stash above --
+					 * round 17/18 proved this live tree
+					 * is not the one the restored kernel
+					 * actually adopts. error is forced
+					 * to 0 so the existing per-page
+					 * accounting below (which still has
+					 * real value: req_pages/inst_pages
+					 * diagnostics, the kstack-coverage
+					 * printf) is unaffected; the actual
+					 * mapping work now happens once,
+					 * post-copy, from the stash just
+					 * populated above.
+					 */
+					error = 0;
+					if (error == 0) {
+						/*
 						break;
 					error = hib_selfcopy_pt(ha, wvec, p, va,
 					    &selfcopied);
+					if (error != 0) {
+						if (is_target) {
+							err_pages++;
+							last_err = error;
+						}
+						break;
+					}
+					if (is_target)
+						inst_pages++;
+
+					/*
+			 * K24-T00 round 24: self-copy-protect
+			 * k24t00_kstack_stash_n immediately after the last
+			 * write to it, exactly like k24t00_staged_pcb_
+			 * page_g above -- this count's correct content is
+			 * THIS boot's own just-populated value, never the
+			 * saved image's stale content for this same
+			 * address (see this global's own declaration
+			 * comment for the full account).
+			 */
+			if (error == 0) {
+				vm_offset_t ksn_pg, ksn_end;
+				u_int ksn_selfcopied = 0;
+
+				ksn_pg = trunc_page(
+				    (vm_offset_t)&k24t00_kstack_stash_n);
+				ksn_end = round_page(
+				    (vm_offset_t)&k24t00_kstack_stash_n +
+				    sizeof(k24t00_kstack_stash_n));
+				for (; ksn_pg < ksn_end;
+				    ksn_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    ksn_pg, true, &ksn_selfcopied);
 					if (error != 0)
 						break;
 				}
