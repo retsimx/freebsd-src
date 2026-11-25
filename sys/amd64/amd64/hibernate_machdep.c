@@ -1130,6 +1130,16 @@ struct k24t00_kstack_stash_entry {
 	char comm[MAXCOMLEN + 1];
 	u_int page_index;
 	/*
+	 * K24-T00 round 31: true for an entry resolved from a thread's
+	 * pcb->pcb_save (FPU/XSAVE save area) rather than its td_kstack.
+	 * Lets the post-copy install pass and verifier report FPU-area
+	 * installs/checks separately from kstack ones using the same
+	 * stash array and install mechanism, rather than inventing a
+	 * second parallel one.
+	 */
+	bool is_fpu;
+};
+/*
  * K24-T00 round 24: k24t00_kstack_stash_n was never self-copy-
  * protected, unlike every sibling "populated pre-copy, read post-
  * copy" global in this file (k24t00_staged_pcb_page_g, k24t00_
@@ -2272,6 +2282,8 @@ hib_md_safe_resolve(vm_paddr_t root_pa, vm_offset_t va, vm_paddr_t *pa_out)
 	return (true);
 }
 
+u_int k24t00_kv_readonly;
+
 static bool
 hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
     const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
@@ -3258,6 +3270,45 @@ hib_staged_leaf(const struct hibernate_attempt *ha,
  */
 static u_int hibernate_resume_kstack_skip_count;
 
+static u_int k24t00_pte_verify_threads;
+static u_int k24t00_pte_verify_mismatch_threads;
+static pid_t k24t00_pte_verify_first_pid = -1;
+static vm_offset_t k24t00_pte_verify_first_va;
+static vm_paddr_t k24t00_pte_verify_first_expected_pa;
+static uint64_t k24t00_pte_verify_first_actual_pte;
+
+static bool
+k24t00_live_pte_read(vm_offset_t va, uint64_t *pte_out)
+{
+	vm_paddr_t table_pa;
+	uint64_t entry;
+	u_int index;
+
+	table_pa = kernel_pmap->pm_cr3 & PG_FRAME;
+	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
+	entry = ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDPSHIFT) & (NPDPEPG - 1));
+	entry = ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PDRSHIFT) & (NPDEPG - 1));
+	entry = ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	if ((entry & X86_PG_V) == 0 || (entry & PG_PS) != 0)
+		return (false);
+
+	table_pa = entry & PG_FRAME;
+	index = (u_int)((va >> PAGE_SHIFT) & (NPTEPG - 1));
+	entry = ((const uint64_t *)PHYS_TO_DMAP(table_pa))[index];
+	*pte_out = entry;
+	return (true);
+}
+
 static bool
 hib_saved_domain_leaf_valid(const struct hibernate_attempt *ha,
     const vm_paddr_t *wvec, uint64_t p, vm_offset_t va)
@@ -3493,8 +3544,55 @@ _Static_assert(HIB_STAGED_MAX_THREADS == 256,
 #define HIB_STAGED_ITER_GUARD  4096
 
 struct hib_staged_thread {
-	vm_offset_t	kstack_va;
-	u_int		kstack_pages;
+	vm_offset_t kstack_va;
+	u_int kstack_pages;
+	pid_t pid;	/* K24-T00: for targeted syslogd/devd marker counts */
+	/*
+	 * K24-T00 round 3: this thread's own staged td_tid, captured
+	 * alongside pid for the independent pid/tid staged-set
+	 * cross-check (see k24t00_staged_tid_g[]/hibernate_k24t00_
+	 * tid_is_staged(), above).
+	 */
+	lwpid_t tid;
+	/*
+	 * K24-T00: staged pcb_rsp sanity check. Captured read-only,
+	 * pre-copy, from this thread's own staged td_pcb->pcb_rsp, so
+	 * the resume continuation's own pre-copy validation can confirm
+	 * each thread's saved stack pointer actually lands inside that
+	 * SAME thread's own kstack range (already proven fully covered
+	 * and path-protected above) rather than trusting the two are
+	 * consistent by construction.
+	 */
+	register_t pcb_rsp;
+	bool pcb_rsp_valid;
+	char comm[MAXCOMLEN + 1];
+	/*
+	 * K24-T00: this thread's own staged td_pcb pointer value (a
+	 * kernel virtual address, boot-invariant layout) -- captured
+	 * unconditionally alongside pcb_rsp above so the resume
+	 * continuation's switch-time provenance check (see
+	 * k24t00_staged_pcb_page_g[]/hibernate_k24t00_pcb_is_staged(),
+	 * below) has every staged thread's PCB page available, not just
+	 * the ones whose deeper pcb_rsp read also succeeded.
+	 */
+	vm_offset_t pcb_va;
+	/*
+	 * K24-T00 round 27: this thread's own staged struct thread *
+	 * pointer value (thread_cursor at capture time), so the
+	 * populate-pass offender report below can name the exact
+	 * thread object a stash-resolution failure traces back to,
+	 * not just its pid/comm/tid.
+	 */
+	vm_offset_t td_va;
+	/*
+	 * K24-T00 round 31: this thread's own staged pcb->pcb_save
+	 * pointer (the FPU/XSAVE save area fpu_activate_sw()'s
+	 * restore_fpu_curthread() writes into on first use post-
+	 * resume). Captured from staged_thread_pcb (already read below
+	 * for pcb_rsp) rather than a fresh staged read. 0 if the pcb
+	 * read failed or pcb_save was NULL for this thread.
+	 */
+	vm_offset_t fpu_save_va;
 };
 
 static int
@@ -3722,6 +3820,99 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 					out[n].kstack_va = kva;
 					out[n].kstack_pages =
 					    staged_thread.td_kstack_pages;
+					out[n].pid = staged_proc.p_pid;
+					out[n].tid = staged_thread.td_tid;
+					out[n].pcb_va = (vm_offset_t)
+					    staged_thread.td_pcb;
+					out[n].td_va =
+					    (vm_offset_t)thread_cursor;
+					memcpy(out[n].comm,
+					    staged_proc.p_comm,
+					    sizeof(out[n].comm));
+					/*
+					 * K24-T00: capture this thread's own
+					 * staged pcb_rsp, read-only, for the
+					 * PCB sanity check below. td_pcb is
+					 * itself staged-image content (a
+					 * pointer value restored verbatim by
+					 * the eventual K-10 copy), so it must
+					 * be read via the SAME staged
+					 * accessor already used for every
+					 * other staged-image field in this
+					 * walk, not dereferenced directly.
+					 * A read failure here is recorded as
+					 * invalid, not fatal to the whole
+					 * enumeration -- the kstack entry
+					 * above is still valid and useful on
+					 * its own.
+					 */
+					if (staged_thread.td_pcb != NULL &&
+					    hibernate_md_staged_read(ha, wvec,
+						p,
+						(vm_offset_t)
+						    staged_thread.td_pcb,
+						&staged_thread_pcb,
+						sizeof(staged_thread_pcb)) ==
+					    0) {
+						out[n].pcb_rsp =
+						    staged_thread_pcb.pcb_rsp;
+						out[n].pcb_rsp_valid = true;
+						out[n].fpu_save_va =
+						    (vm_offset_t)
+							staged_thread_pcb
+							    .pcb_save;
+						/*
+						 * K24-T00: pcb_cr3
+						 * asymmetry check. Print
+						 * one line per thread of
+						 * interest (syslogd, devd,
+						 * and one kernel-only
+						 * control) comparing this
+						 * thread's own staged
+						 * pcb_cr3 against the live
+						 * kernel_pmap->pm_cr3,
+						 * safe here (pre-copy,
+						 * same safety window as
+						 * the existing kstack
+						 * coverage printf several
+						 * lines below).
+						 */
+						if (staged_proc.p_pid ==
+						    871 ||
+						    staged_proc.p_pid ==
+							601 ||
+						    staged_proc.p_pid == 0) {
+							printf(
+							    "hibernate: k24t00: pcb_cr3 check: pid=%d comm=%s pcb_cr3=%#jx kernel_pmap_cr3=%#jx %s\n",
+							    (int)staged_proc
+								.p_pid,
+							    staged_proc
+								.p_comm,
+							    (uintmax_t)
+								staged_thread_pcb
+								    .pcb_cr3,
+							    (uintmax_t)
+								kernel_pmap
+								    ->pm_cr3,
+							    (vm_paddr_t)
+									staged_thread_pcb
+									    .pcb_cr3 ==
+								kernel_pmap
+								    ->pm_cr3 ?
+								"EQUAL" :
+								"NOT-EQUAL");
+						}
+					} else {
+						out[n].pcb_rsp = 0;
+						out[n].pcb_rsp_valid = false;
+						out[n].fpu_save_va = 0;
+					}
+					if (staged_proc.p_pid == 871 ||
+					    staged_proc.p_pid == 601) {
+						hibernate_k24t04_raw_marker(
+						    'W');
+						hibernate_k24t04_raw_uint(1);
+					}
 					n++;
 				}
 				thread_cursor = TAILQ_NEXT(&staged_thread,
@@ -5029,6 +5220,10 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			}
 
 			selfcopied = 0;
+			u_int k24t31_fpu_attempted = 0;
+			u_int k24t31_fpu_unresolved = 0;
+			u_int k24t31_fpu_stashed = 0;
+			/*
 			for (i = 0; i < nthreads; i++) {
 				struct hibernate_md_walk walk;
 				vm_offset_t va;
@@ -5145,6 +5340,33 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						se->va = va;
 						se->leaf_pa = walk.hmw_pa;
 						se->flags = walk.hmw_flags;
+						se->is_fpu = false;
+						/*
+						 * K24-T00 round 26: the
+						 * post-copy install pass
+						 * (acpi.c) reports 13
+						 * deterministic failures
+						 * every run, all at the
+						 * identical va
+						 * 0x6f69d50c0311000 with
+						 * reason=1 (misaligned
+						 * va/leaf_pa in
+						 * hibernate_md_kva_install()).
+						 * That va cannot be a real
+						 * kstack VA produced by
+						 * this loop (va is always
+						 * page-aligned here by
+						 * construction). Print, at
+						 * the trusted pre-copy
+						 * population site, the
+						 * pid/comm/tid of whichever
+						 * thread's iteration writes
+						 * this exact va into the
+						 * stash, so the install-
+						 * time failure can be
+						 * correlated back to its
+						 * true originating thread.
+						 */
 						k24t00_kstack_stash_n++;
 					 * K24-T00 round 15 RESULT: the test
 					 * above (disabling this install for
@@ -5200,6 +5422,131 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 						inst_pages++;
 
 					/*
+				 * K24-T00 round 31: stash this thread's own
+				 * pcb->pcb_save (FPU/XSAVE save area) pages
+				 * the same way the kstack loop above stashes
+				 * td_kstack pages -- resolved from the
+				 * image's own saved tables via the identical
+				 * hib_staged_leaf(), stored as (va, leaf_pa,
+				 * flags) in the same stash array/mechanism
+				 * the post-copy install pass (acpi.c) already
+				 * consumes. is_fpu=true marks these entries
+				 * so the install pass can force PG_RW on
+				 * them (see acpi.c's own comment for why) and
+				 * so the verifier can report them separately
+				 * from kstack pages.
+				 *
+				 * Round 30's live DDB capture proved the
+				 * concrete failure mode: fpu_activate_sw()'s
+				 * memmove() into pcb_save faulted with
+				 * "supervisor write data, protection
+				 * violation" at a mapped-but-read-only page
+				 * -- not missing. Resolution failures here
+				 * are counted (k24t31_fpu_unresolved) but do
+				 * not block the thread's kstack stash above;
+				 * this is strictly additive.
+				 */
+				if (threads[i].fpu_save_va != 0) {
+					vm_offset_t fpu_lo, fpu_hi, fva;
+
+					fpu_lo = trunc_page(
+					    threads[i].fpu_save_va);
+					fpu_hi = trunc_page(
+					    threads[i].fpu_save_va +
+					    cpu_max_ext_state_size - 1);
+					for (fva = fpu_lo; fva <= fpu_hi;
+					    fva += PAGE_SIZE) {
+						struct hibernate_md_walk
+						    fpu_walk;
+
+						k24t31_fpu_attempted++;
+						if (!hib_staged_leaf(ha, wvec,
+						    p, fva, &fpu_walk)) {
+							k24t31_fpu_unresolved++;
+							continue;
+						}
+						if (k24t00_kstack_stash_n <
+						    K24T00_KSTACK_STASH_MAX) {
+							struct
+							    k24t00_kstack_stash_entry
+								*fse;
+
+							fse = (struct
+							    k24t00_kstack_stash_entry
+								*)
+							    PHYS_TO_DMAP(
+								layout
+								    .stash_pa) +
+							    k24t00_kstack_stash_n;
+							fse->va = fva;
+							fse->leaf_pa =
+							    fpu_walk.hmw_pa;
+							/*
+							 * Force PG_RW (and
+							 * PG_V) regardless
+							 * of the image's
+							 * own saved flags.
+							 * fpu_activate_sw()'s
+							 * restore path
+							 * WRITES into this
+							 * page every time
+							 * it runs (the
+							 * round 30 fault is
+							 * exactly that
+							 * write failing);
+							 * unlike a kstack
+							 * leaf (whose
+							 * image-saved
+							 * flags are
+							 * trusted as-is), a
+							 * pcb_save page is
+							 * never correct
+							 * read-only, so
+							 * forcing
+							 * writability here
+							 * is specific to
+							 * this one content
+							 * class, not a
+							 * generic
+							 * override. NX/U
+							 * are still
+							 * preserved from
+							 * the image: this
+							 * page's
+							 * executability/
+							 * user-
+							 * accessibility
+							 * semantics are
+							 * unrelated to the
+							 * bug and must not
+							 * be touched. Do
+							 * NOT apply this
+							 * force-writable
+							 * treatment to any
+							 * other content
+							 * class (e.g.
+							 * kstack text/
+							 * data, kernel
+							 * .rodata) whose
+							 * read-only
+							 * disposition in
+							 * the image is
+							 * intentional and
+							 * must be
+							 * preserved as-is.
+							 */
+							fse->flags =
+							    (fpu_walk
+								    .hmw_flags |
+								X86_PG_V |
+								X86_PG_RW);
+							fse->is_fpu = true;
+							k24t00_kstack_stash_n++;
+							k24t31_fpu_stashed++;
+						}
+					}
+				}
+				/*
 			 * K24-T00 round 24: self-copy-protect
 			 * k24t00_kstack_stash_n immediately after the last
 			 * write to it, exactly like k24t00_staged_pcb_
