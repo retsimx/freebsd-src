@@ -148,6 +148,7 @@ int uart_bus_probe(device_t dev, int regshft, int regiowidth, int rclk, int rid,
 int uart_bus_sysdev(device_t dev);
 
 void uart_sched_softih(struct uart_softc *, uint32_t);
+void uart_hibernate_reseed_sysdev_ops(void);
 
 int uart_tty_attach(struct uart_softc *);
 int uart_tty_detach(struct uart_softc *);

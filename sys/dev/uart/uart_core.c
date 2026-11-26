@@ -230,6 +230,51 @@ uart_add_sysdev(struct uart_devinfo *di)
 	SLIST_INSERT_HEAD(&uart_sysdevs, di, next);
 }
 
+/*
+ * K24-T00: hibernate-resume fixup for struct uart_softc's own KOBJ_FIELDS
+ * ("ops", the compiled method-dispatch cache pointer set once by
+ * kobj_init() in uart_bus_probe()).  This is a SEPARATE kobj instance
+ * from the per-device_t one device_hibernate_ops_snapshot_capture/
+ * replay() (sys/kern/subr_bus.c) already fixes: uart_softc is the
+ * *softc*, a distinct malloc(M_UART) allocation (uart_bus_attach()),
+ * not the device_t object itself.
+ *
+ * The restored image's sc->ops is a dangling pointer: it names the
+ * SAVE boot's own struct kobj_ops allocation (kobj_class_compile()'s
+ * per-boot malloc), an address this RESUME boot never allocated and
+ * may not even map.  Confirmed fault: uart_grab() -> UART_GRAB(sc) ->
+ * kobj dispatch through this exact stale sc->ops, cr2 in a
+ * 0xfffff800... KVA region with no backing mapping this boot.
+ *
+ * Fixed by re-deriving live, exactly like kobj_init()'s own first-call
+ * site (uart_bus_probe()): point sc->ops back at this boot's own
+ * sc->sc_class->ops, compiling it if this is the first reference
+ * (kobj_class_compile() is idempotent and self-synchronizing).  This
+ * is preferred over caching/protecting the old pointer value, per the
+ * established rule for this bug class: re-derive from live state
+ * rather than protect stale content.
+ *
+ * Walks uart_sysdevs only: the console and debug-port uart_softc
+ * instances are the ones reachable from cngrab()/cnungrab() (via
+ * struct consdev's cn_grab/cn_ungrab) during KDB entry on the
+ * hibernate-resume path, before any other device's attach/resume
+ * method has had a chance to run.  Ordinary newbus-attached uart(4)
+ * instances go through the normal device resume path instead
+ * (uart_bus_resume() -> UART_ATTACH(), which re-derives everything
+ * needed on its own).
+ */
+void
+uart_hibernate_reseed_sysdev_ops(void)
+{
+	struct uart_devinfo *di;
+
+	SLIST_FOREACH(di, &uart_sysdevs, next) {
+		if (di->sc != NULL && di->sc->sc_class != NULL)
+			kobj_init((kobj_t)di->sc,
+			    (kobj_class_t)di->sc->sc_class);
+	}
+}
+
 const char *
 uart_getname(struct uart_class *uc)
 {

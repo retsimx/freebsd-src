@@ -98,6 +98,8 @@
 #include <dev/acpica/acpiio.h>
 
 #include <dev/pci/pcivar.h>
+#include <dev/uart/uart.h>
+#include <dev/uart/uart_bus.h>
 
 #include <vm/vm_param.h>
 
@@ -5830,6 +5832,18 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 				}
 			}
 		}
+		/*
+		 * K24-T00: re-derive the console/debug-port uart_softc's own
+		 * kobj ops pointer (a SEPARATE kobj instance from the
+		 * per-device_t one -- see uart_hibernate_reseed_sysdev_ops()'s
+		 * declaration comment in sys/dev/uart/uart_bus.h) before any
+		 * code on this path can call cngrab()/cnungrab(), which is
+		 * what kdb_enter() does on first entry.  Confirmed fault:
+		 * uart_grab() dispatching through the restored image's
+		 * dangling sc->ops, a SAVE-boot kobj_ops allocation this
+		 * RESUME boot never made.
+		 */
+		uart_hibernate_reseed_sysdev_ops();
 		/*
 		 * clear HIB_STAGE_RESERVED before unwinding on this
 		 * specific EJUSTRETURN resume-continuation path, so

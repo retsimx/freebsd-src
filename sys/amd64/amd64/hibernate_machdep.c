@@ -7945,6 +7945,50 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 		}
 		if (error == 0) {
 			/*
+			 * K24-T00: struct uart_class's own compiled kobj_ops
+			 * dispatch cache (sys/dev/uart/uart.h,
+			 * uart_hibernate_nclasses()/
+			 * uart_hibernate_class_selfcopy_range()).  A
+			 * separate object from the per-device_t ops caches
+			 * walked just above: uart_class_set is a DATA_SET,
+			 * not a devclass, and the console/debug-port
+			 * uart_softc (struct uart_devinfo's own "sc", e.g.
+			 * uart_dbgport in uart_dbg.c) is never attached via
+			 * newbus, so it is outside bus_data_devices too.
+			 * This boot's own kobj_class_compile() output,
+			 * never the saved image's -- copy_leaf=true, same
+			 * rule as every sibling in this class.
+			 */
+			extern u_int uart_hibernate_nclasses(void);
+			extern void uart_hibernate_class_selfcopy_range(
+			    u_int, uintptr_t *, size_t *);
+			u_int uc_n, uc_idx;
+
+			uc_n = uart_hibernate_nclasses();
+			for (uc_idx = 0; uc_idx < uc_n && error == 0;
+			    uc_idx++) {
+				uintptr_t uc_va;
+				size_t uc_len;
+				vm_offset_t uc_pg, uc_end;
+
+				uart_hibernate_class_selfcopy_range(uc_idx,
+				    &uc_va, &uc_len);
+				if (uc_va == 0 || uc_len == 0)
+					continue;
+				uc_pg = trunc_page((vm_offset_t)uc_va);
+				uc_end = round_page(
+				    (vm_offset_t)uc_va + uc_len);
+				for (; uc_pg < uc_end; uc_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3, uc_pg,
+					    true, &selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+		}
+		if (error == 0) {
+			/*
 			 * DSA00 "keg topology" round: capture every keg's
 			 * own three per-domain slab-list HEAD pointers from
 			 * the STAGED (saved) image, via hibernate_md_staged_

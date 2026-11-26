@@ -34,7 +34,51 @@
 #include <machine/vmparam.h>
 
 #include <dev/uart/uart.h>
+#include <dev/uart/uart_bus.h>
 #include <dev/uart/uart_cpu.h>
+
+/*
+ * K24-T00: see the declaration comment in uart.h.  SET_FOREACH over
+ * uart_class_set, counting/returning only classes whose kobj_ops cache
+ * has actually been compiled (uc->ops != NULL) -- an uncompiled class
+ * has no cache yet to protect, matching device_hibernate_nclasses()'s
+ * own "driver->ops != NULL" test exactly.
+ */
+u_int
+uart_hibernate_nclasses(void)
+{
+	struct uart_class **puc;
+	u_int n;
+
+	n = 0;
+	SET_FOREACH(puc, uart_class_set) {
+		if ((*puc)->ops != NULL)
+			n++;
+	}
+	return (n);
+}
+
+void
+uart_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
+    size_t *len_out)
+{
+	struct uart_class **puc;
+	u_int n;
+
+	*va_out = 0;
+	*len_out = 0;
+	n = 0;
+	SET_FOREACH(puc, uart_class_set) {
+		if ((*puc)->ops == NULL)
+			continue;
+		if (n == idx) {
+			*va_out = (uintptr_t)(*puc)->ops;
+			*len_out = sizeof(*(*puc)->ops);
+			return;
+		}
+		n++;
+	}
+}
 
 #define	UART_TAG_BR	0
 #define	UART_TAG_CH	1

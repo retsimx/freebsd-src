@@ -120,6 +120,26 @@ extern struct uart_class uart_quicc_class __attribute__((weak));
 extern struct uart_class uart_z8530_class __attribute__((weak));
 
 /*
+ * K24-T00: hibernate self-copy support for struct uart_class's own
+ * compiled kobj_ops dispatch cache (uc_ops/the KOBJ_CLASS_FIELDS "ops"
+ * member, populated by kobj_class_compile() the first time any class in
+ * uart_class_set is instantiated -- see uart_bus_probe()'s kobj_init()).
+ *
+ * This cache is a SEPARATE object from the per-device_t kobj cache that
+ * device_hibernate_class_selfcopy_range()/device_hibernate_ops_snapshot_*
+ * (sys/kern/subr_bus.c) already protect: uart_class_set is a DATA_SET,
+ * not a devclass, and struct uart_devinfo's own "sc" (the console/
+ * debug-port uart_softc, e.g. uart_dbgport in uart_dbg.c) is never
+ * inserted into bus_data_devices, so neither existing walk reaches it.
+ * Enumerated the same way uart_parse_class() already walks this exact
+ * set (uart_subr.c), idx-based like the device-class walk above so
+ * callers loop idx from 0 while *va_out != 0.
+ */
+u_int	uart_hibernate_nclasses(void);
+void	uart_hibernate_class_selfcopy_range(u_int idx, uintptr_t *va_out,
+	    size_t *len_out);
+
+/*
  * Device flags.
  */
 #define	UART_FLAGS_CONSOLE(f)		((f) & 0x10)
