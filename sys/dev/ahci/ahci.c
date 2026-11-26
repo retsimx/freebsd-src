@@ -1096,6 +1096,58 @@ static int
 ahci_ch_resume(device_t dev)
 {
 	struct ahci_channel *ch = device_get_softc(dev);
+	uint64_t k24t00_junk = 0xdeadc0dedeadc0deULL;
+
+	/*
+	 * K24-T00: direct capture confirmed ch->r_mem ITSELF (the
+	 * struct resource * pointer, not merely a field cached inside an
+	 * otherwise-live resource -- contrast HPET's hpet_resume() fix,
+	 * where sc->mem_res was a valid pointer and only its internally
+	 * cached start/size were stale) reads as
+	 * 0xdeadc0dedeadc0de, UMA's own debug "junk" poison
+	 * (sys/vm/uma_dbg.c): a one-shot diagnostic printf's own call to
+	 * rman_get_start(ch->r_mem) faulted with %rax ==
+	 * 0xdeadc0dedeadc0de, proving ch->r_mem's backing page was free
+	 * (and so filled with junk) at hibernate-image capture time --
+	 * the same destination-set-accounting-gap shape VGA's softc had
+	 * (a UMA-backed allocation whose backing page never fell inside
+	 * the image's own destination set), here affecting one field of
+	 * an otherwise-live channel softc rather than the whole
+	 * structure.
+	 *
+	 * device_get_softc(dev) itself is a LIVE lookup (ivars are owned
+	 * by this boot's own device tree, not image content) -- ch's own
+	 * address and its directly-adjacent fields (dev, unit) are
+	 * sound, as confirmed by %rbx/%rdi in the fault's own register
+	 * dump holding plausible live kernel addresses, not poison. Only
+	 * ch->r_mem's CONTENTS are the restored image's stale snapshot.
+	 * A live lookup cannot repair this the way HPET's fix repaired
+	 * mem_res's cached start/size: HPET's bus_space_map()/
+	 * rman_set_bushandle() re-derive a MAPPING from the live device
+	 * tree's resource-list bookkeeping while reusing the SAME,
+	 * already-valid struct resource pointer; here the pointer slot
+	 * itself is poison, so there is no existing resource object to
+	 * re-map into. Re-allocating a fresh resource
+	 * (bus_alloc_resource_any()) at RESUME is not attempted here:
+	 * that is attach-time machinery with side effects (rman
+	 * reservation bookkeeping) this resume path has no mandate to
+	 * re-run, and AHCI re-initialization is not required for this
+	 * harness (no disk I/O occurs during resume; the disk's own
+	 * content is already correct from the save/restore image
+	 * itself, independent of whether this channel's MMIO is
+	 * reinitialized). The guarded no-op, same disposition as VGA,
+	 * is therefore the right fix here too, not a stopgap: skip
+	 * channel re-initialization, name the poison, and return
+	 * cleanly.
+	 */
+	if ((uint64_t)ch->r_mem == k24t00_junk) {
+		device_printf(dev,
+		    "hibernate: k24t00: ahci_ch_resume: ch->r_mem reads "
+		    "as UMA junk (%p) -- backing page was not part of "
+		    "the image's destination set; skipping channel "
+		    "re-initialization\n", ch->r_mem);
+		return (0);
+	}
 
 	mtx_lock(&ch->mtx);
 	ahci_ch_init(dev);
