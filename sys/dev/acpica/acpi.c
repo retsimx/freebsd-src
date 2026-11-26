@@ -4427,6 +4427,193 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 		u_int stopped;
 
 		stopped = k24t00_exclude_stop_threads();
+		printf("hibernate: k24t00: exclude stop: recorded=%u "
+		    "stopped=%u\n",
+		    k24t00_exclude_n, stopped);
+	}
+	/*
+	 * K24-T31: give every live thread a valid, writable FPU save
+	 * area post-copy, allocating fresh where the image carries
+	 * none. Root cause (this round's own captured fault): "fpu
+	 * stash populate: attempted=114 stashed=71 unresolved=43" --
+	 * the saved image's own tables simply do not carry 43 of 114
+	 * FPU/XSAVE save-area pages, so no install can ever place them
+	 * (the stash-based install below can only place what the image
+	 * DOES carry). fpu_activate_sw()'s own write into pcb->pcb_save
+	 * is what then faults, as captured. Same single-BSP-actor,
+	 * no-sleepable-lock, strictly-before-acpi_s4_resume_scheduler_
+	 * aps() constraint as every other block here -- allproc is
+	 * walked with NO lock, identical to hibernate_k24t00_kstack_
+	 * verify()'s own proven-safe traversal immediately below.
+	 * pmap_page_alloc_below_4g(), not fpu_save_area_alloc()
+	 * (uma_zalloc(..., M_WAITOK) can sleep -- unsafe here), is used
+	 * for the replacement page, mirroring hibernate_md_kva_
+	 * install()'s own existing allocator choice for this identical
+	 * constraint. Fails closed: an allocation or install failure
+	 * panics rather than releasing a thread into state that will
+	 * fault.
+	 *
+	 * K24-T31 REVERT NOTE: disabled below (#if 0) after an 8-run
+	 * campaign showed this block introduces its own new fault --
+	 * confirmed by offline disassembly, acpi_s4_resume_bsp+0x4e7
+	 * resolves to THIS block's own unprotected LIST_FOREACH(fp,
+	 * &allproc, p_list) walk (3/16 runs in a follow-up campaign).
+	 * Root cause: allproc's own p_list chain is documented,
+	 * pre-existing, post-copy image content not corrected until
+	 * hibernate_resume_rebuild_allproc() runs, much later, inside
+	 * acpi_EnterSleepState() rather than this earlier-called
+	 * acpi_s4_resume_bsp() -- the same "whole-graph" corruption
+	 * class that call site's own comment documents recurring at a
+	 * different node pair each round. A per-node plausibility
+	 * guard (the existing k24t00_trace_allproc_point() pattern) is
+	 * insufficient: the fault is a mid-list dereference, not the
+	 * list head. Disabled rather than fixed in place because
+	 * moving this logic past hibernate_resume_rebuild_allproc()
+	 * requires crossing a function boundary, out of scope for a
+	 * surgical patch this round. The original FPU-activation fault
+	 * this block was added to fix is therefore unresolved again
+	 * while this stays disabled.
+	 */
+	/*
+	 * K24-T31: re-enabled. Rewritten to iterate the RECORDED staged-
+	 * thread list (k24t31_recorded_threads_ptr(), hibernate_
+	 * machdep.c) instead of allproc/p_list directly -- see that
+	 * list's own declaration comment for the full account of why
+	 * walking allproc here faulted (acpi_s4_resume_bsp+0x4e7,
+	 * confirmed by offline disassembly). The recorded list is
+	 * immune to that corruption; the double loop (LIST_FOREACH +
+	 * FOREACH_THREAD_IN_PROC) collapses to one flat loop since the
+	 * recorded list is already per-thread.
+	 */
+	{
+		extern bool k24t00_hib_md_safe_resolve_pub(vm_paddr_t,
+		    vm_offset_t, vm_paddr_t *);
+		extern bool k24t00_live_pte_read_pub(vm_offset_t,
+		    uint64_t *);
+		extern int hibernate_md_kva_install_pub(vm_offset_t,
+		    vm_paddr_t, uint64_t, bool);
+		extern struct k24t31_recorded_thread {
+			struct thread *td;
+			pid_t pid;
+			lwpid_t tid;
+			char comm[MAXCOMLEN + 1];
+			vm_offset_t fpu_save_va;
+		} *k24t31_recorded_threads_ptr(void);
+		extern u_int k24t31_recorded_threads_count(void);
+		struct k24t31_recorded_thread *k24t31_rlist;
+		u_int k24t31_rn, k24t31_ri;
+		struct proc *fp;
+		struct thread *ft;
+		u_int fpu_replaced, fpu_missing, fpu_readonly;
+		u_int fpu_reported;
+
+		fpu_replaced = 0;
+		fpu_missing = 0;
+		fpu_readonly = 0;
+		fpu_reported = 0;
+		k24t31_rlist = k24t31_recorded_threads_ptr();
+		k24t31_rn = k24t31_recorded_threads_count();
+		for (k24t31_ri = 0; k24t31_ri < k24t31_rn; k24t31_ri++) {
+			{
+				struct pcb *fpcb;
+				vm_offset_t flo, fhi, ffva;
+				bool need_replace;
+				vm_paddr_t fpa;
+				uint64_t fpte;
+
+				ft = k24t31_rlist[k24t31_ri].td;
+				fp = ft->td_proc;
+				fpcb = ft->td_pcb;
+				if (fpcb == NULL || fpcb->pcb_save == NULL)
+					continue;
+				if (cpu_max_ext_state_size > PAGE_SIZE) {
+					panic("hibernate: k24t31: FPU "
+					    "save area (%u bytes) exceeds "
+					    "one page -- single-page "
+					    "replacement assumption "
+					    "violated",
+					    cpu_max_ext_state_size);
+				}
+				flo = trunc_page(
+				    (vm_offset_t)fpcb->pcb_save);
+				fhi = trunc_page(
+				    (vm_offset_t)fpcb->pcb_save +
+				    cpu_max_ext_state_size - 1);
+				need_replace = false;
+				for (ffva = flo; ffva <= fhi;
+				    ffva += PAGE_SIZE) {
+					if (!k24t00_hib_md_safe_resolve_pub(
+					    kernel_pmap->pm_cr3, ffva,
+					    &fpa)) {
+						fpu_missing++;
+						need_replace = true;
+						continue;
+					}
+					if (k24t00_live_pte_read_pub(ffva,
+					    &fpte) &&
+					    (fpte & X86_PG_RW) == 0) {
+						fpu_readonly++;
+						need_replace = true;
+					}
+				}
+				if (!need_replace)
+					continue;
+				{
+					vm_page_t m_fpu;
+					vm_paddr_t fpu_new_pa;
+					void *fpu_new_va;
+					int ierr;
+
+					m_fpu = pmap_page_alloc_below_4g(
+					    true);
+					if (m_fpu == NULL) {
+						panic("hibernate: k24t31: "
+						    "FPU replacement "
+						    "allocation failed for "
+						    "pid=%d comm=%s -- "
+						    "refusing to release "
+						    "into a faulting state",
+						    (int)fp->p_pid,
+						    fp->p_comm);
+					}
+					fpu_new_pa =
+					    VM_PAGE_TO_PHYS(m_fpu);
+					fpu_new_va = (void *)PHYS_TO_DMAP(
+					    fpu_new_pa);
+					bzero(fpu_new_va, PAGE_SIZE);
+					ierr = hibernate_md_kva_install_pub(
+					    trunc_page((vm_offset_t)
+					    fpu_new_va), fpu_new_pa,
+					    X86_PG_V | X86_PG_RW, true);
+					if (ierr != 0) {
+						panic("hibernate: k24t31: "
+						    "FPU replacement "
+						    "install failed "
+						    "(err=%d) for pid=%d "
+						    "comm=%s -- refusing",
+						    ierr, (int)fp->p_pid,
+						    fp->p_comm);
+					}
+					if (fpu_reported < 16) {
+						printf("hibernate: k24t31: "
+						    "fpu_replaced: pid=%d "
+						    "comm=%s old=%p new=%p\n",
+						    (int)fp->p_pid,
+						    fp->p_comm,
+						    fpcb->pcb_save,
+						    fpu_new_va);
+						fpu_reported++;
+					}
+					fpcb->pcb_save =
+					    (struct savefpu *)fpu_new_va;
+					fpu_replaced++;
+				}
+			}
+		}
+		printf("hibernate: k24t31: fpu replace summary: "
+		    "fpu_replaced=%u fpu_missing=%u fpu_readonly=%u\n",
+		    fpu_replaced, fpu_missing, fpu_readonly);
+	}
 	acpi_s4_resume_scheduler_aps(sc, susp_cpus);
 	acpi_s4_resume_interrupts(intr_state);
 	acpi_s4_resume_clocks(sc);

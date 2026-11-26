@@ -1211,6 +1211,44 @@ struct k24t00_exclude_entry {
 struct k24t00_exclude_entry k24t00_exclude_list[K24T00_EXCLUDE_MAX];
 u_int k24t00_exclude_n;
 
+/*
+ * K24-T31: the recorded staged-thread list. Every post-copy, pre-
+ * release pass that needs "every live staged thread" (the kstack
+ * verifier, the FPU-area presence check, the FPU-area replacement
+ * pass) previously walked the kernel's own allproc/p_list -- which is
+ * documented, pre-existing, post-copy IMAGE CONTENT, not corrected
+ * until hibernate_resume_rebuild_allproc() runs, much later, inside
+ * acpi_EnterSleepState() (see that call site's own "whole-graph
+ * corruption... recurring at a different node pair each round"
+ * comment). Walking allproc before that rebuild runs is walking a
+ * known-corrupt list; this is what produced acpi_s4_resume_bsp+0x4e7
+ * (the FPU-replacement block's own allproc walk) and, in earlier
+ * rounds, hibernate_k24t00_kstack_verify()'s own crash inside its own
+ * walk.
+ *
+ * Fix: record this exact same thread set -- the populate pass already
+ * enumerates it into threads[] via hibernate_md_enumerate_staged_
+ * threads() -- into this protected, persistent array, PRE-copy, and
+ * have every post-copy walk iterate THIS array instead of allproc.
+ * The pointers were valid at capture (pre-copy, read from the staged
+ * image's own tables, same source hibernate_md_enumerate_staged_
+ * threads() already proves correct for every other per-thread use in
+ * this file) and the array itself is self-copy-protected (below),
+ * exactly like k24t00_kstack_stash_n/k24t00_exclude_list -- so this
+ * traversal is immune to the allproc corruption class regardless of
+ * when it runs relative to hibernate_resume_rebuild_allproc().
+ */
+struct k24t31_recorded_thread {
+	struct thread *td;
+	pid_t pid;
+	lwpid_t tid;
+	char comm[MAXCOMLEN + 1];
+	vm_offset_t fpu_save_va;
+};
+struct k24t31_recorded_thread
+    k24t31_recorded_threads[HIB_STAGED_PCB_PAGE_MAX];
+u_int k24t31_recorded_n;
+
 
 struct hibernate_md_arena_layout {
 	vm_paddr_t header_pa; /* 256 B: struct hibernate_arena_header. */
@@ -2407,6 +2445,300 @@ k24t00_td_is_excluded(struct thread *td)
 
 u_int	hibernate_k24t00_kstack_verify(void);
 u_int
+hibernate_k24t00_kstack_verify(void)
+{
+	extern void hibernate_k24t04_raw_marker(int c);
+	struct proc *p;
+	struct thread *td, *self;
+	u_int threads_checked, pages_checked, pages_missing;
+
+	threads_checked = 0;
+	pages_checked = 0;
+	pages_missing = 0;
+	k24t00_kv_offender_n = 0;
+	k24t00_kv_superpage_covered = 0;
+	k24t00_kv_excluded_threads = 0;
+	k24t00_kv_readonly = 0;
+	self = curthread;
+
+	/*
+	 * K24-T31: iterate the RECORDED staged-thread list, not allproc/
+	 * p_list directly -- allproc's own chain is documented, pre-
+	 * existing, post-copy IMAGE CONTENT, not corrected until
+	 * hibernate_resume_rebuild_allproc() runs, much later, inside
+	 * acpi_EnterSleepState(). This function previously crashed
+	 * inside this exact walk for that reason. k24t31_recorded_
+	 * threads[] (populated pre-copy from the identical staged-
+	 * thread enumeration this file already trusts for every other
+	 * per-thread use, self-copy-protected like every other
+	 * populate-pre-copy/read-post-copy global here) is immune to
+	 * that corruption regardless of when this function runs. Each
+	 * entry's own td pointer was valid at capture; td->td_proc is
+	 * dereferenced directly (not re-looked-up via allproc) for the
+	 * identical reason. Still single-BSP-actor, no-sleepable-lock --
+	 * safe by exclusion, same reasoning as before, over a
+	 * trustworthy list now. The former double loop (LIST_FOREACH +
+	 * FOREACH_THREAD_IN_PROC) collapses to one flat loop since the
+	 * recorded list is already per-THREAD, not per-proc.
+	 */
+	k24t00_kv_fpu_offender_n = 0;
+	k24t00_kv_fpu_pages_checked = 0;
+	k24t00_kv_fpu_pages_missing = 0;
+	k24t00_kv_fpu_threads_checked = 0;
+
+	{
+		extern struct k24t31_recorded_thread *
+		    k24t31_recorded_threads_ptr(void);
+		extern u_int k24t31_recorded_threads_count(void);
+		struct k24t31_recorded_thread *k24t31_rlist;
+		u_int k24t31_rn, k24t31_ri;
+
+		k24t31_rlist = k24t31_recorded_threads_ptr();
+		k24t31_rn = k24t31_recorded_threads_count();
+		/*
+		 * K24-T31: fail closed if pages were stashed but no
+		 * threads were recorded -- that means the recording
+		 * itself failed (a logic bug), not that there are
+		 * genuinely zero staged threads with a kstack to check.
+		 */
+		if (k24t31_rn == 0 && k24t00_kstack_stash_n != 0) {
+			panic("hibernate: k24t31: recorded thread list "
+			    "empty but k24t00_kstack_stash_n=%u -- "
+			    "recording failed, refusing to verify "
+			    "against an empty list",
+			    k24t00_kstack_stash_n);
+		}
+	for (k24t31_ri = 0; k24t31_ri < k24t31_rn; k24t31_ri++) {
+		td = k24t31_rlist[k24t31_ri].td;
+		p = td->td_proc;
+		{
+			vm_offset_t va, kstack_lo, kstack_hi;
+			u_int pg;
+
+			/*
+			 * K24-T00 round 29: a thread recorded in the
+			 * exclusion list was already stopped post-copy
+			 * (k24t00_exclude_stop_threads(), called by
+			 * acpi.c strictly before this verifier) precisely
+			 * because its own kstack page(s) are confirmed
+			 * absent from the saved image's own tables (round
+			 * 28). It is deliberately non-runnable, not an
+			 * undiagnosed gap -- count it separately and skip
+			 * the page-level check entirely so its known,
+			 * already-accounted-for gap can never surface as
+			 * a fail-closed panic.
+			 */
+			if (k24t00_td_is_excluded(td)) {
+				k24t00_kv_excluded_threads++;
+				continue;
+			}
+			threads_checked++;
+			kstack_lo = (vm_offset_t)td->td_kstack;
+			kstack_hi = kstack_lo +
+			    (vm_offset_t)td->td_kstack_pages * PAGE_SIZE;
+			for (pg = 0; pg < td->td_kstack_pages; pg++) {
+				vm_paddr_t live_pa;
+				vm_paddr_t sp_pa;
+				bool sp_covered;
+
+				va = kstack_lo + (vm_offset_t)pg * PAGE_SIZE;
+				pages_checked++;
+				/*
+				 * K24-T00 round 20: superpage-aware check.
+				 * hib_md_safe_resolve() itself already
+				 * follows a PD-level PG_PS entry down to a
+				 * resolved PA (see its own PG_PS_FRAME
+				 * branch) and returns true -- so a VA
+				 * covered by a superpage was NEVER actually
+				 * misreported as missing by the ORIGINAL
+				 * hib_md_safe_resolve()-based check above.
+				 * The new k24t00_pd_superpage_check() call
+				 * below exists only to DISTINGUISH, for
+				 * every VA hib_md_safe_resolve() already
+				 * resolved successfully, whether that
+				 * resolution went through a superpage or an
+				 * ordinary 4 KiB leaf -- the count this
+				 * round's task asks for -- without changing
+				 * which VAs count as present/missing at all
+				 * (that classification is, and remains,
+				 * hib_md_safe_resolve()'s own true/false
+				 * return, read first, unmodified).
+				 */
+				if (hib_md_safe_resolve(kernel_pmap->pm_cr3,
+				    va, &live_pa)) {
+					uint64_t kv_live_pte;
+
+					if (k24t00_pd_superpage_check(
+					    kernel_pmap->pm_cr3, va, &sp_pa,
+					    &sp_covered) && sp_covered)
+						k24t00_kv_superpage_covered++;
+					/*
+					 * K24-T00 round 31: present does not
+					 * imply writable. Round 30 proved a
+					 * kstack/FPU page can be mapped yet
+					 * read-only at this exact instant,
+					 * which a later write (e.g.
+					 * fpu_activate_sw()'s restore)
+					 * faults on identically to a missing
+					 * page. Count it, do not panic here
+					 * (distinct from `missing`'s own
+					 * fail-closed contract; this is the
+					 * new, additive check this round
+					 * adds).
+					 */
+					if (k24t00_live_pte_read(va,
+					    &kv_live_pte) &&
+					    (kv_live_pte & X86_PG_RW) == 0)
+						k24t00_kv_readonly++;
+					continue;
+				}
+				pages_missing++;
+				if (k24t00_kv_offender_n <
+				    K24T00_KV_OFFENDER_MAX) {
+					struct k24t00_kv_offender *o;
+					bool pt_present, pte_ok;
+
+					o = &k24t00_kv_offenders[
+					    k24t00_kv_offender_n++];
+					o->pid = p->p_pid;
+					memcpy(o->comm, p->p_comm,
+					    sizeof(o->comm) - 1);
+					o->comm[sizeof(o->comm) - 1] =
+					    '\0';
+					o->td = td;
+					o->td_tid = td->td_tid;
+					o->va = va;
+					o->va_in_kstack_range =
+					    (va >= kstack_lo &&
+					    va < kstack_hi);
+					o->is_curthread = (td == self);
+					k24t00_pt_page_state(
+					    kernel_pmap->pm_cr3, va,
+					    &pt_present, &pte_ok);
+					o->pt_page_present = pt_present;
+					o->pte_valid_recheck = pte_ok;
+				}
+			}
+
+			/*
+			 * K24-T00 round 21: FPU/XSAVE save area presence
+			 * check. pcb->pcb_save (struct savefpu *) is a
+			 * SEPARATE allocation from fpu_save_area_alloc()
+			 * (sys/amd64/amd64/vm_machdep.c
+			 * cpu_thread_alloc()), never part of td_kstack --
+			 * it is exactly the pointer restore_fpu_curthread()
+			 * (inlined into fpu_activate_sw(), the call
+			 * immediately following done_load_dr's own stack
+			 * write) dereferences via bcopy()/fpurestore().
+			 * Allocated for every thread regardless of
+			 * TDP_KTHREAD (cpu_thread_alloc() runs
+			 * unconditionally), so checked for every thread
+			 * here, matching the kstack check's own
+			 * unconditional scope. May span more than one page
+			 * (cpu_max_ext_state_size, not sizeof(struct
+			 * savefpu)); the area is only
+			 * XSAVE_AREA_ALIGN(64)-aligned, not necessarily
+			 * page-aligned, so every page it touches is walked
+			 * from trunc_page(start) to trunc_page(end - 1)
+			 * inclusive.
+			 */
+			{
+				struct pcb *pcb;
+				vm_offset_t fpu_lo, fpu_hi, fva;
+
+				pcb = td->td_pcb;
+				if (pcb != NULL && pcb->pcb_save != NULL) {
+					k24t00_kv_fpu_threads_checked++;
+					fpu_lo = trunc_page(
+					    (vm_offset_t)pcb->pcb_save);
+					fpu_hi = trunc_page(
+					    (vm_offset_t)pcb->pcb_save +
+					    cpu_max_ext_state_size - 1);
+					for (fva = fpu_lo; fva <= fpu_hi;
+					    fva += PAGE_SIZE) {
+						vm_paddr_t fpu_live_pa;
+
+						k24t00_kv_fpu_pages_checked++;
+						if (hib_md_safe_resolve(
+						    kernel_pmap->pm_cr3, fva,
+						    &fpu_live_pa)) {
+							uint64_t
+							    fpu_live_pte;
+
+							/*
+							 * K24-T00 round 31:
+							 * same present-but-
+							 * read-only check as
+							 * the kstack loop
+							 * above -- this is
+							 * exactly the
+							 * content class
+							 * round 30's live
+							 * fault was
+							 * reproduced
+							 * against.
+							 */
+							if (k24t00_live_pte_read(
+							    fva,
+							    &fpu_live_pte) &&
+							    (fpu_live_pte &
+								X86_PG_RW) ==
+							    0)
+								k24t00_kv_readonly++;
+							continue;
+						}
+						k24t00_kv_fpu_pages_missing++;
+						if (k24t00_kv_fpu_offender_n <
+						    K24T00_KV_FPU_OFFENDER_MAX) {
+							struct k24t00_kv_fpu_offender *fo;
+							bool pt_present, pte_ok;
+
+							fo = &k24t00_kv_fpu_offenders[
+							    k24t00_kv_fpu_offender_n++];
+							fo->pid = p->p_pid;
+							memcpy(fo->comm,
+							    p->p_comm,
+							    sizeof(fo->comm) - 1);
+							fo->comm[
+							    sizeof(fo->comm) - 1] =
+							    '\0';
+							fo->td = td;
+							fo->td_tid = td->td_tid;
+							fo->va = fva;
+							fo->page_index =
+							    (u_int)((fva -
+							    fpu_lo) /
+							    PAGE_SIZE);
+							fo->va_in_kstack_range =
+							    (fva >= kstack_lo &&
+							    fva < kstack_hi);
+							fo->is_curthread =
+							    (td == self);
+							k24t00_pt_page_state(
+							    kernel_pmap->pm_cr3,
+							    fva, &pt_present,
+							    &pte_ok);
+							fo->pt_page_present =
+							    pt_present;
+							fo->pte_valid_recheck =
+							    pte_ok;
+						}
+					}
+				}
+			}
+		}
+	}
+	}
+
+	hibernate_k24t04_raw_marker('K');
+	hibernate_k24t04_raw_uint((uint64_t)threads_checked);
+	hibernate_k24t04_raw_marker('L');
+	hibernate_k24t04_raw_uint((uint64_t)pages_checked);
+	hibernate_k24t04_raw_marker('M');
+	hibernate_k24t04_raw_uint((uint64_t)pages_missing);
+	return (pages_missing);
+}
+
 static bool
 hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
     const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
@@ -2837,6 +3169,28 @@ struct k24t00_exclude_entry *
 k24t00_exclude_ptr(void)
 {
 	return (k24t00_exclude_list);
+}
+
+/*
+ * K24-T31: cross-file accessor for every post-copy pass that needs
+ * "every live staged thread" without walking the kernel's own
+ * (documented-corrupt-at-that-point) allproc/p_list. k24t31_
+ * recorded_threads[] is a plain, self-copy-protected static array
+ * (see its own declaration comment), so this accessor is a trivial
+ * address-of, not an arena-layout lookup.
+ */
+struct k24t31_recorded_thread *k24t31_recorded_threads_ptr(void);
+struct k24t31_recorded_thread *
+k24t31_recorded_threads_ptr(void)
+{
+	return (k24t31_recorded_threads);
+}
+
+u_int k24t31_recorded_threads_count(void);
+u_int
+k24t31_recorded_threads_count(void)
+{
+	return (k24t31_recorded_n);
 }
 
 /*
@@ -3986,6 +4340,7 @@ hibernate_md_enumerate_staged_threads(const struct hibernate_attempt *ha,
 	k24t00_thread_fail_err = 0;
 	k24t00_kstack_stash_n = 0;
 	k24t00_exclude_n = 0;
+	k24t31_recorded_n = 0;
 	for (i = 0; i <= hash; i++) {
 		struct proc staged_proc;
 		u_int iter_guard;
@@ -5142,6 +5497,34 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			}
 
 			/*
+			 * K24-T31: record this exact same staged-thread set
+			 * into the protected, persistent array every post-
+			 * copy allproc-walking pass now iterates instead of
+			 * the kernel's own (documented-corrupt-at-that-
+			 * point) allproc/p_list. See k24t31_recorded_
+			 * threads[]'s own declaration comment for the full
+			 * account. One entry per thread (nthreads is
+			 * already <= HIB_STAGED_MAX_THREADS, the array this
+			 * global is sized to match).
+			 */
+			for (i = 0; i < nthreads &&
+			    k24t31_recorded_n < HIB_STAGED_MAX_THREADS;
+			    i++) {
+				struct k24t31_recorded_thread *rt;
+
+				rt = &k24t31_recorded_threads[
+				    k24t31_recorded_n];
+				rt->td = (struct thread *)threads[i].td_va;
+				rt->pid = threads[i].pid;
+				rt->tid = threads[i].tid;
+				memcpy(rt->comm, threads[i].comm,
+				    sizeof(rt->comm) - 1);
+				rt->comm[sizeof(rt->comm) - 1] = '\0';
+				rt->fpu_save_va = threads[i].fpu_save_va;
+				k24t31_recorded_n++;
+			}
+
+			/*
 			 * K24-T00 round 24: fail closed, pre-copy, if this
 			 * boot's own real requirement ever exceeds the
 			 * stash's capacity -- refusing here is cheap (no
@@ -5917,6 +6300,51 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					error = hibernate_md_selfcopy_walk(ha,
 					    wvec, p, kernel_pmap->pm_cr3,
 					    xl_pg, true, &xl_selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+			/*
+			 * K24-T31: self-copy-protect k24t31_recorded_n and
+			 * k24t31_recorded_threads[] the same way, immediately
+			 * after the last write to each -- same reasoning as
+			 * k24t00_exclude_n/k24t00_exclude_list immediately
+			 * above: this boot's own just-populated staged-
+			 * thread list, never the saved image's stale content
+			 * for this same address range. See k24t31_recorded_
+			 * threads[]'s own declaration comment for why this
+			 * list exists and what it replaces.
+			 */
+			if (error == 0) {
+				vm_offset_t rn_pg, rn_end;
+				u_int rn_selfcopied = 0;
+
+				rn_pg = trunc_page(
+				    (vm_offset_t)&k24t31_recorded_n);
+				rn_end = round_page(
+				    (vm_offset_t)&k24t31_recorded_n +
+				    sizeof(k24t31_recorded_n));
+				for (; rn_pg < rn_end; rn_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    rn_pg, true, &rn_selfcopied);
+					if (error != 0)
+						break;
+				}
+			}
+			if (error == 0) {
+				vm_offset_t rt_pg, rt_end;
+				u_int rt_selfcopied = 0;
+
+				rt_pg = trunc_page(
+				    (vm_offset_t)&k24t31_recorded_threads);
+				rt_end = round_page(
+				    (vm_offset_t)&k24t31_recorded_threads +
+				    sizeof(k24t31_recorded_threads));
+				for (; rt_pg < rt_end; rt_pg += PAGE_SIZE) {
+					error = hibernate_md_selfcopy_walk(ha,
+					    wvec, p, kernel_pmap->pm_cr3,
+					    rt_pg, true, &rt_selfcopied);
 					if (error != 0)
 						break;
 				}
