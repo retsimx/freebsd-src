@@ -112,8 +112,50 @@ static void
 vga_resume(device_t dev)
 {
 	vga_softc_t *sc;
+	uint64_t k24t00_junk = 0xdeadc0dedeadc0deULL;
 
 	sc = device_get_softc(dev);
+
+	/*
+	 * K24-T00: direct capture confirmed sc->adp, sc->state_buf, AND
+	 * sc->pal_buf all read as UMA's own debug "junk" poison
+	 * (0xdeadc0dedeadc0de, sys/vm/uma_dbg.c) simultaneously --
+	 * i.e. the entire vga_softc_t backing page, not one field, was
+	 * never part of the hibernate image's own destination set, so
+	 * the destructive copy left it as fresh, un-restored slab
+	 * content. This is the same destination-set-accounting-gap
+	 * class already fixed for periph_drivers[]/struct cam_periph/
+	 * struct cam_ed (sys/cam/cam_periph.c, sys/cam/cam_xpt.c) and
+	 * for DPCPU/the FPU save area -- the fourth confirmed instance
+	 * in this device-resume walk (after HPET's mem_res, ACPICA's
+	 * object caches, and this one).
+	 *
+	 * Unlike those three, there is no live device-tree lookup this
+	 * driver can use to re-derive sc->adp: vga_probe_unit() (the
+	 * attach-time path) runs once per unit at PROBE, not RESUME,
+	 * and re-running it here would re-probe hardware state this
+	 * function has no mandate to touch. VGA state/palette restore
+	 * is purely cosmetic on this harness (-display none, no actual
+	 * display consuming it), and sc->state_buf/sc->pal_buf are
+	 * themselves the same poisoned allocation -- there is nothing
+	 * genuine to restore even if adp were recoverable. The honest,
+	 * safe disposition is a guarded no-op: detect the poison
+	 * signature before any dereference, skip the state/palette
+	 * reload entirely, and say so plainly rather than silently
+	 * losing cosmetic state or guessing at a repaired pointer.
+	 */
+	if ((uint64_t)sc->adp == k24t00_junk ||
+	    (uint64_t)sc->state_buf == k24t00_junk ||
+	    (uint64_t)sc->pal_buf == k24t00_junk) {
+		device_printf(dev,
+		    "hibernate: k24t00: vga_resume: softc reads as "
+		    "UMA junk (adp=%p state_buf=%p pal_buf=%p) -- "
+		    "backing page was not part of the image's "
+		    "destination set; skipping cosmetic state/palette "
+		    "restore\n",
+		    sc->adp, sc->state_buf, sc->pal_buf);
+		return;
+	}
 
 	if (sc->state_buf != NULL) {
 		if (vidd_load_state(sc->adp, sc->state_buf) != 0)
