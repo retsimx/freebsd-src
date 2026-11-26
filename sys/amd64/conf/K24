@@ -1,0 +1,22 @@
+#
+# K24 -- Production-style kernel configuration for the S4 hibernate-resume
+# bench: GENERIC with the debug-only assertion/lock-order machinery
+# (WITNESS, INVARIANTS, INVARIANT_SUPPORT) disabled, matching a shipping
+# kernel. A shipping kernel does not carry these options; the hibernate
+# resume target here is a production-style kernel, not a debug kernel.
+#
+# The assertions these options enable remain available for debug builds
+# (GENERIC). Disabling them here is a deliberate trade, not an oversight:
+# the hibernate path documents several structures it restores across a
+# boot boundary, which is exactly what WITNESS/INVARIANTS police, so their
+# absence can convert what would have been a loud panic into silent
+# corruption, a hang, or a crash without diagnostic text. See the N=12
+# campaign notes for this config for where that trade was and was not
+# observed.
+#
+include GENERIC
+ident		K24
+
+nooptions	WITNESS
+nooptions	INVARIANTS
+nooptions	INVARIANT_SUPPORT
