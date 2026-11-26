@@ -46,6 +46,28 @@ static struct callout g_hibernate_deadline_callout;
 static struct root_hold_token *g_hibernate_root_hold;
 static struct g_hibernate_softc *g_hibernate_owner;
 static volatile u_int g_hibernate_complete;
+/*
+ * K24-T00: g_hibernate_claimed state values.
+ *   0 -- unclaimed: no taste has ever attempted discovery for the
+ *        configured provider (or a prior attempt fully completed and
+ *        reset nothing -- in practice state only ever returns to 0
+ *        implicitly via process exit, never explicitly after this fix).
+ *   1 -- an attempt owns discovery: either a live g_hibernate_softc
+ *        exists (admission in flight, protected by its own per-attempt
+ *        sc->deadline) or a taste call is briefly executing.
+ *   2 -- transient target value only: written by g_hibernate_deadline()
+ *        (the global, arg == NULL boot-time deadline) at the instant it
+ *        wins the race and panics; never read back as a stable state.
+ *   3 -- retry pending: a taste hit ENXIO on hibernate_dumper_lookup()
+ *        (the documented GEOM_HIBERNATE-races-ahead-of-GEOM_DEV ordering,
+ *        see g_hibernate_taste()'s "retryable" comment below) and is
+ *        waiting for hibernate_dumper_registered()'s retry
+ *        (g_hibernate_retry_event()) to re-taste once the dumper exists.
+ *        The root-mount hold stays open throughout (g_hibernate_complete_
+ *        probe() is not called on this path). Holding state at 3 instead
+ *        of releasing it to 0 is what prevents the global deadline from
+ *        treating a pending retry as "never tasted at all".
+ */
 static volatile u_int g_hibernate_claimed;
 
 static void g_hibernate_teardown_event(void *, int);
@@ -392,19 +414,107 @@ g_hibernate_deadline(void *arg)
 {
 	struct g_hibernate_softc *sc;
 	struct hibernate_marker_result result;
+	u_int cur;
 
 	sc = arg;
 	result = g_hibernate_error_result(ETIMEDOUT);
 	if (sc != NULL) {
-		(void)g_hibernate_publish_error(sc, ETIMEDOUT);
+		/*
+		 * K24-T00 (round 2): this is the PER-ATTEMPT deadline,
+		 * started only after g_hibernate_taste() has already
+		 * found the matching provider, located its registered
+		 * dumper, and opened admission (sc->admission_open = true
+		 * in g_hibernate_taste(), just above the
+		 * callout_reset(&sc->deadline, ...) that arms this
+		 * callout).  Firing here therefore means a genuine image
+		 * was found and admitted, but g_hibernate_worker() (the
+		 * kproc that calls hibernate_probe() to read the marker
+		 * and, if PENDING, hibernate_resume_attempt()) did not
+		 * finish within hc_wait_ms -- a second, previously
+		 * unguarded silent-cold-boot path distinct from the
+		 * global/state-3 one fixed above: g_hibernate_publish_
+		 * error() below closes admission and calls
+		 * g_hibernate_complete_probe() exactly like a genuine
+		 * "no image present" result, releasing the root-mount
+		 * hold with no panic and -- because admission_open was
+		 * true, not merely claimed -- WITHOUT ever going through
+		 * the state-3 "retry pending" path this round's earlier
+		 * fix covers.  Confirmed directly this round: K24
+		 * production-kernel N=12 after the first admission fix
+		 * still produced 7/12 cold boots with zero "hibernate:
+		 * k24t00"/"hibernate: k12" diagnostic prints and zero
+		 * admission-timeout panics -- this per-attempt path was
+		 * the remaining gap.
+		 *
+		 * Fail closed here too, for the identical reason: a
+		 * silent cold boot over a confirmed-present, confirmed-
+		 * admitted image is strictly worse than a loud failure.
+		 * g_hibernate_publish_error() returns true only when it
+		 * actually found admission_open still true and closed it
+		 * (false means the worker already finished first and this
+		 * callout lost the race harmlessly) -- panic only in the
+		 * true case.
+		 */
+		if (g_hibernate_publish_error(sc, ETIMEDOUT)) {
+			panic("GEOM_HIBERNATE: provider \"%s\" has an "
+			    "admitted hibernate image but the probe/resume "
+			    "worker did not complete within hc_wait_ms=%u "
+			    "ms; refusing to silently cold boot over an "
+			    "unconsumed image", sc->id.name,
+			    g_hibernate_config.hc_wait_ms);
+		}
 		return;
 	}
 	/*
 	 * Compete atomically with taste for the unresolved discovery attempt.
 	 * State 1 belongs to taste; state 2 belongs to this deadline.
 	 */
-	if (atomic_cmpset_acq_int(&g_hibernate_claimed, 0, 2))
+	if (atomic_cmpset_acq_int(&g_hibernate_claimed, 0, 2)) {
 		g_hibernate_complete_probe(&result);
+		return;
+	}
+	/*
+	 * K24-T00: the cmpset above only succeeds from state 0 ("no taste
+	 * ever matched the configured provider").  State 3 ("retry
+	 * pending" -- g_hibernate_taste() found the provider but
+	 * hibernate_dumper_lookup() raced ahead of GEOM_DEV's own
+	 * registration, see that function's "retryable" comment) is a
+	 * DIFFERENT, much more dangerous case to let through silently: it
+	 * means a hibernate image is confirmed present on the configured
+	 * provider -- that's the only way discovery could have progressed
+	 * past the name/sectorsize/mediasize checks to reach
+	 * hibernate_dumper_lookup() at all -- and the retry driven by
+	 * hibernate_dumper_registered() has still not completed admission
+	 * after the full hc_wait_ms deadline.
+	 *
+	 * Before this fix, the prior round's cmpset(0, 2) here used to
+	 * succeed in exactly this situation, because a retryable ENXIO
+	 * reset the claim all the way back to 0 instead of parking it at
+	 * 3 -- silently calling g_hibernate_complete_probe() and
+	 * releasing the root-mount hold with no admission ever attempted
+	 * and no diagnostic printed anywhere: an operator-invisible cold
+	 * boot with a valid, CRC-verified PENDING image still on disk.
+	 * Confirmed directly this round on the K24 production
+	 * (non-debug) kernel: 9/12 restores cold-booted exactly this way,
+	 * indistinguishable in every log from an ordinary successful boot
+	 * except for the absent "hibernate: k24t00"/"hibernate: k12"
+	 * diagnostic trail.
+	 *
+	 * A silent cold boot is strictly worse than a loud failure: fail
+	 * closed instead.  This is a boot-time-only path (the global
+	 * deadline fires once per boot, long before any user process
+	 * exists), so panic() is the correct terminal action -- there is
+	 * no running system yet to degrade gracefully into, and silently
+	 * continuing a normal boot is exactly the bug being fixed.
+	 */
+	cur = atomic_load_acq_int(&g_hibernate_claimed);
+	if (cur == 3) {
+		panic("GEOM_HIBERNATE: provider \"%s\" has a pending "
+		    "hibernate image but admission did not complete "
+		    "within hc_wait_ms=%u ms; refusing to silently cold "
+		    "boot over an unconsumed image",
+		    g_hibernate_config.hc_name, g_hibernate_config.hc_wait_ms);
+	}
 }
 
 static void
@@ -482,11 +592,27 @@ g_hibernate_taste(struct g_class *mp, struct g_provider *pp, int flags)
 	    strcmp(pp->name, g_hibernate_config.hc_name) != 0 ||
 	    pp->sectorsize != DEV_BSIZE || pp->mediasize <= 0)
 		return (NULL);
-	if (!atomic_cmpset_acq_int(&g_hibernate_claimed, 0, 1)) {
-		if (g_hibernate_owner != NULL)
-			(void)g_hibernate_publish_error(g_hibernate_owner,
-			    EEXIST);
-		return (NULL);
+	/*
+	 * K24-T00: claim from EITHER state 0 (never tasted) or state 3
+	 * (a prior taste hit the GEOM_DEV-not-yet-registered race below,
+	 * parked the claim at 3, and is waiting for exactly this retried
+	 * call).  A plain cmpset(0, 1) here -- the original form -- can
+	 * only ever succeed on the very first taste; every retry taste
+	 * driven by hibernate_dumper_registered() would then find the
+	 * claim already non-zero and bail out as EEXIST, so the retry
+	 * this whole mechanism exists for could never actually run.
+	 */
+	for (;;) {
+		u_int cur = atomic_load_acq_int(&g_hibernate_claimed);
+
+		if (cur != 0 && cur != 3) {
+			if (g_hibernate_owner != NULL)
+				(void)g_hibernate_publish_error(
+				    g_hibernate_owner, EEXIST);
+			return (NULL);
+		}
+		if (atomic_cmpset_acq_int(&g_hibernate_claimed, cur, 1))
+			break;
 	}
 	sc = malloc(sizeof(*sc), M_GEOM, M_WAITOK | M_ZERO);
 	mtx_init(&sc->lock, "geom hibernate", NULL, MTX_DEF);
@@ -570,12 +696,27 @@ fail:
 		mtx_destroy(&sc->lock);
 		free(sc, M_GEOM);
 		/*
-		 * Release the one-shot claim (but not g_hibernate_complete):
-		 * this was not a genuine refusal, so a later
-		 * hibernate_dumper_registered() retry must be able to
-		 * re-attempt discovery from the top of this function.
+		 * K24-T00: park the claim at state 3 ("retry pending"), not
+		 * 0.  Resetting fully to 0 here used to let the global
+		 * boot-time deadline (g_hibernate_deadline_callout, arg ==
+		 * NULL, below) race the pending hibernate_dumper_
+		 * registered() retry and sometimes win it -- especially on
+		 * a fast, non-debug kernel -- silently calling
+		 * g_hibernate_complete_probe() and releasing the
+		 * root-mount hold with no admission ever attempted and no
+		 * diagnostic printed: an undetectable cold boot with a
+		 * valid, CRC-verified PENDING image still on disk
+		 * (confirmed directly this round: K24 production-kernel
+		 * verification, 9/12 restores cold-booted this way).  This
+		 * was not a genuine refusal -- a later
+		 * hibernate_dumper_registered() retry must still be able
+		 * to re-attempt discovery (g_hibernate_taste()'s own entry
+		 * cmpset above accepts state 3 as well as state 0) -- but
+		 * the global deadline below must now be able to tell this
+		 * state apart from "nothing ever matched" and refuse to
+		 * silently complete while it persists.
 		 */
-		atomic_store_rel_int(&g_hibernate_claimed, 0);
+		atomic_store_rel_int(&g_hibernate_claimed, 3);
 		return (NULL);
 	}
 	result = g_hibernate_error_result(error);
@@ -599,9 +740,20 @@ g_hibernate_retry_event(void *arg, int flag)
 	if (flag == EV_CANCEL)
 		return;
 	g_topology_assert();
-	if (atomic_load_acq_int(&g_hibernate_complete) != 0 ||
-	    atomic_load_acq_int(&g_hibernate_claimed) != 0)
+	/*
+	 * K24-T00: state 3 ("retry pending", set by g_hibernate_taste()'s
+	 * own retryable-ENXIO path) is exactly the state this retry exists
+	 * to resolve -- do not treat it as "already claimed by someone
+	 * else" and bail.  Only a genuinely different claim (any value
+	 * other than 0 or 3) means another attempt owns discovery.
+	 */
+	if (atomic_load_acq_int(&g_hibernate_complete) != 0)
 		return;
+	{
+		u_int cur = atomic_load_acq_int(&g_hibernate_claimed);
+		if (cur != 0 && cur != 3)
+			return;
+	}
 	pp = g_provider_by_name(g_hibernate_config.hc_name);
 	if (pp != NULL)
 		(void)g_hibernate_taste(&g_hibernate_class, pp, 0);
@@ -624,11 +776,27 @@ g_hibernate_retry_event(void *arg, int flag)
 void
 hibernate_dumper_registered(const char *devname)
 {
+	u_int cur;
+
 	if (devname == NULL ||
 	    atomic_load_acq_int(&g_hibernate_complete) != 0 ||
-	    atomic_load_acq_int(&g_hibernate_claimed) != 0 ||
 	    !g_hibernate_config.hc_enabled ||
 	    strcmp(devname, g_hibernate_config.hc_name) != 0)
+		return;
+	/*
+	 * K24-T00: state 3 ("retry pending") is the normal, expected state
+	 * here -- it is what g_hibernate_taste()'s retryable-ENXIO path
+	 * sets precisely so that THIS callback's retry can still proceed.
+	 * Treating any nonzero claim as "someone else owns discovery" (the
+	 * original check) silently dropped every retry: once the first
+	 * taste parked at 3, this function would see claimed != 0 and
+	 * return without ever posting g_hibernate_retry_event(), and the
+	 * attempt could only complete via the global deadline timing out
+	 * (see g_hibernate_deadline()) -- or, before this fix, by that
+	 * deadline silently succeeding instead.
+	 */
+	cur = atomic_load_acq_int(&g_hibernate_claimed);
+	if (cur != 0 && cur != 3)
 		return;
 	(void)g_post_event(g_hibernate_retry_event, NULL, M_NOWAIT, NULL);
 }
