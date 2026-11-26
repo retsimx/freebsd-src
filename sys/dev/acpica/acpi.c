@@ -4698,6 +4698,70 @@ acpi_s4_resume_bsp(struct acpi_softc *sc, enum acpi_sleep_state *slp_state,
 	atomic_add_int(&hibernate_hcb_releases, 1);
 #endif
 	/*
+	 * K24-T00: reset ACPICA's internal object caches' free-lists
+	 * before DEVICE_RESUME(root_bus) below (triggered by the
+	 * ACPI_SS_DEV_SUSPEND flag set a few lines down, via backout:)
+	 * runs any AML evaluation. AcpiGbl_NamespaceCache (and its
+	 * siblings: AcpiGbl_StateCache, AcpiGbl_PsNodeCache,
+	 * AcpiGbl_PsNodeExtCache, AcpiGbl_OperandCache) are ordinary
+	 * restored-image global data: each cache's ListHead is a
+	 * singly-linked free-list of previously-recycled objects,
+	 * built entirely from the SAVE boot's own heap addresses
+	 * (AcpiOsAcquireObject()'s "cache hit" path walks
+	 * ACPI_GET_DESCRIPTOR_PTR(Object) and calls memset() directly
+	 * on it -- no re-validation against this boot's own live
+	 * memory). Confirmed by direct capture: acpi_pci_link_resume()
+	 * -> AcpiNsEvaluate() -> AcpiNsLookup() -> AcpiNsSearchAndEnter()
+	 * -> AcpiNsCreateNode() faulted "fault on nofault entry" inside
+	 * memset_erms(), with cr2 landing on an unrelated kernel
+	 * .rodata page -- AcpiGbl_NamespaceCache->ListHead pointed at a
+	 * save-time heap address that happens to decode as .rodata on
+	 * this boot's own, differently-laid-out heap. This is the exact
+	 * same provenance bug class the HPET mem_res fix (hpet_resume(),
+	 * acpi_hpet.c) already closed: a cached address restored as
+	 * image content, trusted instead of re-derived. The difference
+	 * here is that the correct "re-derive" is simpler than HPET's
+	 * live-resource lookup -- these free-lists are pure allocator
+	 * optimization state with no semantically meaningful content
+	 * (every object on them is about to be memset() to zero before
+	 * use regardless), so the safe fix is to make each cache
+	 * EMPTY on this boot, not to repair the stale pointer: zeroing
+	 * ListHead/CurrentDepth forces every subsequent
+	 * AcpiOsAcquireObject() call down the "cache miss" path
+	 * (ACPI_ALLOCATE_ZEROED(), a fresh, this-boot allocation),
+	 * exactly like a cold boot's caches start out. Do NOT call
+	 * AcpiOsPurgeCache() for this: it also walks the stale
+	 * ListHead chain and calls ACPI_FREE() on each stale node --
+	 * the identical bug, relocated into the allocator's free path
+	 * instead of memset(). A direct field reset touches nothing
+	 * the stale chain points to.
+	 */
+	{
+		extern ACPI_CACHE_T *AcpiGbl_NamespaceCache;
+		extern ACPI_CACHE_T *AcpiGbl_StateCache;
+		extern ACPI_CACHE_T *AcpiGbl_PsNodeCache;
+		extern ACPI_CACHE_T *AcpiGbl_PsNodeExtCache;
+		extern ACPI_CACHE_T *AcpiGbl_OperandCache;
+		ACPI_CACHE_T *k24t00_caches[5];
+		u_int k24t00_ci;
+
+		k24t00_caches[0] = AcpiGbl_NamespaceCache;
+		k24t00_caches[1] = AcpiGbl_StateCache;
+		k24t00_caches[2] = AcpiGbl_PsNodeCache;
+		k24t00_caches[3] = AcpiGbl_PsNodeExtCache;
+		k24t00_caches[4] = AcpiGbl_OperandCache;
+		for (k24t00_ci = 0; k24t00_ci < nitems(k24t00_caches);
+		    k24t00_ci++) {
+			if (k24t00_caches[k24t00_ci] == NULL)
+				continue;
+			k24t00_caches[k24t00_ci]->ListHead = NULL;
+			k24t00_caches[k24t00_ci]->CurrentDepth = 0;
+		}
+		device_printf(sc->acpi_dev,
+		    "hibernate: k24t00: ACPICA object caches reset "
+		    "(stale save-time free-list pointers discarded)\n");
+	}
+	/*
 	 * Cold-boot firmware re-initialized devices while the restored kernel
 	 * expects them configured.  Force DEVICE_RESUME via backout.
 	 */
