@@ -5196,41 +5196,186 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 * as fatal.
 			 */
 			register_t kstack_va;
-			vm_paddr_t pcb_pa, pcb_dst_page;
-			vm_offset_t pcb_page_off;
-			uint64_t pcb_idx;
-			const struct pcb *staged_pcb;
+			register_t staged_pcb_rsp;
+			vm_offset_t susppcb_pcb_va;
+			vm_offset_t kstack_base, kstack_end, kstack_slot;
+			vm_size_t kstack_stride;
 
 			if (susppcbs == NULL || susppcbs[0] == NULL)
 				return (EINVAL);
-			pcb_pa = vtophys(&susppcbs[0]->sp_pcb);
-			pcb_dst_page = trunc_page(pcb_pa);
-			pcb_page_off = (vm_offset_t)(pcb_pa & PAGE_MASK);
+			/*
+			 * K24-T00 (round 3): resolve &susppcbs[0]->sp_pcb
+			 * through the SAVED kernel's own page tables
+			 * (hibernate_md_staged_read(), rooted at
+			 * ha->ha_image.hi_pcb.hp_cr3 -- see that function's
+			 * own extensive comment above), not the resume
+			 * boot's live vtophys()/kernel_pmap.
+			 *
+			 * The two previously-tried sources were both
+			 * disproven by direct evidence: susppcbs[0]->sp_pcb
+			 * itself is uninitialized on the save side (the BSP
+			 * removes itself from suspend_cpus()'s set, so
+			 * nothing ever wrote it -- fixed separately, this
+			 * same file/round, by populating it from curthread->
+			 * td_pcb at the acpi.c save-side call site); and
+			 * ha->ha_image.hi_pcb.hp_rsp is a different field
+			 * entirely (the savectx() scratch-stack pointer, not
+			 * any thread's kstack).  Even with the save-side
+			 * population fix applied and proven correct (direct
+			 * capture: pre_copy_rsp=0 -> post_copy pcb_rsp
+			 * matching curthread->td_pcb->pcb_rsp exactly, a
+			 * genuine kernel-half address), site 42 still fired
+			 * in 5/12 verification runs: vtophys(&susppcbs[0]->
+			 * sp_pcb) on THIS (resume) boot's own live tables
+			 * returns THIS boot's cold-boot allocation address
+			 * for that VA, which only coincidentally matches the
+			 * SAVE boot's own (already-running, non-deterministic
+			 * heap state) allocation address for the identical
+			 * VA -- confirmed directly: the same VA resolved to
+			 * PA 0x168fd80 on the save side in one capture and
+			 * the resume side's own guess landed on the
+			 * DIFFERENT PA 0x1690d80 in the very same run.
+			 *
+			 * hibernate_md_staged_read() eliminates this guess
+			 * entirely: it walks hi_pcb.hp_cr3 -- the SAVED
+			 * kernel's own captured CR3 -- so the VA ->
+			 * PA resolution is authoritative by construction,
+			 * identical in kind to every other dynamically-
+			 * allocated object this file already resolves this
+			 * way (struct proc, struct thread, etc., per round
+			 * 11's fix, same function).
+			 *
+			 * K24-T00 (round 4/5, REVERTED): rounds 4-5 tried
+			 * routing this read through saved_pcb_va (the PA
+			 * hibernate_md_patch_saved_domain() computes for the
+			 * identity map) instead of this hi_pcb.hp_cr3 walk,
+			 * reasoning that resumectx() already dereferences
+			 * that exact address without faulting on most runs.
+			 * Live N=12 evidence disproved this: saved_pcb_va's
+			 * own PA comes from that SAME function's live
+			 * vtophys(&susppcbs[0]->sp_pcb) call -- the identical
+			 * per-boot-random-allocation problem this round-3
+			 * comment already documents -- so it is not an
+			 * independent, reliable source; it only happens to
+			 * be identity-MAPPED (hibernate_md_identity_ensure()
+			 * guarantees the mapping exists and is present), which
+			 * is why resumectx() never faults dereferencing it,
+			 * even when the CONTENT at that address is wrong.
+			 * Routing through it made site 42 fire in 8/12 runs
+			 * (worse than this round's own 4/12 baseline), so it
+			 * was reverted back to this hi_pcb.hp_cr3 walk, the
+			 * last version with a strictly better (not worse)
+			 * fire rate.
+			 *
+			 * K24-T00 (round 6): the bug round 3 never actually
+			 * fixed. hibernate_md_staged_read() above correctly
+			 * walks the SAVED kernel's page tables (hi_pcb.hp_cr3)
+			 * for the VA-to-PA resolution step -- but the VA it
+			 * was given, "&susppcbs[0]->sp_pcb", is computed by
+			 * first dereferencing susppcbs (a plain global
+			 * pointer, sys/x86/x86/mp_x86.c) on THIS (resume)
+			 * boot, in C, before any staged walk ever runs.
+			 * susppcbs is allocated fresh by
+			 * acpi_alloc_wakeup_handler() (sys/amd64/acpica/
+			 * acpi_wakeup.c) on EVERY boot via plain malloc(), so
+			 * its VALUE is exactly as boot-specific as the heap
+			 * allocation round 3 already proved unreliable for
+			 * susppcbs[0] itself -- staging the VA->PA walk for
+			 * *(susppcbs[0]) never helped, because the pointer
+			 * being dereferenced to REACH that VA was always the
+			 * live, resume-boot pointer, not the saved one.
+			 * susppcbs is NOT in any self-copy-protection set:
+			 * searching every hibernate_md_selfcopy_walk() call
+			 * site in this file (31 call sites checked) finds
+			 * none passing &susppcbs or any VA resolving to its
+			 * containing .bss page; only &susppcbs[0]->sp_pcb
+			 * (the pointee) was ever protected or referenced.
+			 * The two-step fix: first stage-read the GLOBAL's own
+			 * VA (&susppcbs, a compile-time-constant kernel symbol
+			 * address, identical on both boots) through the saved
+			 * tables to recover the SAVE boot's susppcbs value;
+			 * then stage-read sp_pcb.pcb_rsp from THAT (save-boot)
+			 * pointer's [0] slot, also through the saved tables.
+			 * Both steps are staged reads rooted in image content;
+			 * no live pointer is dereferenced in C at any point.
+			 */
+			{
+				vm_offset_t susppcbs_global_va;
+				uint64_t saved_susppcbs_ptr;
+				uint64_t saved_susppcb0_ptr;
 
-			/*
-			 * Fail closed, not silently: ENOENT here means the
-			 * saved PCB's own physical page was not part of the
-			 * image at all, which should never happen given
-			 * saved_pcb_va's own existing reliance on this same PA
-			 * (see hibernate_md_patch_saved_domain() above) -- refuse
-			 * rather than trust an unindexed read.
-			 */
-			error = hibernate_md_dst_page_index(ha, pcb_dst_page,
-			    &pcb_idx);
+				susppcbs_global_va = (vm_offset_t)&susppcbs;
+				error = hibernate_md_staged_read(ha, wvec, p,
+				    susppcbs_global_va, &saved_susppcbs_ptr,
+				    sizeof(saved_susppcbs_ptr));
+				if (error != 0)
+					return (error);
+				/*
+				 * K24-T00 (round 6, guard fix): susppcbs is
+				 * malloc(M_DEVBUF)'d (sys/amd64/acpica/
+				 * acpi_wakeup.c), so its VA lives in the
+				 * general kernel map, NOT the kstack arena
+				 * VM_MIN_KERNEL_ADDRESS..VM_MAX_KERNEL_ADDRESS
+				 * range this same function uses for kstack_va
+				 * below -- that range rejected the real,
+				 * independently-confirmed value
+				 * (0xfffff8000109a180, identical across every
+				 * boot observed this session) as invalid.
+				 * Only rule out a NULL/corrupt staged read
+				 * here; the subsequent staged read of
+				 * sp_pcb.pcb_rsp through this pointer (site
+				 * 39 below) is the real content check, and a
+				 * canonical-range guard on the FINAL kstack_va
+				 * result still applies at site 42.
+				 */
+				if (saved_susppcbs_ptr == 0)
+					return (EINVAL);
+				/*
+				 * K24-T00 (round 6, 2nd bug): saved_susppcbs_
+				 * ptr is the ARRAY base (struct susppcb **),
+				 * not susppcbs[0] (struct susppcb *) -- the
+				 * previous version of this block skipped
+				 * dereferencing slot 0 entirely and fed the
+				 * array base straight into offsetof(sp_pcb),
+				 * which is why site 42 still fired with
+				 * susppcb_pcb_va printing the exact array-
+				 * base address (0xfffff8000109a180) instead
+				 * of a struct pcb address. A THIRD staged
+				 * read -- of the 8-byte pointer AT
+				 * saved_susppcbs_ptr (i.e. susppcbs[0] on the
+				 * SAVE boot) -- is required before this
+				 * offset can be added, mirroring exactly how
+				 * live code reads susppcbs[0] before
+				 * susppcbs[0]->sp_pcb.
+				 */
+				error = hibernate_md_staged_read(ha, wvec, p,
+				    (vm_offset_t)saved_susppcbs_ptr,
+				    &saved_susppcb0_ptr,
+				    sizeof(saved_susppcb0_ptr));
+				if (error != 0)
+					return (error);
+				if (saved_susppcb0_ptr == 0)
+					return (EINVAL);
+				susppcb_pcb_va = (vm_offset_t)saved_susppcb0_ptr +
+				    offsetof(struct susppcb, sp_pcb);
+			}
+			error = hibernate_md_staged_read(ha, wvec, p,
+			    susppcb_pcb_va + offsetof(struct pcb, pcb_rsp),
+			    &staged_pcb_rsp, sizeof(staged_pcb_rsp));
 			if (error != 0)
+				/*
+				 * Fail closed with a DISTINCT message:
+				 * per this round's instruction, an
+				 * unresolved saved-table walk here
+				 * means slot 0's own struct pcb page
+				 * was never captured in the image at
+				 * all -- a different and equally
+				 * important finding from a bad VALUE,
+				 * pointing at the writer/enumeration
+				 * side rather than this reader.
+				 */
 				return (error);
-			if (pcb_idx >= p)
-				return (EINVAL);
-			/*
-			 * struct pcb must not straddle its containing page: the
-			 * staged read below only maps one page via
-			 * PHYS_TO_DMAP(wvec[pcb_idx]).
-			 */
-			if (pcb_page_off + sizeof(*staged_pcb) > PAGE_SIZE)
-				return (EINVAL);
-			staged_pcb = (const struct pcb *)((const uint8_t *)
-			    PHYS_TO_DMAP(wvec[pcb_idx]) + pcb_page_off);
-			kstack_va = staged_pcb->pcb_rsp;
+			kstack_va = staged_pcb_rsp;
 			kstack_va &= ~(register_t)PAGE_MASK;
 
 			/*
@@ -5269,7 +5414,7 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			 */
 			kstack_stride = ptoa(KSTACK_PAGES + KSTACK_GUARD_PAGES);
 			kstack_slot = VM_MIN_KERNEL_ADDRESS +
-			    (((vm_offset_t)staged_pcb->pcb_rsp -
+			    (((vm_offset_t)staged_pcb_rsp -
 				 VM_MIN_KERNEL_ADDRESS) /
 				kstack_stride) *
 				kstack_stride;
@@ -5277,8 +5422,8 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			kstack_end = kstack_base + ptoa(KSTACK_PAGES);
 			if (kstack_base < kstack_slot ||
 			    kstack_end < kstack_base ||
-			    (vm_offset_t)staged_pcb->pcb_rsp < kstack_base ||
-			    (vm_offset_t)staged_pcb->pcb_rsp >= kstack_end)
+			    (vm_offset_t)staged_pcb_rsp < kstack_base ||
+			    (vm_offset_t)staged_pcb_rsp >= kstack_end)
 				return (EINVAL);
 
 			k24t00_kstack_va = kstack_va;

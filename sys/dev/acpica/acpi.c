@@ -5296,6 +5296,59 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 	 * suspend_other_cpus() is static in acpi.c; the coordinator
 	 * cannot call it directly.  We call it here and set the stage bit.
 	 */
+	/*
+	 * K24-T00: populate the BSP's own susppcbs[0] slot before
+	 * suspend_other_cpus() runs.  suspend_cpus() (sys/x86/x86/
+	 * mp_x86.c) only ever calls savectx(&susppcbs[cpu]->sp_pcb)
+	 * for each AP acknowledging suspend -- suspend_other_cpus()
+	 * (immediately below) explicitly does
+	 * "CPU_CLR(PCPU_GET(cpuid), susp_cpus)" first, removing the
+	 * BSP itself from that set, so susppcbs[0]->sp_pcb is never
+	 * written by anything, on any boot, on this path.
+	 * susppcbs[i] is malloc()'d M_WAITOK only, not M_ZERO (sys/
+	 * amd64/acpica/acpi_wakeup.c's
+	 * acpi_alloc_wakeup_handler()), so its content is whatever
+	 * the backing heap slab last held.  Confirmed directly this
+	 * session: hibernate_machdep_prepare()'s resume-side read
+	 * of susppcbs[0]->sp_pcb.pcb_rsp (used there to derive the
+	 * dump/resume thread's own kstack VA range) read back as
+	 * the exact bit pattern 0xffffffffffffffff, which that
+	 * function's own canonical-range guard correctly refuses
+	 * with EINVAL -- the guard was never wrong; it was simply
+	 * never given a real value for CPU 0.
+	 *
+	 * The BSP's own curthread IS the thread whose continuation
+	 * resumes execution after restore (this same function
+	 * continues running, unmodified, as the dump worker, after
+	 * the whole save+restore round trip) -- its kstack
+	 * allocation does not move between save and resume, so
+	 * copying curthread->td_pcb's CURRENT content here (while
+	 * still running normally, before any suspend) gives the
+	 * resume side a genuine, valid, in-kernel-half pcb_rsp
+	 * belonging to the correct kstack, which is exactly what
+	 * that guard checks for.  Fail closed, loudly, rather than
+	 * silently if the live state is not what it must be.
+	 */
+	KASSERT(curthread->td_pcb != NULL,
+	    ("hibernate: curthread->td_pcb is NULL at "
+	     "suspend_other_cpus()"));
+	if (curthread->td_pcb == NULL ||
+	    (vm_offset_t)curthread->td_pcb->pcb_rsp <
+		VM_MIN_KERNEL_ADDRESS ||
+	    (vm_offset_t)curthread->td_pcb->pcb_rsp >=
+		VM_MAX_KERNEL_ADDRESS) {
+		panic("hibernate: cannot populate susppcbs[0]: "
+		    "curthread->td_pcb %s (pcb_rsp=%#jx), refusing "
+		    "to save an image the resume side cannot "
+		    "validate",
+		    curthread->td_pcb == NULL ? "is NULL" :
+			"has a non-canonical pcb_rsp",
+		    curthread->td_pcb != NULL ?
+			(uintmax_t)curthread->td_pcb->pcb_rsp : 0);
+	}
+	if (susppcbs != NULL && susppcbs[0] != NULL)
+		susppcbs[0]->sp_pcb = *curthread->td_pcb;
+
 	device_printf(sc->acpi_dev, "Suspending other CPUs...\n");
 	suspend_other_cpus(&susp_cpus);
 	hib_stages |= HIB_STAGE_APS_STOPPED;
