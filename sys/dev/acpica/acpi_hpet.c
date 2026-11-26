@@ -879,6 +879,38 @@ hpet_resume(device_t dev)
 
 	/* Re-enable the timer after a resume to keep the clock advancing. */
 	sc = device_get_softc(dev);
+	{
+		bus_space_tag_t hpet_bst;
+		bus_space_handle_t hpet_bsh;
+		rman_res_t hpet_live_start, hpet_live_count;
+
+		/*
+		 * sc->mem_res is restored hibernate-image content: its
+		 * cached r_bushandle, and the rman linkage reachable from
+		 * it, describe the saved kernel's boot, not this one, so
+		 * bus_activate_resource() must not be used to re-validate
+		 * it here. Re-derive the physical start/size from the
+		 * live device tree and install a fresh mapping directly,
+		 * bypassing the stale rman linkage entirely. Fail closed
+		 * if either step does not succeed.
+		 */
+		hpet_bst = rman_get_bustag(sc->mem_res);
+		if (bus_get_resource(dev, SYS_RES_MEMORY, sc->mem_rid,
+		    &hpet_live_start, &hpet_live_count) != 0) {
+			device_printf(dev,
+			    "hpet_resume: bus_get_resource failed, "
+			    "refusing to touch a stale MMIO mapping\n");
+			return (ENXIO);
+		}
+		if (bus_space_map(hpet_bst, hpet_live_start,
+		    hpet_live_count, 0, &hpet_bsh) != 0) {
+			device_printf(dev,
+			    "hpet_resume: bus_space_map failed, "
+			    "refusing to touch a stale MMIO mapping\n");
+			return (ENXIO);
+		}
+		rman_set_bushandle(sc->mem_res, hpet_bsh);
+	}
 	hpet_enable(sc);
 	/* Restart event timers that were running on suspend. */
 	for (i = 0; i < sc->num_timers; i++) {
