@@ -6769,10 +6769,53 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				ti_pg = trunc_page((vm_offset_t)ti_va);
 				ti_end = round_page((vm_offset_t)ti_va +
 				    ti_len);
-				for (; ti_pg < ti_end; ti_pg += PAGE_SIZE) {
+		if (error == 0) {
+			/*
+			 * acpi_timer_eh (sys/dev/acpica/acpi_timer.c) -- a
+			 * plain static eventhandler_tag global, not reached
+			 * by the eventhandler_hibernate_selfcopy_nodes() walk
+			 * above (that walk only protects struct
+			 * eventhandler_list nodes and the struct
+			 * eventhandler_entry nodes hanging off their own
+			 * el_entries TAILQ, not every driver-local cache of
+			 * one of those nodes' addresses).  Confirmed by live
+			 * capture: two independent 12-run verification
+			 * campaigns (k24t00-ssp-n12, runs 3 and 10) both
+			 * panicked with an identical RIP inside
+			 * _eventhandler_deregister()+0xac, called from
+			 * acpi_timer_resume() via EVENTHANDLER_DEREGISTER
+			 * (power_resume, acpi_timer_eh), itself reached from
+			 * acpi_EnterSleepState() via an ordinary acpiconf(8)
+			 * ioctl run after restore completes.  Whenever
+			 * hibernate entry runs acpi_timer_suspend_handler(),
+			 * this boot's own acpi_timer_eh is set non-NULL
+			 * before the image is saved; the K-10 destructive
+			 * copy then overwrites this (resume) boot's own
+			 * fresh BSS-zero value with that stale pointer,
+			 * which acpi_timer_resume() unconditionally
+			 * dereferences.  copy_leaf=true: this boot's own
+			 * fresh NULL is the correct content to preserve,
+			 * the same rule already applied to every sibling
+			 * driver-local eventhandler_tag/cache global in this
+			 * tree.
+			 */
+			extern void acpi_timer_hibernate_selfcopy_eh_va(
+			    uintptr_t *va_out, size_t *len_out);
+			uintptr_t ateh_va;
+			size_t ateh_len;
+			vm_offset_t ateh_pg, ateh_end;
+
+			acpi_timer_hibernate_selfcopy_eh_va(&ateh_va,
+			    &ateh_len);
+			if (ateh_va != 0 && ateh_len != 0) {
+				ateh_pg = trunc_page((vm_offset_t)ateh_va);
+				ateh_end = round_page(
+				    (vm_offset_t)ateh_va + ateh_len);
+				for (; ateh_pg < ateh_end;
+				    ateh_pg += PAGE_SIZE) {
 					error = hibernate_md_selfcopy_walk(ha,
 					    wvec, p, kernel_pmap->pm_cr3,
-					    ti_pg, true, &selfcopied);
+					    ateh_pg, true, &selfcopied);
 					if (error != 0)
 						break;
 				}

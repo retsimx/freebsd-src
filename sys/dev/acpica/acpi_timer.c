@@ -83,6 +83,41 @@ static struct acpi_timer_softc *acpi_timer_sc;
 static struct timecounter *acpi_timer_saved_tc;
 static eventhandler_tag acpi_timer_eh;
 
+/*
+ * K24-T00: acpi_timer_eh is a plain static BSS global, not a list/node
+ * the generic eventhandler self-copy walk (eventhandler_hibernate_
+ * selfcopy_nodes(), sys/kern/subr_eventhandler.c) ever reaches -- that
+ * walk only protects struct eventhandler_list nodes and the struct
+ * eventhandler_entry nodes hanging off their own el_entries TAILQ, not
+ * every driver-local eventhandler_tag variable that happens to cache one
+ * of those nodes' addresses. Whenever hibernate entry runs through
+ * acpi_timer_suspend_handler() (ordinary path: hibernate_suspend() ->
+ * acpi_timer_suspend()), this boot's own acpi_timer_eh is set non-NULL
+ * before the image is saved, so the SAVED image's own copy of this exact
+ * byte range is also non-NULL -- a tag pointing at a malloc(M_EVENTHANDLER)
+ * node that belongs to the SAVE kernel, not this (resume) kernel's own
+ * eventhandler_lists. The K-10 destructive copy overwrites this boot's
+ * own fresh BSS-zero value with that stale pointer before acpi_timer_eh is
+ * ever read, and acpi_timer_resume() unconditionally dereferences it via
+ * EVENTHANDLER_DEREGISTER(power_resume, acpi_timer_eh) -- a GPF inside
+ * _eventhandler_deregister(), captured live (two independent 12-run
+ * verification campaigns, k24t00-ssp-n12 runs 3 and 10, identical RIP
+ * both times). copy_leaf=true: this boot's own fresh NULL is the correct
+ * content to preserve (exactly the same "adopt this boot's own state"
+ * rule already applied to every sibling driver-local eventhandler_tag/
+ * cache global), following kvm_clock_hibernate_selfcopy_range()'s own
+ * narrow-accessor pattern (sys/dev/kvm_clock/kvm_clock.c) for a plain
+ * static global no existing hibernate_machdep.c caller can already reach.
+ */
+void	acpi_timer_hibernate_selfcopy_eh_va(uintptr_t *va_out, size_t *len_out);
+void
+acpi_timer_hibernate_selfcopy_eh_va(uintptr_t *va_out, size_t *len_out)
+{
+	*va_out = (uintptr_t)&acpi_timer_eh;
+	*len_out = sizeof(acpi_timer_eh);
+}
+
+
 static device_method_t acpi_timer_methods[] = {
     DEVMETHOD(device_identify,	acpi_timer_identify),
     DEVMETHOD(device_probe,	acpi_timer_probe),
