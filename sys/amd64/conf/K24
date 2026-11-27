@@ -20,3 +20,25 @@ ident		K24
 nooptions	WITNESS
 nooptions	INVARIANTS
 nooptions	INVARIANT_SUPPORT
+
+# Stack Smashing Protection (SSP) is a structural conflict for this target,
+# not merely a debug/production trade like WITNESS/INVARIANTS above: SSP
+# relies on a single canary value (set once at boot) being valid for every
+# live stack frame checked against it. The hibernate resume path installs a
+# dormant, image-restored frame (the suspended thread's own saved kernel
+# stack, re-mapped page-by-page from the SAVED image/boot) directly beside
+# ordinary live frames produced by THIS (resume) boot. The saved frame's own
+# epilogue was emitted against the SAVE boot's canary value, not the RESUME
+# boot's -- the two cannot agree, because they are two different boots'
+# randomized globals. One canary cannot simultaneously validate both a
+# dormant restored frame and a live resume-boot frame, so SSP here is not a
+# diagnostic a debug build could opt into; it is a false-positive generator
+# against this kernel's own normal, correct resume behavior. There is no
+# per-thread-canary alternative available on amd64 (PERTHREAD_SSP exists
+# only under sys/conf/options.arm64), so the only correct fix is disabling
+# SSP outright for this kernel, via the MK_SSP build knob (sys/conf/options
+# has no registered "SSP" options(5) token, so a plain "nooptions SSP" line
+# is a silent no-op; makeoptions MK_SSP=no is the mechanism kern.mk actually
+# reads -- see sys/conf/kern.mk's "Stack Smashing Protection (SSP) support"
+# section, guarded by ".if ${MK_SSP} != \"no\"").
+makeoptions	MK_SSP=no
