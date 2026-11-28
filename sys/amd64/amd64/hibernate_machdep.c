@@ -6633,7 +6633,55 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					 * ever place these pages; this
 					 * thread must not be released
 					 * post-copy.
+					 *
+					 * K24-T00 round 3 (enqueue-gate
+					 * suspicion) fix: threads[i].td_va
+					 * is a raw kernel virtual address
+					 * read from the SAVED image's own
+					 * thread table (populated from
+					 * thread_cursor, a save-time
+					 * pointer value) -- it carries no
+					 * relationship to this boot's own
+					 * live allocations. This function
+					 * (hibernate_machdep_prepare(),
+					 * called from
+					 * hibernate_resume_attempt()) runs
+					 * on this resume continuation's own
+					 * thread (g_hibernate_worker) by
+					 * construction, so curthread here IS
+					 * that live worker. Deterministic
+					 * kernel memory layout across boots
+					 * (same build, same physical memory
+					 * map) makes it possible for an
+					 * unrelated staged thread's own
+					 * save-time td_va to numerically
+					 * equal this live worker's own
+					 * struct thread address -- a pure
+					 * address collision between two
+					 * different objects in two different
+					 * boots' address spaces, not a
+					 * meaningful identity match. Adding
+					 * such an entry would gate this
+					 * worker's own re-enqueue for the
+					 * rest of the resume continuation it
+					 * must survive to complete (same
+					 * requirement already documented for
+					 * the sibling "curthread is excluded
+					 * unconditionally" non-image-thread
+					 * census, above in this same
+					 * function) -- so refuse to record
+					 * this one collision, by the same
+					 * by-identity discipline, instead of
+					 * ever matching by pid/comm.
 					 */
+					if ((struct thread *)threads[i].td_va
+					    == curthread) {
+						extern void
+						    hibernate_k24t04_raw_marker(
+						    int c);
+						hibernate_k24t04_raw_marker(
+						    'W');
+					} else
 					if (k24t00_exclude_n <
 					    K24T00_EXCLUDE_MAX) {
 						struct k24t00_exclude_entry
