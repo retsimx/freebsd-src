@@ -6235,9 +6235,21 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	 * Bind this thread to CPU0 before hibernate_machdep_prepare() runs,
 	 * matching the SAVE side's own already-correct idiom (sys/dev/
 	 * acpica/acpi.c, AcpiEnterSleepState()'s sched_bind(curthread, 0)
-	 * immediately before the equivalent save-time work).  Unbind
-	 * immediately after: nothing downstream of the MD_PREPARE seam
-	 * depends on this thread's own CPU affinity.
+	 * immediately before the equivalent save-time work).
+	 *
+	 * Keep the bind in place through hibernate_park_dispatch():
+	 * hibernate_machdep_prepare() bakes PCPU_GET(cpuid) into the
+	 * park-stub trampoline as HPK_CPU, while hibernate_stop_cpus() and
+	 * hibernate_park_dispatch() independently re-derive the complement
+	 * cpuset that ipi_startup() targets from the same PCPU_GET(cpuid),
+	 * at a later instant.  Unbinding between those two derivations
+	 * lets the scheduler migrate this worker onto the AP, so the
+	 * INIT/STARTUP pair ipi_startup() sends can target the CPU this
+	 * thread is itself running on, corrupting that CPU's pcpu leaf
+	 * under its own live frames (observed as a pre-copy instruction
+	 * fetch fault at cr2 = rip = 0xffffffffffffffff in
+	 * g_hibernate_worker()).  Unbind once, at the cleanup label below,
+	 * after every PCPU_GET(cpuid)-sensitive derivation has run.
 	 */
 	thread_lock(curthread);
 	sched_bind(curthread, 0);
@@ -6249,10 +6261,6 @@ hibernate_resume_attempt(struct hibernate_attempt *ha)
 	stage = HIB_RESUME_MD_PREPARE;
 	hibernate_resume_stage_record(stage);
 	error = hibernate_machdep_prepare(ha);
-
-	thread_lock(curthread);
-	sched_unbind(curthread);
-	thread_unlock(curthread);
 	if (error != 0)
 		goto cleanup;
 
@@ -6388,6 +6396,16 @@ classify_non_pending:
 		error = ENOENT;
 
 cleanup:
+	/*
+	 * Matching unbind for the bind above: idempotent (sched_unbind()
+	 * is a no-op if this thread was never bound, e.g. prepare() failed
+	 * before binding mattered), so unconditionally unbinding on every
+	 * exit from this function -- success or any earlier goto cleanup --
+	 * is safe.
+	 */
+	thread_lock(curthread);
+	sched_unbind(curthread);
+	thread_unlock(curthread);
 	hibernate_attempt_cleanup(ha);
 	return (error);
 }
