@@ -5461,6 +5461,23 @@ hibernate_park_dispatch(struct hibernate_attempt *ha, cpuset_t acknowledged)
 	state_pa = ha->ha_arena_start + HIBERNATE_ARENA_HEADER_OFF_RESERVED_0F0;
 	park = (volatile struct hibernate_park_state *)PHYS_TO_DMAP(state_pa);
 
+	/*
+	 * K24-T00 round (AP reseed ordering): reseed each AP's own idle-
+	 * thread PCB from the BSP, exactly once, strictly before this
+	 * CPU's own ipi_startup() SIPI is ever sent -- see
+	 * hibernate_bsp_reseed_ap_idle()'s own declaration comment
+	 * (sys/amd64/amd64/hibernate_machdep.c) for the full root-cause
+	 * account (hibernate_park_startup_retry()'s bounded SIPI resend,
+	 * below, can otherwise race this reseed against a second entry
+	 * into the AP-side hibernate_resume_ap_entry(), observed this
+	 * round producing a near-null pcb_rip mid-write on a live AP).
+	 * Moved out of the AP's own entry path entirely: a duplicate SIPI
+	 * now always finds the idle PCB already complete.
+	 */
+	extern void hibernate_bsp_reseed_ap_idle(u_int cpu);
+	CPU_FOREACH_ISSET(cpu, &acknowledged)
+		hibernate_bsp_reseed_ap_idle((u_int)cpu);
+
 	/* Dispatch to the entire acknowledged set as one tight group. */
 	CPU_FOREACH_ISSET(cpu, &acknowledged) {
 		ipi_startup(cpu_apic_ids[cpu],

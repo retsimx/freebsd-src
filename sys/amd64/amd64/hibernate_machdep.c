@@ -778,6 +778,57 @@ hibernate_amd64_cpu_validate(const struct hibernate_pcb *pcb, bool *refuse_la57,
 void	tdq_curthread_reseed(struct thread *td);
 void	tdq_runq_hibernate_reinit(void);
 
+/*
+ * K24-T00 round (AP reseed ordering): BSP-side idle-PCB reseed, called
+ * from hibernate_park_dispatch() (sys/kern/kern_hibernate.c) strictly
+ * before either half of this CPU's own ipi_startup() SIPI pair is sent
+ * -- moved here from hibernate_resume_ap_entry() (immediately below)
+ * because that function can genuinely be entered twice for the same
+ * CPU (hibernate_park_startup_retry()'s bounded resend of ipi_startup()
+ * when a merely-slow, not lost, first SIPI pair causes the PARK_READY
+ * poll to time out before the AP's own progress is observed), and the
+ * reseed is not safe to race against itself: a second, concurrent-or-
+ * interleaved invocation can observe pcb_rip mid-write, producing
+ * exactly the "trap 0xc, rip = 0x2" near-null instruction-fetch fault
+ * confirmed live this round on an AP (cpuid 1), traced via marker
+ * evidence to this exact function's own entry being hit twice with no
+ * intervening completion.
+ *
+ * Performed exactly once per CPU, by the sole BSP actor, before either
+ * SIPI is ever sent: a duplicate SIPI then finds the idle PCB already
+ * fully and identically reseeded, with no actor able to observe a
+ * partial write, closing the race by construction rather than by
+ * synchronization.
+ *
+ * Idempotent by content (every write sets the same value every call),
+ * so calling it more than once for the same CPU -- which should not
+ * happen given its single call site, but is not itself unsafe -- is
+ * harmless.
+ */
+void	hibernate_bsp_reseed_ap_idle(u_int cpu);
+void
+hibernate_bsp_reseed_ap_idle(u_int cpu)
+{
+	struct pcpu *pc;
+	struct thread *itd;
+	struct pcb *ipcb;
+
+	pc = pcpu_find(cpu);
+	if (pc == NULL)
+		panic("hibernate: bsp reseed: AP %u has no pcpu", cpu);
+
+	itd = pc->pc_idlethread;
+	ipcb = itd->td_pcb;
+	ipcb->pcb_r12 = (register_t)sched_idletd;
+	ipcb->pcb_rbx = 0;
+	ipcb->pcb_rbp = 0;
+	ipcb->pcb_rsp = (register_t)itd->td_frame - sizeof(void *);
+	ipcb->pcb_rip = (register_t)fork_trampoline;
+	clear_pcb_flags(ipcb,
+	    PCB_FPUINITDONE | PCB_USERFPUINITDONE | PCB_KERNFPU |
+		PCB_KERNFPU_THR);
+}
+
 void
 hibernate_resume_ap_entry(u_int cpu)
 {
@@ -823,6 +874,31 @@ hibernate_resume_ap_entry(u_int cpu)
 	 * count 0" fired inside this exact first-entry path on a genuine,
 	 * physically-verified correct AP; with 1, the assert is satisfied
 	 * by construction.
+	 *
+	 * K24-T00 round (AP reseed ordering): curthread->td_critnest and
+	 * ->td_md.md_spinlock_count are set on EVERY entry (idempotent,
+	 * same value each time), unlike the idle-PCB reseed immediately
+	 * below, which this round moved to the BSP side
+	 * (hibernate_bsp_reseed_ap_idle(), called from
+	 * hibernate_park_dispatch() before ipi_startup()) precisely
+	 * because it is NOT safely idempotent against this function being
+	 * entered twice for the same CPU: marker evidence this round
+	 * (cpu=1's own 'A' marker firing twice with no intervening 'B'
+	 * marker ever completing) showed hibernate_park_startup_retry()'s
+	 * bounded re-send of ipi_startup() (this same file, see that
+	 * function's own comment) can -- when the first SIPI pair was
+	 * merely slow rather than lost -- genuinely deliver two SIPIs to
+	 * one AP, producing two concurrent-or-interleaved entries into
+	 * this no-return function. A reseed performed here, mid-entry, can
+	 * therefore race its own second invocation, leaving pcb_rip
+	 * observed mid-write (the "trap 0xc, rip = 0x2" signature: a
+	 * near-null instruction fetch, consistent with a partially-written
+	 * pcb_rip) by whichever invocation's own switch-in reads it first.
+	 * Performing the reseed once, from the BSP, strictly before either
+	 * SIPI of this CPU's own pair is ever sent, removes the window
+	 * entirely: a duplicate SIPI then finds the idle PCB already fully
+	 * and identically reseeded, with no actor able to observe a
+	 * partial write.
 	 */
 	curthread->td_critnest = 1;
 	curthread->td_md.md_spinlock_count = 1;
@@ -861,20 +937,20 @@ hibernate_resume_ap_entry(u_int cpu)
 	 * idle-thread creation, so the AP enters sched_idletd() fresh via
 	 * fork_trampoline, as a cold-boot AP does.
 	 */
-	{
-		struct thread *itd;
-		struct pcb *ipcb;
-
-		itd = pc->pc_idlethread;
-		ipcb = itd->td_pcb;
-		ipcb->pcb_r12 = (register_t)sched_idletd;
-		ipcb->pcb_rbx = 0;
-		ipcb->pcb_rbp = 0;
-		ipcb->pcb_rsp = (register_t)itd->td_frame - sizeof(void *);
-		ipcb->pcb_rip = (register_t)fork_trampoline;
-		clear_pcb_flags(ipcb, PCB_FPUINITDONE | PCB_USERFPUINITDONE |
-		    PCB_KERNFPU | PCB_KERNFPU_THR);
-	}
+	/*
+	 * K24-T00 round (AP reseed ordering): the idle-PCB reseed itself
+	 * is performed exactly once, by the BSP, in
+	 * hibernate_bsp_reseed_ap_idle() (below in this same file), called
+	 * from hibernate_park_dispatch() (sys/kern/kern_hibernate.c)
+	 * strictly before either SIPI of this CPU's own ipi_startup()
+	 * pair is ever sent -- removed from here, where a duplicate SIPI
+	 * (hibernate_park_startup_retry()'s bounded resend, confirmed this
+	 * round via marker evidence to be able to reach a merely-slow, not
+	 * lost, AP) could race this function's own two concurrent-or-
+	 * interleaved entries against each other and leave pcb_rip
+	 * observed mid-write by whichever invocation's switch-in ran
+	 * first.
+	 */
 	/*
 	 * Sibling defect to the pcb reseed above.  pc_monitorbuf.idle_state
 	 * lives in this same one-page per-CPU leaf as pc_gdt, which this
