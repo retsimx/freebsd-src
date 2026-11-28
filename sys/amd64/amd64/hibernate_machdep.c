@@ -3213,6 +3213,24 @@ k24t31_recorded_threads_count(void)
 }
 
 /*
+ * K24-T00 td_contested reseed support: the direct struct thread *
+ * twin of k24t31_recorded_thread_proc_pub() above, for
+ * sys/dev/acpica/acpi.c's own td_contested reseed sweep (see that
+ * call site's own comment for the full root-cause account). Returns
+ * the recorded thread pointer itself rather than its td_proc, since
+ * the reseed writes directly to struct thread.td_contested, not
+ * anything process-level.
+ */
+struct thread *k24t31_recorded_thread_td_pub(u_int idx);
+struct thread *
+k24t31_recorded_thread_td_pub(u_int idx)
+{
+	if (idx >= k24t31_recorded_n)
+		return (NULL);
+	return (k24t31_recorded_threads[idx].td);
+}
+
+/*
  * K24-T00 round 29: post-copy consumer. For each recorded excluded
  * thread, stop it using the kernel's own existing, already-proven
  * thread_suspend_one() -- the identical primitive thread_single()

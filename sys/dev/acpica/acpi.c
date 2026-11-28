@@ -5654,6 +5654,64 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 		    saved_td_sleeplocks);
 		hibernate_coordinator_mtx_reseed(saved_td);
 		/*
+		 * K24-T00 td_contested reseed (post-resume panic
+		 * investigation): struct thread.td_contested
+		 * (LIST_HEAD(, turnstile)) is per-thread saved-image
+		 * content restored byte-for-byte by the K-10
+		 * destructive copy, the identical provenance class as
+		 * td_lock (td_lock_hibernate_reseed(), sched_ule.c)
+		 * and the pd_lock/pg_mtx/s_mtx fields reseeded
+		 * immediately above: its lh_first word still names
+		 * whatever turnstile the SAVE kernel's own thread had
+		 * contested-lock-linked at suspend time, not a
+		 * turnstile that exists on this boot.
+		 *
+		 * Confirmed directly this round: pid 871 "syslogd"
+		 * panics with "general protection fault" inside
+		 * turnstile_wait() -> turnstile_setowner() ->
+		 * LIST_INSERT_HEAD(&owner->td_contested, ts,
+		 * ts_link), dereferencing owner->td_contested.lh_first
+		 * to patch its ts_link.le_prev -- the stale save-time
+		 * turnstile pointer is not valid on this boot, so the
+		 * write faults.
+		 *
+		 * Safety argument identical to the reseeds above: this
+		 * runs here, strictly before any AP is released and
+		 * before DEVICE_RESUME/interrupts are restored, so no
+		 * other actor can be contending on any recorded
+		 * thread's td_contested yet -- resetting each one to
+		 * the empty list is equivalent to the state a thread
+		 * that has contested no locks since this boot would
+		 * have, which every recorded thread genuinely is, on
+		 * this boot. Walks the same k24t31_recorded_threads[]
+		 * list the per-process sweep above already uses, for
+		 * the same reason (allproc/p_list not yet trustworthy
+		 * here).
+		 */
+		{
+			extern struct thread *k24t31_recorded_thread_td_pub(
+			    u_int idx);
+			extern u_int k24t31_recorded_threads_count(void);
+			u_int k24t31_ci, k24t31_cn, contested_reseeded;
+			struct thread *ct;
+
+			contested_reseeded = 0;
+			k24t31_cn = k24t31_recorded_threads_count();
+			for (k24t31_ci = 0; k24t31_ci < k24t31_cn;
+			    k24t31_ci++) {
+				ct = k24t31_recorded_thread_td_pub(
+				    k24t31_ci);
+				if (ct == NULL)
+					continue;
+				LIST_INIT(&ct->td_contested);
+				contested_reseeded++;
+			}
+			printf("hibernate: k24t00: td_contested "
+			    "reseed: recorded_threads=%u "
+			    "reseeded=%u\n",
+			    k24t31_cn, contested_reseeded);
+		}
+		/*
 		 * rebuild UMA's own
 		 * plinks.uma reverse-lookup index (vm_page_t's own
 		 * slab/zone-identity fields, stale/zero after round 59's
