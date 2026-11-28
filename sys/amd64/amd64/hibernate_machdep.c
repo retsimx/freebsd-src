@@ -2739,6 +2739,13 @@ hibernate_k24t00_kstack_verify(void)
 	return (pages_missing);
 }
 
+#define K24T00_EARLY_KSTACK_CACHE_MAX 8
+static vm_offset_t k24t00_early_kstack_va[K24T00_EARLY_KSTACK_CACHE_MAX];
+static struct hibernate_md_walk
+    k24t00_early_kstack_walk[K24T00_EARLY_KSTACK_CACHE_MAX];
+static bool k24t00_early_kstack_valid[K24T00_EARLY_KSTACK_CACHE_MAX];
+static u_int k24t00_early_kstack_count;
+
 static bool
 hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
     const vm_paddr_t *vector, uint64_t vector_count, vm_offset_t va,
@@ -2751,6 +2758,18 @@ hibernate_md_staged_leaf_for_live_slot(const struct hibernate_attempt *ha,
 	vm_paddr_t pt_page_pa;
 	uint64_t entry, sidx, staged_pte;
 	u_int index;
+
+	{
+		u_int ci;
+
+		for (ci = 0; ci < k24t00_early_kstack_count; ci++) {
+			if (k24t00_early_kstack_valid[ci] &&
+			    k24t00_early_kstack_va[ci] == va) {
+				*walk = k24t00_early_kstack_walk[ci];
+				return (true);
+			}
+		}
+	}
 
 	pml4 = (pml4_entry_t *)PHYS_TO_DMAP(kernel_pmap->pm_cr3 & PG_FRAME);
 	index = (u_int)((va >> PML4SHIFT) & (NPML4EPG - 1));
@@ -4154,6 +4173,106 @@ hibernate_md_staged_read(const struct hibernate_attempt *ha,
 	return (0);
 }
 
+/*
+ * K24-T00 site=50 fix: resolve the resuming thread's own kstack leaf
+ * PTEs EARLY -- immediately after wvec becomes valid, before this
+ * function's own caller (hibernate_machdep_prepare()) runs its later
+ * self-copy sweep (trampoline/GDT/KPML4/live-kstack-protect) -- and
+ * cache the results for hibernate_md_staged_leaf_for_live_slot()
+ * itself to consult first (see the cache check at its own top).
+ *
+ * Root cause this directly targets: hibernate_md_staged_leaf_for_
+ * live_slot()'s own round-2 fallback (the "vector[sidx] == pt_page_pa"
+ * branch) re-derives sidx via hibernate_md_dst_page_index() on the
+ * SAME pt_page_pa that triggered the aliasing check in the first
+ * place -- a pure function of physical address, so it always yields
+ * the SAME destination-set index back into the SAME already-
+ * overwritten vector[] slot.  It is not an independent read in that
+ * exact case, only a differently-shaped read of the identical wrong
+ * bytes -- which is exactly why fail_reason=9 persists no matter how
+ * the fallback's own per-level table reads are routed.  Resolving
+ * here, before the sweep that introduces the aliasing has run at all,
+ * means vector[sidx] for the shared PT page still holds its genuine
+ * staged content, so the function's own ORDINARY (non-fallback) path
+ * already succeeds -- no parallel lookup implementation is added;
+ * this calls the exact same hibernate_md_staged_leaf_for_live_slot(),
+ * only early enough that its aliasing detection never triggers.
+ *
+ * Purely additive and fails open: any resolution failure here just
+ * leaves the cache empty (k24t00_early_kstack_count == 0 entries
+ * marked valid), so the original, unchanged call site later in
+ * hibernate_machdep_prepare() runs exactly as before, with identical
+ * diagnostics, for any page this early capture did not get.
+ */
+static void
+k24t00_early_kstack_capture(const struct hibernate_attempt *ha,
+    const vm_paddr_t *wvec, uint64_t p)
+{
+	uint64_t saved_susppcbs_ptr, saved_susppcb0_ptr;
+	register_t staged_pcb_rsp;
+	vm_offset_t susppcbs_global_va, susppcb_pcb_va;
+	vm_offset_t kstack_va, kstack_base, kstack_end, kstack_slot;
+	vm_size_t kstack_stride;
+	u_int pg;
+
+	bzero(k24t00_early_kstack_valid, sizeof(k24t00_early_kstack_valid));
+	k24t00_early_kstack_count = 0;
+	if (susppcbs == NULL || susppcbs[0] == NULL)
+		return;
+
+	susppcbs_global_va = (vm_offset_t)&susppcbs;
+	if (hibernate_md_staged_read(ha, wvec, p, susppcbs_global_va,
+		&saved_susppcbs_ptr, sizeof(saved_susppcbs_ptr)) != 0 ||
+	    saved_susppcbs_ptr == 0)
+		return;
+	if (hibernate_md_staged_read(ha, wvec, p,
+		(vm_offset_t)saved_susppcbs_ptr, &saved_susppcb0_ptr,
+		sizeof(saved_susppcb0_ptr)) != 0 ||
+	    saved_susppcb0_ptr == 0)
+		return;
+	susppcb_pcb_va = (vm_offset_t)saved_susppcb0_ptr +
+	    offsetof(struct susppcb, sp_pcb);
+	if (hibernate_md_staged_read(ha, wvec, p,
+		susppcb_pcb_va + offsetof(struct pcb, pcb_rsp),
+		&staged_pcb_rsp, sizeof(staged_pcb_rsp)) != 0)
+		return;
+
+	kstack_va = staged_pcb_rsp;
+	kstack_va &= ~(register_t)PAGE_MASK;
+	if ((vm_offset_t)kstack_va < VM_MIN_KERNEL_ADDRESS ||
+	    (vm_offset_t)kstack_va >= VM_MAX_KERNEL_ADDRESS)
+		return;
+
+	kstack_stride = ptoa(KSTACK_PAGES + KSTACK_GUARD_PAGES);
+	kstack_slot = VM_MIN_KERNEL_ADDRESS +
+	    (((vm_offset_t)staged_pcb_rsp - VM_MIN_KERNEL_ADDRESS) /
+		kstack_stride) * kstack_stride;
+	kstack_base = kstack_slot + ptoa(KSTACK_GUARD_PAGES);
+	kstack_end = kstack_base + ptoa(KSTACK_PAGES);
+	if (kstack_base < kstack_slot || kstack_end < kstack_base ||
+	    (vm_offset_t)staged_pcb_rsp < kstack_base ||
+	    (vm_offset_t)staged_pcb_rsp >= kstack_end)
+		return;
+
+	for (pg = 0; pg < KSTACK_PAGES &&
+	    pg < K24T00_EARLY_KSTACK_CACHE_MAX; pg++) {
+		vm_offset_t stack_va;
+		struct hibernate_md_walk walk;
+
+		stack_va = kstack_base + (vm_offset_t)pg * PAGE_SIZE;
+		if (hibernate_md_staged_leaf_for_live_slot(ha, wvec, p,
+			stack_va, &walk) &&
+		    (walk.hmw_flags & (X86_PG_V | X86_PG_RW)) ==
+			(X86_PG_V | X86_PG_RW)) {
+			k24t00_early_kstack_va[pg] = stack_va;
+			k24t00_early_kstack_walk[pg] = walk;
+			k24t00_early_kstack_valid[pg] = true;
+		}
+	}
+	k24t00_early_kstack_count = MIN(KSTACK_PAGES,
+	    K24T00_EARLY_KSTACK_CACHE_MAX);
+}
+
 #define HIB_STAGED_MAX_THREADS 256
 _Static_assert(HIB_STAGED_MAX_THREADS == 256,
     "K24T00_KSTACK_STASH_MAX's own literal 256 (near this file's top, "
@@ -4979,6 +5098,9 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 				hib_guard_captured = true;
 			}
 		}
+
+		k24t00_early_kstack_capture(ha, wvec, p);
+
 		error = hibernate_md_selfcopy_walk(ha, wvec, p,
 		    kernel_pmap->pm_cr3, trampoline_saved_va, true,
 		    &selfcopied);
