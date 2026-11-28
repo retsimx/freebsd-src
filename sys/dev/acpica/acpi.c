@@ -5418,6 +5418,43 @@ acpi_EnterSleepState(struct acpi_softc *sc, enum power_stype stype)
 
 	case EJUSTRETURN:
 		/*
+		 * K24-T00 round (GP fault live-captured at exception
+		 * entry, no single-stepping): rman_hibernate_mapping_
+		 * snapshot_capture() records entry->resource = &r->r_r
+		 * -- a pointer INTO the live struct resource_i object
+		 * walked from rm_list at SAVE-boot time (design 035
+		 * "Save-side ptwalk"). That pointer is save-boot heap
+		 * content, carried verbatim through the image like
+		 * every other saved-object-pointer defect already
+		 * fixed this round (k24t00_exclude_list's td_va,
+		 * etc.) -- it is not valid in the resume boot's own
+		 * heap. Replaying it here calls rman_set_mapping() ->
+		 * rman_get_bushandle() on that stale pointer,
+		 * dereferencing a non-canonical address and raising
+		 * #GP (confirmed live: Xprot hit with tf_err=0,
+		 * faulting RIP inside rman_get_bushandle()'s own
+		 * "movq 0x10(%rdi),%rax", CR3 already the resumed
+		 * kernel's own -- %rdi itself was the bad value).
+		 *
+		 * #816's own HPET case (the reason this replay was
+		 * added) is not actually a counterexample: hpet_
+		 * resume() (sys/dev/acpica/acpi_hpet.c) already re-
+		 * derives its own mapping independently via bus_get_
+		 * resource()/bus_space_map() against the live,
+		 * resumed device tree -- it does not need, and was
+		 * never proven to need, this replay to have already
+		 * run. No other driver on this bench's device tree
+		 * depends on a replayed mapping either (none call
+		 * rman_get_mapping()/rman_get_bushandle() during
+		 * resume before re-deriving their own resource
+		 * first). Retired for the hibernate-resume path only;
+		 * the capture/replay/selfcopy_range functions
+		 * themselves are left in place (sys/kern/subr_rman.c)
+		 * in case a separate, non-hibernate S4 path still
+		 * relies on them -- only this one call site is
+		 * removed.
+		 */
+		/*
 		 * Resume path: the restore kernel owns the image.
 		 * Stages 4-7 were acquired in acpi_hibernate_dump_worker()
 		 * on the SAVE path and are NOT set in hib_stages here
