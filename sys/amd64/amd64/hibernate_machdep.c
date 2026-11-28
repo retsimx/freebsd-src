@@ -6156,6 +6156,64 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 			u_int k24t31_fpu_unresolved = 0;
 			u_int k24t31_fpu_stashed = 0;
 			/*
+			 * K24-T00 (rip=0x2 fix, round 2): this worker
+			 * thread's own kstack is self-copy-protected
+			 * (copy_leaf=true, see hibernate_machdep_prepare()'s
+			 * block_seq=4 live-kstack block, above) so it
+			 * survives the K-10 destructive copy as THIS boot's
+			 * own live, still-executing C frames at its own
+			 * VIRTUAL ADDRESS -- never the image's content for
+			 * that VA. Round 1 of this fix compared PHYSICAL
+			 * frames (worker_kstack_pa_lo/_hi) and proved
+			 * insufficient: a repeat capture (K24T00-WORKERCOLL-
+			 * SKIP, this round) showed the skip correctly firing
+			 * for "sh" (pid 1084)'s 4 kstack pages, yet the
+			 * SAME rip=0x2 panic recurred on that exact pid/tid.
+			 * The real collision is not physical-frame aliasing
+			 * at all: kstack VAs are assigned from a small,
+			 * deterministic kva-arena stride
+			 * (VM_MIN_KERNEL_ADDRESS + slot*stride, see
+			 * hibernate_machdep_prepare()'s own kstack_slot
+			 * derivation elsewhere in this file), so an
+			 * unrelated SAVED thread from the image's own boot
+			 * and this LIVE worker thread from the resume boot
+			 * can be assigned the IDENTICAL kernel virtual
+			 * address for their respective kstacks -- confirmed
+			 * directly: "sh"'s own stashed va
+			 * (0xfffffe0068f75000-0xfffffe0068f78000) is
+			 * BIT-IDENTICAL to this worker's own
+			 * worker_kstack_va (K24T00-PARKSTACK's own print,
+			 * same run). The post-copy stash install
+			 * (hibernate_md_kva_install_pub(), acpi.c) then
+			 * rewrites the PTE at that exact live VA to point at
+			 * "sh"'s own foreign leaf_pa -- unmapping the
+			 * physical backing store this worker is CURRENTLY
+			 * executing its own C frames on, out from under it,
+			 * which is the actual write that produces the
+			 * rip=0x2/corrupt-rbp signature (not a frame-content
+			 * read of stale bytes, a VA whose mapping itself
+			 * was just yanked).
+			 *
+			 * Fix: compute this worker's own live kstack VIRTUAL
+			 * ADDRESS range once, here, before the per-thread
+			 * stash loop runs, and skip stashing any leaf whose
+			 * DESTINATION VA (not physical frame) falls inside
+			 * this worker's own live kstack VA range. That VA's
+			 * live mapping is left exactly as the ordinary resume
+			 * boot already set it up -- this worker's own, still
+			 * in use -- never retargeted by the post-copy
+			 * install, regardless of which physical frame either
+			 * side happens to use.
+			 */
+			vm_offset_t k24t00_worker_kstack_va_lo,
+			    k24t00_worker_kstack_va_hi;
+
+			k24t00_worker_kstack_va_lo =
+			    (vm_offset_t)curthread->td_kstack;
+			k24t00_worker_kstack_va_hi =
+			    k24t00_worker_kstack_va_lo +
+			    ptoa(curthread->td_kstack_pages);
+
 			for (i = 0; i < nthreads; i++) {
 				struct hibernate_md_walk walk;
 				vm_offset_t va;
@@ -6259,7 +6317,90 @@ hibernate_machdep_prepare(struct hibernate_attempt *ha)
 					 * needs exactly this granularity to
 					 * install correctly.
 					 */
-					if (k24t00_kstack_stash_n <
+					/*
+					 * K24-T00 (rip=0x2 fix, round 2):
+					 * never stash a leaf whose
+					 * DESTINATION VA (not physical
+					 * frame -- see this loop's own
+					 * header comment, immediately
+					 * above its opening brace, for why
+					 * round 1's PA-based check was
+					 * insufficient) aliases this
+					 * worker's own live kstack VA
+					 * range. Skipping the stash means
+					 * the post-copy install pass never
+					 * rewrites the PTE at this VA away
+					 * from the resume boot's own,
+					 * already-correct live mapping;
+					 * the page is left exactly as this
+					 * file's own pre-existing "sparse,
+					 * never-touched" sentinel case.
+					 */
+					if (va >=
+					    k24t00_worker_kstack_va_lo &&
+					    va <
+					    k24t00_worker_kstack_va_hi) {
+						printf(
+						    "K24T00-WORKERCOLL-SKIP: "
+						    "pid=%d comm=%s "
+						    "page_index=%u va=%#jx "
+						    "leaf_pa=%#jx "
+						    "worker_va=[%#jx-%#jx)\n",
+						    (int)threads[i].pid,
+						    threads[i].comm, pg,
+						    (uintmax_t)va,
+						    (uintmax_t)walk.hmw_pa,
+						    (uintmax_t)
+						    k24t00_worker_kstack_va_lo,
+						    (uintmax_t)
+						    k24t00_worker_kstack_va_hi);
+						/*
+						 * K24-T00 (rip=0x2 fix,
+						 * round 3): skipping the
+						 * stash/install is not
+						 * sufficient on its own --
+						 * THIS thread's own
+						 * td_kstack field (copied
+						 * verbatim from the image)
+						 * still equals the worker's
+						 * own live VA range, so if
+						 * this thread is later
+						 * scheduled and runs on that
+						 * VA, it executes on
+						 * physical memory the
+						 * worker's own live context
+						 * may still be using (or
+						 * vice versa) -- the second,
+						 * distinct half of the same
+						 * collision. Route through
+						 * the SAME already-proven
+						 * exclusion list the
+						 * "genuine zero terminal
+						 * PTE" case immediately
+						 * below already uses: mark
+						 * thread_has_uncovered so
+						 * this thread is recorded
+						 * in k24t00_exclude_list and
+						 * not released post-copy,
+						 * exactly like any other
+						 * thread whose kstack cannot
+						 * be safely installed.
+						 */
+						if (!thread_has_uncovered) {
+							thread_has_uncovered =
+							    true;
+							if (!have_first_offender) {
+								have_first_offender =
+								    true;
+								first_offending_pid =
+								    threads[i].pid;
+								first_offending_va =
+								    va;
+							}
+						}
+						total_uncovered_pages++;
+						thread_missing_pages++;
+					} else if (k24t00_kstack_stash_n <
 					    K24T00_KSTACK_STASH_MAX) {
 						struct k24t00_kstack_stash_entry
 						    *se;
